@@ -197,7 +197,7 @@ async def test_test_run_workflow_submits_and_saves(client, monkeypatch, tmp_path
 
     resp = await client.post(
         "/manga_autopilot/api/workflows/anime_t2i_default/test-run",
-        json={"overrides": {"positive_prompt": "1girl, blue hair"}, "output_dir": str(tmp_path)},
+        json={"overrides": {"positive_prompt": "1girl, blue hair"}, "output_dir": str(tmp_path), "allow_external_output_dir": True},
     )
     assert resp.status == 200
     body = await resp.json()
@@ -208,6 +208,96 @@ async def test_test_run_workflow_submits_and_saves(client, monkeypatch, tmp_path
     saved = Path(body["images_saved"][0])
     assert saved.exists()
     assert saved.parent == tmp_path
+
+
+async def test_test_run_workflow_rejects_external_output_dir(client) -> None:
+    """The /test-run endpoint must ignore ``output_dir`` unless the caller
+    explicitly opts in via ``allow_external_output_dir`` (or a per-app
+    override is set).  Otherwise it locks to
+    ``{storage_root}/test_runs/{workflow_id}``."""
+
+    payload = _payload()
+    payload["api_graph"] = {
+        "9": {"class_type": "SaveImage", "inputs": {"filename_prefix": "x"}},
+    }
+    await client.post("/manga_autopilot/api/workflows", json=payload)
+
+    class _FakeClient:
+        async def submit_workflow(self, graph, **kwargs):
+            return "prompt-x"
+
+        async def get_history(self, prompt_id):
+            return {
+                "prompt-x": {
+                    "status": {"completed": True},
+                    "outputs": {
+                        "9": {
+                            "images": [
+                                {"filename": "out.png", "subfolder": "", "type": "output"}
+                            ]
+                        }
+                    },
+                }
+            }
+
+        async def fetch_image_to(self, dest, **kwargs):
+            Path(dest).write_bytes(b"\x89PNG\r\n\x1a\n")
+            return Path(dest)
+
+    client.app["manga_comfy_client"] = _FakeClient()
+    resp = await client.post(
+        "/manga_autopilot/api/workflows/anime_t2i_default/test-run",
+        json={"output_dir": "/tmp/should-be-rejected"},
+    )
+    assert resp.status == 400
+    text = await resp.text()
+    assert "allow_external_output_dir" in text or "locked" in text
+
+
+async def test_test_run_workflow_uses_default_dir(client, tmp_path) -> None:
+    """Without an explicit output_dir, results land in test_runs/{wid}."""
+
+    payload = _payload()
+    payload["api_graph"] = {
+        "9": {"class_type": "SaveImage", "inputs": {"filename_prefix": "x"}},
+    }
+    await client.post("/manga_autopilot/api/workflows", json=payload)
+
+    storage_root = tmp_path
+    client.app["manga_storage_root"] = storage_root
+
+    class _FakeClient:
+        async def submit_workflow(self, graph, **kwargs):
+            return "prompt-y"
+
+        async def get_history(self, prompt_id):
+            return {
+                "prompt-y": {
+                    "status": {"completed": True},
+                    "outputs": {
+                        "9": {
+                            "images": [
+                                {"filename": "out.png", "subfolder": "", "type": "output"}
+                            ]
+                        }
+                    },
+                }
+            }
+
+        async def fetch_image_to(self, dest, **kwargs):
+            Path(dest).write_bytes(b"\x89PNG\r\n\x1a\n")
+            return Path(dest)
+
+    client.app["manga_comfy_client"] = _FakeClient()
+    resp = await client.post(
+        "/manga_autopilot/api/workflows/anime_t2i_default/test-run", json={}
+    )
+    assert resp.status == 200
+    body = await resp.json()
+    assert body["ok"] is True
+    saved = Path(body["images_saved"][0])
+    assert saved.parent.parent.name == "test_runs"
+    assert saved.parent.parent.parent == storage_root.resolve()
 
 
 async def test_test_run_workflow_propagates_error(client) -> None:

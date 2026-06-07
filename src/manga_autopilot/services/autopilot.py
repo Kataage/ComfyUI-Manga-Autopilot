@@ -173,7 +173,10 @@ class AutopilotStateMachine:
         if to in (AutopilotState.PAUSED, AutopilotState.CANCELLED):
             self._record(to, reason)
             return self.state
-        if self.state == AutopilotState.PAUSED and to == AutopilotState.PANELS_GENERATING:
+        if self.state == AutopilotState.PAUSED:
+            # Resume: accept any state the machine can legally occupy.
+            # This is gated by :meth:`AutopilotController.resume` which only
+            # records ``pre_pause_state`` from a state the run was actually in.
             self._record(to, reason)
             return self.state
         raise InvalidTransitionError(f"illegal jump {self.state} -> {to}")
@@ -306,6 +309,14 @@ class AutopilotRun:
     task: asyncio.Task | None = None
     cancel_event: asyncio.Event | None = None
     pause_event: asyncio.Event | None = None
+    pre_pause_state: AutopilotState | None = None
+    """The state the pipeline was in *before* the most recent pause.
+
+    Populated by :meth:`AutopilotController.pause` and consumed by
+    :meth:`AutopilotController.resume` to restore the run to where it
+    actually was when the user pressed pause (rather than always jumping
+    to ``PANELS_GENERATING``).
+    """
     input: dict[str, Any] = field(default_factory=dict)
 
     def _now(self) -> datetime:
@@ -526,23 +537,49 @@ class AutopilotController:
             run.pause_event = pause_event
 
     def pause(self, project_id: str, reason: str = "user_paused") -> AutopilotRun:
+        """Mark a run as paused.
+
+        The current :class:`AutopilotState` is captured in
+        :attr:`AutopilotRun.pre_pause_state` so :meth:`resume` can restore
+        the run to its real position in the pipeline.  The
+        :attr:`AutopilotRun.pause_event` is **cleared** so the orchestrator's
+        per-step :keyword:`await pause_event.wait()` blocks until
+        :meth:`resume` is called.
+        """
+
         with self.lock:
             run = self._require(project_id)
             if run.machine.state in (AutopilotState.COMPLETED, AutopilotState.CANCELLED):
                 raise InvalidTransitionError(f"cannot pause {run.machine.state}")
+            if run.machine.state == AutopilotState.PAUSED:
+                # idempotent; nothing to do.
+                return run
+            run.pre_pause_state = run.machine.state
             run.machine.jump(AutopilotState.PAUSED, reason=reason)
-            run.log_event("paused", {"reason": reason})
+            if run.pause_event is not None:
+                run.pause_event.clear()
+            run.log_event("paused", {"reason": reason, "pre_pause_state": run.pre_pause_state.value})
             return run
 
     def resume(self, project_id: str, reason: str = "user_resumed") -> AutopilotRun:
+        """Resume a previously-paused run.
+
+        The state machine jumps back to the captured
+        :attr:`AutopilotRun.pre_pause_state` (defaulting to
+        :attr:`AutopilotState.PANELS_GENERATING` when no state was recorded,
+        e.g. for runs that were paused before the first hook ran).
+        """
+
         with self.lock:
             run = self._require(project_id)
             if run.machine.state != AutopilotState.PAUSED:
                 raise InvalidTransitionError(f"cannot resume from {run.machine.state}")
-            run.machine.jump(AutopilotState.PANELS_GENERATING, reason=reason)
-            run.log_event("resumed", {"reason": reason})
+            target = run.pre_pause_state or AutopilotState.PANELS_GENERATING
+            run.machine.jump(target, reason=reason)
+            run.pre_pause_state = None
             if run.pause_event is not None:
                 run.pause_event.set()
+            run.log_event("resumed", {"reason": reason, "resumed_to": target.value})
             return run
 
     def cancel(self, project_id: str, reason: str = "user_cancelled") -> AutopilotRun:
@@ -606,9 +643,20 @@ def _is_cancelled(run: AutopilotRun) -> bool:
 
 
 def _is_paused(run: AutopilotRun) -> bool:
-    if run.pause_event is None:
-        return False
-    return run.pause_event.is_set() is False and run.machine.state == AutopilotState.PAUSED
+    """``True`` when the run is currently between pause() and resume().
+
+    The :attr:`AutopilotRun.pause_event` is the single source of truth: when
+    it is ``False`` (cleared), the orchestrator should wait.  We also
+    require :attr:`AutopilotState.PAUSED` in the state machine as a
+    belt-and-braces guard so a run that was never wired to an event loop
+    still surfaces its paused state through the normal status API.
+    """
+
+    if run.machine.state == AutopilotState.PAUSED:
+        return True
+    if run.pause_event is not None and not run.pause_event.is_set():
+        return True
+    return False
 
 
 async def _invoke_hook(callable_hook: Callable[..., Any] | None, *args: Any, **kwargs: Any) -> Any:
@@ -643,7 +691,14 @@ class Orchestrator:
         *hook_args: Any,
         **hook_kwargs: Any,
     ) -> Any:
+        # Cooperative pause: wait until the run is unpaused before doing any
+        # state-machine work.  This must happen *before* ``advance`` so the
+        # state doesn't drift while the user is paused.
+        if run.pause_event is not None and run.machine.state != AutopilotState.PAUSED:
+            await run.pause_event.wait()
         if _is_cancelled(run):
+            return None
+        if _is_paused(run):
             return None
         run.machine.advance(reason=hook_name)
         step = run.record_step(hook_name, target_state)

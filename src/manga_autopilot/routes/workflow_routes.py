@@ -258,11 +258,28 @@ async def test_run_workflow(request: web.Request) -> web.Response:
     payload = await _payload_or_400_async(request)
     overrides = dict(payload.get("overrides") or {})
     output_dir = payload.get("output_dir")
-    save_to = (
-        Path(output_dir).expanduser().resolve()
-        if output_dir
-        else _default_test_run_dir(request.app, wid)
+    allow_external = bool(
+        payload.get("allow_external_output_dir")
+        or request.app.get("manga_allow_external_test_run_dir")
     )
+    if output_dir and not allow_external:
+        # Refuse arbitrary destinations by default.  Callers that need to
+        # drop files outside the project's test_runs directory must opt in
+        # explicitly so this endpoint can't be coerced into overwriting
+        # arbitrary paths.
+        raise web.HTTPBadRequest(
+            text=(
+                "output_dir is locked to {storage}/test_runs/{workflow_id} "
+                "unless allow_external_output_dir=true is supplied."
+            ).format(
+                storage=Path(str(request.app.get("manga_storage_root", "."))).expanduser(),
+                workflow_id=wid,
+            )
+        )
+    if output_dir:
+        save_to = Path(output_dir).expanduser().resolve()
+    else:
+        save_to = _default_test_run_dir(request.app, wid)
     save_to.mkdir(parents=True, exist_ok=True)
     graph = wf.api_graph or {}
     try:

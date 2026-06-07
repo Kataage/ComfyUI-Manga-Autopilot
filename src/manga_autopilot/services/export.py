@@ -24,7 +24,6 @@ from PIL import Image
 from manga_autopilot.models.panel import PanelLayout
 from manga_autopilot.services.page_renderer import render_page_to_png
 from manga_autopilot.storage.paths import (
-    EXPORT_SUBDIRS,
     ensure_project_paths,
     project_paths,
 )
@@ -396,18 +395,26 @@ class ExportService:
         self,
         project_id: str,
         page_pngs: Sequence[str | Path],
+        *,
+        allow_asset_images: bool = False,
     ) -> list[Path]:
         """Validate that every page PNG lives inside the project's export tree.
 
-        Only paths that resolve to a file directly inside
-        ``{storage_root}/projects/{project_id}/exports/pages/`` (or one of its
-        sibling export subdirs: webtoon / pdf) are accepted.  Absolute paths
-        and paths that escape the project root raise :class:`ValueError`.
+        By default, only paths that resolve to a file directly inside
+        ``{storage_root}/projects/{project_id}/exports/pages/`` are accepted.
+        Absolute paths and paths that escape the project root raise
+        :class:`ValueError`.
+
+        The legacy code also accepted ``assets/`` (panel images).  That
+        behaviour is preserved as an opt-in through ``allow_asset_images``;
+        callers (typically the export HTTP routes) need to set it explicitly
+        to surface panel-level images for, e.g., a custom webtoon build.
         """
 
         paths = project_paths(self.storage_root, project_id)
-        allowed_roots = [paths.export(sub).resolve() for sub in EXPORT_SUBDIRS]
-        allowed_roots.append(paths.assets.resolve())  # panel images may live here
+        allowed_roots = [paths.export("pages").resolve()]
+        if allow_asset_images:
+            allowed_roots.append(paths.assets.resolve())
         resolved: list[Path] = []
         for raw in page_pngs:
             p = Path(raw).expanduser()

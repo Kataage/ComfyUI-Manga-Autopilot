@@ -8,7 +8,6 @@ import pytest
 from aiohttp import web
 
 from manga_autopilot.comfy_integration import (
-    _default_storage_root,
     _resolve_app_and_routes,
     attach_routes_to_prompt_server,
 )
@@ -43,8 +42,57 @@ def test_resolve_app_and_routes_handles_promptserver():
 
 def test_default_storage_root_uses_env(tmp_path: Path, monkeypatch):
     monkeypatch.setenv("MANGA_AUTOPILOT_STORAGE_ROOT", str(tmp_path))
+    monkeypatch.delenv("MANGA_AUTOPILOT_FORCE_TEMP_STORAGE", raising=False)
+    from manga_autopilot.routes import _default_storage_root
     root = _default_storage_root()
     assert root == tmp_path.resolve()
+
+
+def test_default_storage_root_persists_across_calls(tmp_path: Path, monkeypatch):
+    """The default storage root must be a durable on-disk path, not a tempdir."""
+
+    target = tmp_path / "durable_manga"
+    monkeypatch.setenv("MANGA_AUTOPILOT_STORAGE_ROOT", str(target))
+    monkeypatch.delenv("MANGA_AUTOPILOT_FORCE_TEMP_STORAGE", raising=False)
+    from manga_autopilot.routes import _default_storage_root
+    root1 = _default_storage_root()
+    root2 = _default_storage_root()
+    assert root1 == root2
+    assert "tmp" not in str(root1).lower() or root1 == target.resolve()
+    assert root1.exists()
+
+
+def test_default_storage_root_force_temp_uses_tempdir(monkeypatch):
+    monkeypatch.setenv("MANGA_AUTOPILOT_FORCE_TEMP_STORAGE", "1")
+    from manga_autopilot.routes import _default_storage_root
+    root = _default_storage_root()
+    import tempfile
+    assert str(root).startswith(tempfile.gettempdir())
+
+
+def test_package_self_registers_src_path():
+    """Importing the package should add ``src/`` to ``sys.path`` so that
+    ``from manga_autopilot import …`` works even from a custom_nodes direct
+    placement (no editable install)."""
+
+    import sys
+    from pathlib import Path
+
+    import manga_autopilot  # noqa: F401
+    import manga_autopilot.routes  # noqa: F401
+    pkg_file = manga_autopilot.routes.__file__
+    # pkg_file = .../src/manga_autopilot/routes/__init__.py
+    # src  = .../src
+    src = Path(pkg_file).resolve().parent.parent.parent
+    # Whether pytest pre-added `src/` or not, the package's __init__.py
+    # must keep it present.  If pytest pre-added it, the package should
+    # have left it alone (no duplicate).  Either way ``src`` is on
+    # ``sys.path`` so the package importable without an editable install.
+    assert str(src) in sys.path
+    # And the package is wired up: it has the comfyui integration glue
+    # registered.
+    assert hasattr(manga_autopilot, "default_storage_root")
+    assert hasattr(manga_autopilot, "WEB_DIRECTORY")
 
 
 def test_attach_routes_to_prompt_server_uses_fake(monkeypatch):

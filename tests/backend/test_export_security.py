@@ -111,3 +111,50 @@ def test_export_resolve_page_pngs_rejects_missing(tmp_path: Path):
     svc = ExportService(storage_root=storage)
     with pytest.raises(ValueError, match="does not exist"):
         svc.resolve_page_pngs("p1", [str(tmp_path / "ghost.png")])
+
+
+def test_export_resolve_page_pngs_rejects_assets_by_default(tmp_path: Path):
+    """`assets/` panel images must NOT be accepted as page PNGs unless the
+    caller explicitly opts in via ``allow_asset_images=True``."""
+
+    storage = tmp_path / "storage"
+    storage.mkdir()
+    paths = ensure_project_paths(storage, "p1")
+    panel = paths.assets / "panels" / "cover.png"
+    panel.parent.mkdir(parents=True, exist_ok=True)
+    panel.write_bytes(b"PNG")
+
+    svc = ExportService(storage_root=storage)
+    with pytest.raises(ValueError, match="outside the project storage tree"):
+        svc.resolve_page_pngs("p1", [str(panel)])
+
+
+def test_export_resolve_page_pngs_accepts_assets_with_flag(tmp_path: Path):
+    storage = tmp_path / "storage"
+    storage.mkdir()
+    paths = ensure_project_paths(storage, "p1")
+    panel = paths.assets / "panels" / "cover.png"
+    panel.parent.mkdir(parents=True, exist_ok=True)
+    panel.write_bytes(b"PNG")
+
+    svc = ExportService(storage_root=storage)
+    resolved = svc.resolve_page_pngs("p1", [str(panel)], allow_asset_images=True)
+    assert resolved == [panel.resolve()]
+
+
+def test_export_resolve_page_pngs_default_only_pages(tmp_path: Path):
+    """Without ``allow_asset_images=True`` only files in
+    ``exports/pages/`` are accepted — paths in other export subdirs
+    (``webtoon``, ``pdf``) are also rejected, narrowing the surface area
+    compared to the pre-fix code."""
+
+    storage = tmp_path / "storage"
+    storage.mkdir()
+    paths = ensure_project_paths(storage, "p1")
+    webtoon = paths.export("webtoon") / "webtoon_full.png"
+    webtoon.parent.mkdir(parents=True, exist_ok=True)
+    webtoon.write_bytes(b"PNG")
+
+    svc = ExportService(storage_root=storage)
+    with pytest.raises(ValueError, match="outside the project storage tree"):
+        svc.resolve_page_pngs("p1", [str(webtoon)])
