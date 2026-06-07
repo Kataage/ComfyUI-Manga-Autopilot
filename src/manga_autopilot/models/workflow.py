@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 from enum import Enum
+from pathlib import Path
 from typing import Any
 
 from pydantic import BaseModel, Field, field_validator, model_validator
@@ -179,6 +180,35 @@ def describe_binding_keys() -> tuple[str, ...]:
     )
 
 
+def workflow_definition_json_schema() -> dict[str, Any]:
+    """Return the JSON Schema for :class:`WorkflowDefinition`."""
+
+    return WorkflowDefinition.model_json_schema()
+
+
+def workflow_binding_json_schema() -> dict[str, Any]:
+    """Return the JSON Schema for :class:`WorkflowBinding`."""
+
+    return WorkflowBinding.model_json_schema()
+
+
+def workflow_definition_schema_str(indent: int = 2) -> str:
+    """Return the JSON Schema for :class:`WorkflowDefinition` as a string."""
+
+    import json as _json
+
+    return _json.dumps(workflow_definition_json_schema(), indent=indent, ensure_ascii=False)
+
+
+def write_workflow_definition_schema(path: Path) -> Path:
+    """Persist the JSON Schema for :class:`WorkflowDefinition` to ``path``."""
+
+    dest = Path(path)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_text(workflow_definition_schema_str(indent=2), encoding="utf-8")
+    return dest
+
+
 __all__ = [
     "WORKFLOW_TYPES",
     "WORKFLOW_ID_RE",
@@ -189,4 +219,8 @@ __all__ = [
     "validate_workflow_payload",
     "validate_api_graph",
     "describe_binding_keys",
+    "workflow_definition_json_schema",
+    "workflow_binding_json_schema",
+    "workflow_definition_schema_str",
+    "write_workflow_definition_schema",
 ]
