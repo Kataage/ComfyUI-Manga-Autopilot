@@ -1,0 +1,30 @@
+{
+  "workflow_id": "anime_reference_default",
+  "name": "Anime Reference-to-Image",
+  "type": "reference_to_image",
+  "file": "workflows/anime_reference_api.json",
+  "description": "Generate a panel using a single character reference image via IP-Adapter. Bind the reference image and the IP-Adapter strength.",
+  "bindings": {
+    "positive_prompt": { "node_id": "6", "input": "text" },
+    "negative_prompt": { "node_id": "7", "input": "text" },
+    "seed": { "node_id": "3", "input": "seed" },
+    "width": { "node_id": "5", "input": "width" },
+    "height": { "node_id": "5", "input": "height" },
+    "reference_image": { "node_id": "12", "input": "image" },
+    "ip_adapter_strength": { "node_id": "13", "input": "weight" },
+    "filename_prefix": { "node_id": "9", "input": "filename_prefix" }
+  },
+  "api_graph": {
+    "3": { "class_type": "KSampler", "inputs": { "seed": 11, "steps": 28, "cfg": 7.0, "sampler_name": "euler_ancestral", "scheduler": "normal", "denoise": 1.0, "model": ["4", 0], "positive": ["14", 0], "negative": ["7", 0], "latent_image": ["5", 0] } },
+    "4": { "class_type": "CheckpointLoaderSimple", "inputs": { "ckpt_name": "anything-v5.safetensors" } },
+    "5": { "class_type": "EmptyLatentImage", "inputs": { "width": 832, "height": 1216, "batch_size": 1 } },
+    "6": { "class_type": "CLIPTextEncode", "inputs": { "text": "1girl, masterpiece", "clip": ["4", 1] } },
+    "7": { "class_type": "CLIPTextEncode", "inputs": { "text": "lowres, bad anatomy", "clip": ["4", 1] } },
+    "8": { "class_type": "VAEDecode", "inputs": { "samples": ["3", 0], "vae": ["4", 2] } },
+    "9": { "class_type": "SaveImage", "inputs": { "filename_prefix": "ComfyUI", "images": ["8", 0] } },
+    "12": { "class_type": "LoadImage", "inputs": { "image": "reference.png" } },
+    "13": { "class_type": "IPAdapterApply", "inputs": { "weight": 0.85, "noise": 0.0, "weight_type": "linear", "start_at": 0.0, "end_at": 1.0, "image": ["12", 0], "model": ["4", 0], "ip_adapter": ["15", 0] } },
+    "14": { "class_type": "CLIPTextEncode", "inputs": { "text": "1girl, masterpiece", "clip": ["4", 1] } },
+    "15": { "class_type": "IPAdapterLoader", "inputs": { "ip_adapter_file": "ip-adapter-plus_sdxl_vit-h.safetensors" } }
+  }
+}

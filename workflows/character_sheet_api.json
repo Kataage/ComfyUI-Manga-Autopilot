@@ -1,0 +1,24 @@
+{
+  "workflow_id": "character_sheet_default",
+  "name": "Character Sheet Generator",
+  "type": "character_sheet",
+  "file": "workflows/character_sheet_api.json",
+  "description": "Generate a 2x2 character reference sheet for a given character description. Saves a labelled grid with a single SaveImage node.",
+  "bindings": {
+    "positive_prompt": { "node_id": "6", "input": "text" },
+    "negative_prompt": { "node_id": "7", "input": "text" },
+    "seed": { "node_id": "3", "input": "seed" },
+    "width": { "node_id": "5", "input": "width" },
+    "height": { "node_id": "5", "input": "height" },
+    "filename_prefix": { "node_id": "9", "input": "filename_prefix" }
+  },
+  "api_graph": {
+    "3": { "class_type": "KSampler", "inputs": { "seed": 100, "steps": 30, "cfg": 7.0, "sampler_name": "dpmpp_2m", "scheduler": "karras", "denoise": 1.0, "model": ["4", 0], "positive": ["6", 0], "negative": ["7", 0], "latent_image": ["5", 0] } },
+    "4": { "class_type": "CheckpointLoaderSimple", "inputs": { "ckpt_name": "anything-v5.safetensors" } },
+    "5": { "class_type": "EmptyLatentImage", "inputs": { "width": 1024, "height": 1024, "batch_size": 4 } },
+    "6": { "class_type": "CLIPTextEncode", "inputs": { "text": "character sheet, multiple angles, white background", "clip": ["4", 1] } },
+    "7": { "class_type": "CLIPTextEncode", "inputs": { "text": "lowres, blurry", "clip": ["4", 1] } },
+    "8": { "class_type": "VAEDecode", "inputs": { "samples": ["3", 0], "vae": ["4", 2] } },
+    "9": { "class_type": "SaveImage", "inputs": { "filename_prefix": "character_sheet", "images": ["8", 0] } }
+  }
+}
