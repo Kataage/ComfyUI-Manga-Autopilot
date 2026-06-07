@@ -1,11 +1,18 @@
 ---
-name: Chore / maintenance
-about: Repo maintenance, CI, tooling, refactor work
+name: Chore
+about: Non-feature maintenance work
+title: 'chore: <short summary>'
 labels: ['type:chore']
+assignees: []
 ---
 
 ## Summary
+<!-- A one-line description. -->
 
-## Reason
+## Why
+<!-- Justification for doing the work now. -->
 
-## Scope
+## Acceptance criteria
+- [ ]
+
+## Notes
