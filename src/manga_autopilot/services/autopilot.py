@@ -691,14 +691,25 @@ class Orchestrator:
         *hook_args: Any,
         **hook_kwargs: Any,
     ) -> Any:
-        # Cooperative pause: wait until the run is unpaused before doing any
-        # state-machine work.  This must happen *before* ``advance`` so the
-        # state doesn't drift while the user is paused.
-        if run.pause_event is not None and run.machine.state != AutopilotState.PAUSED:
+        # Cooperative pause: always wait for the pause event *before* doing
+        # any state-machine work.  When ``AutopilotController.pause`` runs,
+        # it (a) jumps the state machine to PAUSED and (b) clears the event;
+        # both of these together mean we must NOT short-circuit on
+        # ``machine.state == PAUSED`` because that would cause this step to
+        # return None and let the pipeline keep walking to the next step
+        # (which would then ``advance`` from PAUSED and crash).  The
+        # ``asyncio.Event`` is the single source of truth: cleared ==
+        # blocked, set == unblocked.
+        if run.pause_event is not None:
             await run.pause_event.wait()
         if _is_cancelled(run):
             return None
         if _is_paused(run):
+            # Event was set (we got past ``wait``) but the state machine
+            # still claims PAUSED.  This can only happen in a narrow race
+            # where ``resume()`` ran *after* the controller set the event
+            # but *before* the state was rewound.  Don't try to advance
+            # from PAUSED; let the caller re-invoke us on the next loop.
             return None
         run.machine.advance(reason=hook_name)
         step = run.record_step(hook_name, target_state)
