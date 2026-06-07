@@ -1,0 +1,163 @@
+"""Story Planner — LLM-driven generator of a StoryPlan (spec section 14)."""
+
+from __future__ import annotations
+
+import json
+import logging
+from collections.abc import Mapping
+from dataclasses import dataclass, field
+from typing import Any
+
+from manga_autopilot.models.story import Act, StoryPlan
+from manga_autopilot.services.json_schema_validator import validate_llm_output
+from manga_autopilot.services.llm_provider import LLMProvider
+
+log = logging.getLogger(__name__)
+
+
+STORY_PLAN_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "required": ["title", "pages"],
+    "properties": {
+        "title": {"type": "string"},
+        "logline": {"type": "string"},
+        "theme": {"type": "string"},
+        "genre": {"type": "string"},
+        "mood": {"type": "string"},
+        "acts": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "required": ["id", "name", "startPage", "endPage"],
+                "properties": {
+                    "id": {"type": "string"},
+                    "name": {"type": "string"},
+                    "startPage": {"type": "integer"},
+                    "endPage": {"type": "integer"},
+                    "summary": {"type": "string"},
+                    "emotionalArc": {"type": "string"},
+                },
+            },
+        },
+        "pages": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "required": ["pageNumber", "panelCount", "summary"],
+                "properties": {
+                    "pageNumber": {"type": "integer"},
+                    "summary": {"type": "string"},
+                    "emotionalGoal": {"type": "string"},
+                    "visualGoal": {"type": "string"},
+                    "panelCount": {"type": "integer"},
+                    "cliffhanger": {"type": "string"},
+                },
+            },
+        },
+    },
+}
+
+
+PROMPT_TEMPLATE = """あなたは漫画原作者です。
+以下の企画を、指定ページ数の漫画構成にしてください。
+
+条件:
+- 出力はJSONのみ
+- ページ数: {page_count}
+- 言語: {language}
+- ジャンル: {genre}
+- 1ページごとに summary, emotionalGoal, visualGoal, panelCount を含める
+- セリフは短くする
+- 各ページの目的が重複しないようにする
+- 最終ページには読後感または次への引きを入れる
+
+企画:
+{idea}
+"""
+
+
+@dataclass
+class StoryPlanner:
+    provider: LLMProvider
+    page_count: int = 4
+    language: str = "ja"
+    genre: str = "fantasy"
+    max_repair_attempts: int = 1
+    system_prompt: str = (
+        "You are a meticulous manga story planner. Always respond with strict JSON only."
+    )
+
+    _issues: list[str] = field(default_factory=list)
+
+    def build_prompt(self, idea: str) -> str:
+        return PROMPT_TEMPLATE.format(
+            page_count=self.page_count,
+            language=self.language,
+            genre=self.genre,
+            idea=idea,
+        )
+
+    async def plan(self, idea: str) -> StoryPlan:
+        prompt = self.build_prompt(idea)
+        data = await self.provider.complete_json(
+            prompt,
+            schema=STORY_PLAN_SCHEMA,
+            system=self.system_prompt,
+            max_repair_attempts=self.max_repair_attempts,
+        )
+        return self._to_model(data, idea)
+
+    # ------------------------------------------------------------------ utils
+    def _to_model(self, data: Mapping[str, Any], idea: str) -> StoryPlan:
+        # Validate once more with the model layer so we get typed errors.
+        outcome = validate_llm_output(data, jsonschema_definition=STORY_PLAN_SCHEMA)
+        if not outcome.ok:
+            self._issues.extend(e.message for e in outcome.errors)
+            raise ValueError(f"StoryPlan validation failed: {outcome.errors}")
+        acts = [self._act_from(a) for a in data.get("acts", [])]
+        pages = self._pages_from(data.get("pages", []), idea)
+        return StoryPlan(
+            title=data["title"],
+            logline=data.get("logline", ""),
+            theme=data.get("theme", ""),
+            genre=data.get("genre", self.genre),
+            mood=data.get("mood", ""),
+            acts=acts,
+            pages=pages,
+        )
+
+    @staticmethod
+    def _act_from(payload: Mapping[str, Any]) -> Act:
+        return Act(
+            id=payload["id"],
+            name=payload["name"],
+            start_page=int(payload["startPage"]),
+            end_page=int(payload["endPage"]),
+            summary=payload.get("summary", ""),
+            emotional_arc=payload.get("emotionalArc", ""),
+        )
+
+    @staticmethod
+    def _pages_from(payloads: list[Mapping[str, Any]], idea: str) -> list:
+        from manga_autopilot.models.page import PagePlan
+
+        out = []
+        for item in payloads:
+            out.append(
+                PagePlan(
+                    page_number=int(item["pageNumber"]),
+                    summary=item.get("summary", ""),
+                    emotional_goal=item.get("emotionalGoal", ""),
+                    visual_goal=item.get("visualGoal", ""),
+                    panel_count=max(1, int(item.get("panelCount", 1))),
+                    cliffhanger=item.get("cliffhanger"),
+                )
+            )
+        return out
+
+
+def dump_story_plan(plan: StoryPlan) -> str:
+    return json.dumps(plan.model_dump(mode="json"), ensure_ascii=False, indent=2)
+
+
+__all__ = ["StoryPlanner", "STORY_PLAN_SCHEMA", "PROMPT_TEMPLATE", "dump_story_plan"]
