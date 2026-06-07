@@ -10,9 +10,16 @@ issue and lives in a focused method on top of this client.
 
 from __future__ import annotations
 
+import asyncio
+import json
+import logging
+from collections.abc import AsyncIterator
 from typing import Any
+from urllib.parse import urlparse, urlunparse
 
 import aiohttp
+
+log = logging.getLogger(__name__)
 
 DEFAULT_BASE_URL = "http://127.0.0.1:8188"
 DEFAULT_TIMEOUT_SEC = 600
@@ -179,6 +186,70 @@ class ComfyClient:
 
         body = await self.get_json("/queue")
         return body if isinstance(body, dict) else {"queue": body}
+
+    # ------------------------------------------------------------- /ws API
+    def _ws_url(self, client_id: str | None = None) -> str:
+        cid = client_id or self.client_id
+        parsed = urlparse(self.base_url)
+        ws_scheme = "wss" if parsed.scheme == "https" else "ws"
+        ws_base = urlunparse((ws_scheme, parsed.netloc, "/ws", "", "", ""))
+        return f"{ws_base}?clientId={cid}"
+
+    async def listen_events(
+        self,
+        *,
+        client_id: str | None = None,
+        max_reconnects: int = 3,
+        reconnect_delay_sec: float = 1.0,
+    ) -> AsyncIterator[dict[str, Any]]:
+        """Yield ComfyUI WebSocket events forever.
+
+        The iterator transparently reconnects up to ``max_reconnects`` times on
+        dropped connections.  Each event is a parsed JSON dict; non-JSON
+        frames (binary previews) are skipped.
+
+        Spec reference: section 10.6.
+        """
+
+        attempts = 0
+        url = self._ws_url(client_id=client_id)
+
+        while True:
+            session = await self._ensure_session()
+            try:
+                async with session.ws_connect(url, heartbeat=30) as ws:
+                    attempts = 0  # reset on successful connect
+                    async for msg in ws:
+                        if msg.type == aiohttp.WSMsgType.TEXT:
+                            try:
+                                payload = json.loads(msg.data)
+                            except json.JSONDecodeError:
+                                log.debug("Skipping non-JSON ws frame")
+                                continue
+                            if isinstance(payload, dict):
+                                yield payload
+                        elif msg.type == aiohttp.WSMsgType.BINARY:
+                            # ComfyUI uses binary frames for preview thumbnails.
+                            continue
+                        elif msg.type in (
+                            aiohttp.WSMsgType.CLOSE,
+                            aiohttp.WSMsgType.CLOSED,
+                            aiohttp.WSMsgType.CLOSING,
+                        ):
+                            break
+                        elif msg.type == aiohttp.WSMsgType.ERROR:
+                            log.warning("ws error: %s", ws.exception())
+                            break
+            except aiohttp.ClientError as exc:
+                log.warning("ComfyUI ws connection failed: %s", exc)
+            except asyncio.CancelledError:
+                raise
+
+            attempts += 1
+            if attempts > max_reconnects:
+                log.info("ws reconnect limit reached (%s); stopping.", max_reconnects)
+                return
+            await asyncio.sleep(reconnect_delay_sec)
 
 
 __all__ = [
