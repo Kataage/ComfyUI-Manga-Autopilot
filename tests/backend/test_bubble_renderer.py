@@ -38,6 +38,21 @@ def test_render_shout_bubble(tmp_path: Path) -> None:
     assert out.exists()
 
 
+def test_render_thought_bubble(tmp_path: Path) -> None:
+    out = tmp_path / "thought.png"
+    target = TailTarget(x=10, y=10)
+    render_bubble_to_png(
+        _bubble(type="thought", text="hmm", tail_target=target), str(out)
+    )
+    assert out.exists()
+
+
+def test_render_thought_bubble_without_tail(tmp_path: Path) -> None:
+    out = tmp_path / "thought_notail.png"
+    render_bubble_to_png(_bubble(type="thought", text=""), str(out))
+    assert out.exists()
+
+
 def test_render_with_tail(tmp_path: Path) -> None:
     out = tmp_path / "tail.png"
     target = TailTarget(x=10, y=10)
