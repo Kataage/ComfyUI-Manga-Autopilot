@@ -362,6 +362,53 @@ class ComfyClient:
         info = await self.get_object_info()
         return [name for name, payload in info.items() if isinstance(payload, dict)]
 
+    # --------------------------------------------------- /system_stats etc.
+    async def get_system_stats(self) -> dict[str, Any]:
+        """Return the ComfyUI server system stats (devices, OS, Python)."""
+
+        body = await self.get_json("/system_stats")
+        if not isinstance(body, dict):
+            raise ComfyUIRequestError(
+                f"Unexpected /system_stats response: {body!r}"
+            )
+        return body
+
+    async def get_devices(self) -> list[dict[str, Any]]:
+        """Return the list of compute devices reported by ComfyUI."""
+
+        body = await self.get_json("/devices")
+        if not isinstance(body, list):
+            raise ComfyUIRequestError(
+                f"Unexpected /devices response: {body!r}"
+            )
+        return [d for d in body if isinstance(d, dict)]
+
+    async def get_extensions(self) -> list[str]:
+        """Return the list of server-side API extension routes."""
+
+        body = await self.get_json("/extensions")
+        if not isinstance(body, list):
+            raise ComfyUIRequestError(
+                f"Unexpected /extensions response: {body!r}"
+            )
+        return [str(x) for x in body]
+
+    async def get_server_info(self) -> dict[str, Any]:
+        """Return a normalised server snapshot used by /health diagnostics."""
+
+        try:
+            stats = await self.get_system_stats()
+        except ComfyUIError:
+            stats = {}
+        try:
+            devices = await self.get_devices()
+        except ComfyUIError:
+            devices = []
+        return {
+            "system_stats": stats,
+            "devices": devices,
+        }
+
     def _ws_url(self, client_id: str | None = None) -> str:
         cid = client_id or self.client_id
         parsed = urlparse(self.base_url)
