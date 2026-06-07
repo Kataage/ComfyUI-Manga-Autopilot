@@ -7,6 +7,7 @@ Provides:
 - Concrete providers: ``ManualProvider``, ``OllamaProvider``, ``OpenAICompatibleProvider``
 - :func:`build_provider` factory that resolves a settings instance to a class
 - :func:`enforce_json_schema` helper to repair malformed LLM output (23.4)
+- :class:`RepairOutcome` and :class:`JSONRepairLoop` for configurable retry+repair
 """
 
 from __future__ import annotations
@@ -16,6 +17,7 @@ import json
 import logging
 import os
 import re
+from dataclasses import dataclass, field
 from typing import Any, Literal
 
 import aiohttp
@@ -73,18 +75,16 @@ class LLMProvider(abc.ABC):
         system: str | None = None,
         max_repair_attempts: int = 1,
     ) -> dict[str, Any]:
-        """Run ``complete`` and validate against ``schema`` (with one repair)."""
+        """Run ``complete`` and validate against ``schema`` (with up to N repair attempts)."""
 
-        text = await self.complete(prompt, schema=schema, system=system)
-        try:
-            return _validate_json(text, schema)
-        except ValueError as exc:
-            if max_repair_attempts <= 0:
-                raise
-            log.warning("LLM JSON invalid, requesting repair: %s", exc)
-            repair_prompt = _build_repair_prompt(text, schema, str(exc))
-            text2 = await self.complete(repair_prompt, schema=schema, system=system)
-            return _validate_json(text2, schema)
+        loop = JSONRepairLoop(
+            max_repair_attempts=max_repair_attempts,
+            system_prompt=system,
+        )
+        outcome = await loop.run(self, prompt, schema)
+        if not outcome.ok:
+            raise ValueError(outcome.error or "JSON repair exhausted")
+        return outcome.data
 
 
 class ManualProvider(LLMProvider):
@@ -224,13 +224,15 @@ def _validate_json(text: str, schema: dict[str, Any]) -> dict[str, Any]:
 
 
 def _build_repair_prompt(text: str, schema: dict[str, Any], error: str) -> str:
+    """Build the spec 23.4 repair prompt (canonical Japanese)."""
+
     return (
-        "The previous JSON failed to validate against the required schema.\n"
-        f"Error: {error}\n"
-        "Repair the following JSON so that it satisfies the schema.\n"
-        "Return only the repaired JSON. Do not include any commentary.\n\n"
+        "以下のJSONはパースに失敗しました。\n"
+        "指定Schemaに合うように修復し、JSONのみを返してください。\n"
+        "説明文は不要です。\n\n"
         f"Schema:\n{json.dumps(schema, ensure_ascii=False, indent=2)}\n\n"
-        f"Previous JSON:\n{text}\n"
+        f"Previous JSON:\n{text}\n\n"
+        f"Validation error: {error}\n"
     )
 
 
@@ -238,6 +240,66 @@ def enforce_json_schema(text: str, schema: dict[str, Any]) -> dict[str, Any]:
     """Public helper that wraps :func:`_validate_json` (spec section 23.4)."""
 
     return _validate_json(text, schema)
+
+
+# -------------------------------------------------------------- Repair loop
+@dataclass
+class RepairOutcome:
+    """Result of a single ``JSONRepairLoop`` invocation."""
+
+    ok: bool
+    data: dict[str, Any] | None = None
+    error: str | None = None
+    attempts: int = 0
+    history: list[str] = field(default_factory=list)
+
+
+@dataclass
+class JSONRepairLoop:
+    """Configurable retry + repair loop for LLM JSON output (spec 23.4).
+
+    The loop runs the original prompt, then on each failure asks the model to
+    repair the previous output via :func:`_build_repair_prompt`.  The number
+    of repair attempts is configurable via ``max_repair_attempts``.
+    """
+
+    max_repair_attempts: int = 1
+    system_prompt: str | None = None
+
+    async def run(
+        self,
+        provider: LLMProvider,
+        prompt: str,
+        schema: dict[str, Any],
+    ) -> RepairOutcome:
+        attempts = 0
+        last_error = "no attempt"
+        text = await provider.complete(prompt, schema=schema, system=self.system_prompt)
+        attempts += 1
+        try:
+            return RepairOutcome(ok=True, data=_validate_json(text, schema), attempts=attempts, history=[text])
+        except ValueError as exc:
+            last_error = str(exc)
+            log.warning("LLM JSON invalid (attempt %d): %s", attempts, exc)
+
+        for _ in range(self.max_repair_attempts):
+            repair_prompt = _build_repair_prompt(text, schema, last_error)
+            text = await provider.complete(
+                repair_prompt, schema=schema, system=self.system_prompt
+            )
+            attempts += 1
+            try:
+                return RepairOutcome(
+                    ok=True,
+                    data=_validate_json(text, schema),
+                    attempts=attempts,
+                    history=[text],
+                )
+            except ValueError as exc:
+                last_error = str(exc)
+                log.warning("LLM JSON repair invalid (attempt %d): %s", attempts, exc)
+
+        return RepairOutcome(ok=False, error=last_error, attempts=attempts, history=[text])
 
 
 __all__ = [
@@ -248,4 +310,6 @@ __all__ = [
     "OpenAICompatibleProvider",
     "build_provider",
     "enforce_json_schema",
+    "JSONRepairLoop",
+    "RepairOutcome",
 ]
