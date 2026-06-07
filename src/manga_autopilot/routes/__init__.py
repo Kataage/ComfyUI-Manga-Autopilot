@@ -60,6 +60,7 @@ def register_all(
 
     from manga_autopilot.routes import (
         bubble_routes,
+        character_routes,
         health_routes,
         workflow_routes,
     )
@@ -72,6 +73,7 @@ def register_all(
     health_routes.register(router)
     workflow_routes.register(router)
     bubble_routes.register(router)
+    character_routes.register(router)
 
 
 __all__ = ["RouteRegistrar", "register_all"]
