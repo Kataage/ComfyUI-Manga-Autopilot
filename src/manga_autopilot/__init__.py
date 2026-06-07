@@ -37,6 +37,21 @@ it at import time so the extension works regardless of where the
 ``custom_nodes/ComfyUI-Manga-Autopilot`` directory ends up on disk.
 """
 
+def _attach_routes_quietly() -> None:
+    """Best-effort hook to register routes when imported inside ComfyUI."""
+
+    try:
+        from manga_autopilot.comfy_integration import attach_routes_to_prompt_server
+
+        attach_routes_to_prompt_server()
+    except Exception:  # pragma: no cover - defensive
+        # Importing during tests or non-ComfyUI environments must never raise.
+        pass
+
+
+_attach_routes_quietly()
+
+
 __all__ = [
     "NODE_CLASS_MAPPINGS",
     "NODE_DISPLAY_NAME_MAPPINGS",
