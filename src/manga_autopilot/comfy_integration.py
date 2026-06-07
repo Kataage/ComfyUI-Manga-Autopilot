@@ -1,7 +1,10 @@
 """Optional ComfyUI integration glue.
 
 When the package is imported inside a running ComfyUI process, this module is
-responsible for binding our aiohttp routes onto the ``PromptServer`` singleton.
+responsible for binding our aiohttp routes onto the ``PromptServer`` singleton
+and configuring the application context (storage_root, workflow registry) so
+the route handlers can find their dependencies.
+
 Outside of ComfyUI (during pytest, standalone runs, etc.) the import is a
 no-op so the rest of the package stays testable.
 """
@@ -9,16 +12,43 @@ no-op so the rest of the package stays testable.
 from __future__ import annotations
 
 import logging
+import os
+import tempfile
+from pathlib import Path
 
 log = logging.getLogger(__name__)
 
 
-def attach_routes_to_prompt_server() -> bool:
-    """Attempt to attach Manga Autopilot routes to ComfyUI's PromptServer.
+def _resolve_app_and_routes(server_obj: object) -> tuple[object | None, object | None]:
+    """Return (application, router) for a ComfyUI PromptServer-like object.
 
-    Returns ``True`` if the integration succeeded, ``False`` otherwise.
-    This function never raises; failures are logged at INFO level because
-    they are expected outside ComfyUI (for example during tests).
+    Newer ComfyUI exposes ``.app`` (aiohttp Application). Older versions only
+    have ``.routes`` (UrlDispatcher). We try both, and fall back to walking
+    the attribute graph if neither matches.
+    """
+
+    app = getattr(server_obj, "app", None)
+    routes = getattr(server_obj, "routes", None)
+    if app is None and routes is not None and hasattr(routes, "_app"):
+        app = routes._app
+    return app, routes
+
+
+def _default_storage_root() -> Path:
+    """Pick a writable storage root when neither env nor caller set one."""
+
+    override = os.environ.get("MANGA_AUTOPILOT_STORAGE_ROOT")
+    if override:
+        return Path(override).expanduser().resolve()
+    return Path(tempfile.mkdtemp(prefix="manga_autopilot_")).resolve()
+
+
+def attach_routes_to_prompt_server() -> bool:
+    """Attach Manga Autopilot routes + context to ComfyUI's PromptServer.
+
+    Returns ``True`` if the integration succeeded, ``False`` otherwise. This
+    function never raises; failures are logged at INFO level because they are
+    expected outside ComfyUI (for example during tests).
     """
 
     try:
@@ -28,15 +58,32 @@ def attach_routes_to_prompt_server() -> bool:
         return False
 
     try:
-        routes = PromptServer.instance.routes
+        server = PromptServer.instance
     except Exception:  # pragma: no cover
-        log.exception("Failed to access PromptServer.instance.routes")
+        log.exception("Failed to access PromptServer.instance")
+        return False
+
+    app, routes = _resolve_app_and_routes(server)
+    if app is None and routes is None:
+        log.warning("PromptServer has neither .app nor .routes; skipping attachment.")
         return False
 
     from manga_autopilot.routes import register_all
 
-    register_all(routes)
-    log.info("Manga Autopilot routes attached to PromptServer.")
+    storage_root = _default_storage_root()
+    try:
+        if app is not None:
+            register_all(app, storage_root=str(storage_root))
+        else:
+            register_all(routes, storage_root=str(storage_root))
+    except Exception:  # pragma: no cover
+        log.exception("Failed to register Manga Autopilot routes")
+        return False
+
+    log.info(
+        "Manga Autopilot routes attached to PromptServer (storage_root=%s).",
+        storage_root,
+    )
     return True
 
 

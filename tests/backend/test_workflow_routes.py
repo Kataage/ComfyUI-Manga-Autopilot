@@ -144,12 +144,90 @@ async def test_validate_workflow_bad_graph(client, tmp_path) -> None:
     assert body["ok"] is False
 
 
-async def test_test_run_workflow(client) -> None:
+async def test_test_run_workflow_missing_graph(client) -> None:
     await client.post("/manga_autopilot/api/workflows", json=_payload())
     resp = await client.post(
-        "/manga_autopilot/api/workflows/anime_t2i_default/test-run"
+        "/manga_autopilot/api/workflows/anime_t2i_default/test-run", json={}
+    )
+    assert resp.status == 400
+
+
+async def test_test_run_workflow_submits_and_saves(client, monkeypatch, tmp_path) -> None:
+    payload = _payload()
+    payload["api_graph"] = {
+        "3": {"class_type": "KSampler", "inputs": {"seed": 1}},
+        "6": {"class_type": "CLIPTextEncode", "inputs": {"text": "1girl"}},
+        "9": {"class_type": "SaveImage", "inputs": {"filename_prefix": "manga"}},
+    }
+    await client.post("/manga_autopilot/api/workflows", json=payload)
+
+    class _FakeComfyClient:
+        def __init__(self) -> None:
+            self.submitted: list[dict] = []
+            self.view_calls: list[dict] = []
+
+        async def submit_workflow(self, graph, **kwargs):
+            self.submitted.append(graph)
+            return "prompt-abc"
+
+        async def get_history(self, prompt_id):
+            assert prompt_id == "prompt-abc"
+            return {
+                "prompt-abc": {
+                    "status": {"completed": True, "status_str": "success"},
+                    "outputs": {
+                        "9": {
+                            "images": [
+                                {"filename": "page_0001.png", "subfolder": "", "type": "output"}
+                            ]
+                        }
+                    },
+                }
+            }
+
+        async def fetch_image_to(self, dest, *, filename, subfolder, type):
+            self.view_calls.append(
+                {"dest": str(dest), "filename": filename, "subfolder": subfolder, "type": type}
+            )
+            Path(dest).write_bytes(b"\x89PNG\r\n\x1a\n")
+            return Path(dest)
+
+    fake = _FakeComfyClient()
+    client.app["manga_comfy_client"] = fake
+
+    resp = await client.post(
+        "/manga_autopilot/api/workflows/anime_t2i_default/test-run",
+        json={"overrides": {"positive_prompt": "1girl, blue hair"}, "output_dir": str(tmp_path)},
     )
     assert resp.status == 200
     body = await resp.json()
-    assert body["workflow_id"] == "anime_t2i_default"
     assert body["ok"] is True
+    assert body["prompt_id"] == "prompt-abc"
+    assert body["images_saved"]
+    assert fake.submitted and fake.submitted[0]["6"]["inputs"]["text"] == "1girl, blue hair"
+    saved = Path(body["images_saved"][0])
+    assert saved.exists()
+    assert saved.parent == tmp_path
+
+
+async def test_test_run_workflow_propagates_error(client) -> None:
+    payload = _payload()
+    payload["api_graph"] = {
+        "9": {"class_type": "SaveImage", "inputs": {"filename_prefix": "x"}},
+    }
+    await client.post("/manga_autopilot/api/workflows", json=payload)
+
+    from manga_autopilot.services.comfy_client import ComfyUIRequestError
+
+    class _FakeClient:
+        async def submit_workflow(self, graph, **kwargs):
+            raise ComfyUIRequestError("rejected", status=400, body="bad prompt")
+
+    client.app["manga_comfy_client"] = _FakeClient()
+    resp = await client.post(
+        "/manga_autopilot/api/workflows/anime_t2i_default/test-run", json={}
+    )
+    assert resp.status == 502
+    body = await resp.json()
+    assert body["ok"] is False
+    assert "rejected" in body["error"]

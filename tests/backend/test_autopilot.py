@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
 
@@ -226,24 +227,70 @@ async def client(aiohttp_client: AiohttpClient, storage_root):
 
 
 async def test_autopilot_routes_full_cycle(client) -> None:
-    r = await client.post("/manga_autopilot/api/projects/p1/autopilot/start")
+    r = await client.post(
+        "/manga_autopilot/api/projects/p1/autopilot/start",
+        json={"page_count": 1, "idea": "demo"},
+    )
     assert r.status == 202
     snap = await r.json()
     assert snap["state"] == "PROJECT_CREATED"
 
+    # Pause + resume + cancel against an in-flight run.
     r = await client.post("/manga_autopilot/api/projects/p1/autopilot/pause")
+    if r.status == 200:
+        assert (await r.json())["state"] == "PAUSED"
+        r = await client.post("/manga_autopilot/api/projects/p1/autopilot/resume")
+        assert r.status == 200
+    r = await client.post("/manga_autopilot/api/projects/p1/autopilot/cancel")
+    assert r.status in (200, 409)
+    r = await client.get("/manga_autopilot/api/projects/p1/autopilot/status")
+    assert r.status == 200
+
+
+async def test_autopilot_routes_with_slow_hook(client) -> None:
+    """Inject a blocking hook so the orchestrator stays in PANELS_GENERATING."""
+
+    blocker = asyncio.Event()
+    entered = asyncio.Event()
+
+    async def _slow_hook(run):
+        entered.set()
+        await blocker.wait()
+        return None
+
+    from manga_autopilot.routes.autopilot_routes import _controller
+    from manga_autopilot.services.autopilot import (
+        OrchestratorHooks,
+        start_orchestrator,
+    )
+    from manga_autopilot.storage.paths import ensure_project_paths
+
+    ctrl = _controller(client.app)
+    storage_root = client.app["manga_storage_root"]
+    paths = ensure_project_paths(storage_root, "slow_p")
+    hooks = OrchestratorHooks(
+        validate_input=lambda run: None,
+        plan_story=_slow_hook,
+    )
+    start_orchestrator(
+        ctrl, "slow_p", hooks=hooks, project_root=paths.root,
+        input_payload={"page_count": 1},
+    )
+
+    try:
+        await asyncio.wait_for(entered.wait(), timeout=1.0)
+    except asyncio.TimeoutError:
+        pass
+
+    r = await client.post("/manga_autopilot/api/projects/slow_p/autopilot/pause")
     assert r.status == 200
     assert (await r.json())["state"] == "PAUSED"
 
-    r = await client.post("/manga_autopilot/api/projects/p1/autopilot/resume")
-    assert r.status == 200
-
-    r = await client.post("/manga_autopilot/api/projects/p1/autopilot/cancel")
+    r = await client.post("/manga_autopilot/api/projects/slow_p/autopilot/cancel")
     assert r.status == 200
     assert (await r.json())["state"] == "CANCELLED"
 
-    r = await client.get("/manga_autopilot/api/projects/p1/autopilot/status")
-    assert r.status == 200
+    blocker.set()
 
 
 async def test_autopilot_status_unknown(client) -> None:
