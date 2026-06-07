@@ -1,0 +1,26 @@
+{
+  "workflow_id": "anime_i2i_default",
+  "name": "Anime Image-to-Image Default",
+  "type": "image_to_image",
+  "file": "workflows/anime_i2i_api.json",
+  "description": "Variation / redraw pipeline that consumes a previous panel as the latent image. Uses VAEEncode + KSampler with denoise < 1.0.",
+  "bindings": {
+    "positive_prompt": { "node_id": "6", "input": "text" },
+    "negative_prompt": { "node_id": "7", "input": "text" },
+    "seed": { "node_id": "3", "input": "seed" },
+    "width": { "node_id": "10", "input": "width" },
+    "height": { "node_id": "10", "input": "height" },
+    "reference_image": { "node_id": "10", "input": "image" },
+    "filename_prefix": { "node_id": "9", "input": "filename_prefix" }
+  },
+  "api_graph": {
+    "3": { "class_type": "KSampler", "inputs": { "seed": 7, "steps": 24, "cfg": 7.0, "sampler_name": "euler_ancestral", "scheduler": "normal", "denoise": 0.55, "model": ["4", 0], "positive": ["6", 0], "negative": ["7", 0], "latent_image": ["11", 0] } },
+    "4": { "class_type": "CheckpointLoaderSimple", "inputs": { "ckpt_name": "anything-v5.safetensors" } },
+    "6": { "class_type": "CLIPTextEncode", "inputs": { "text": "same character, slight variation", "clip": ["4", 1] } },
+    "7": { "class_type": "CLIPTextEncode", "inputs": { "text": "lowres, bad anatomy", "clip": ["4", 1] } },
+    "8": { "class_type": "VAEDecode", "inputs": { "samples": ["3", 0], "vae": ["4", 2] } },
+    "9": { "class_type": "SaveImage", "inputs": { "filename_prefix": "ComfyUI", "images": ["8", 0] } },
+    "10": { "class_type": "LoadImage", "inputs": { "image": "previous_panel.png" } },
+    "11": { "class_type": "VAEEncode", "inputs": { "pixels": ["10", 0], "vae": ["4", 2] } }
+  }
+}
