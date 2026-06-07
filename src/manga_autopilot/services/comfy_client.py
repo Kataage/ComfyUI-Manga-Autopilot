@@ -135,6 +135,16 @@ class ComfyClient:
                 body=text,
             ) from exc
 
+    @staticmethod
+    async def _read_json_compat(value: Any) -> Any:
+        """Internal helper used by tests to validate non-dict guards."""
+
+        if not isinstance(value, dict):
+            raise ComfyUIRequestError(
+                f"Unexpected response (not an object): {value!r}"
+            )
+        return value
+
     # ----------------------------------------------------------- /prompt API
     async def submit_workflow(
         self,
@@ -187,7 +197,51 @@ class ComfyClient:
         body = await self.get_json("/queue")
         return body if isinstance(body, dict) else {"queue": body}
 
-    # ------------------------------------------------------------- /ws API
+    # ---------------------------------------------------------- /history API
+    async def get_history(self, prompt_id: str | None = None) -> dict[str, Any]:
+        """Return ComfyUI's history.
+
+        With ``prompt_id`` provided this calls ``/history/{prompt_id}``.
+        Without it, the full history list is returned.  In both cases ComfyUI
+        responds with a mapping keyed by prompt id.
+        """
+
+        path = f"/history/{prompt_id}" if prompt_id else "/history"
+        body = await self.get_json(path)
+        if not isinstance(body, dict):
+            raise ComfyUIRequestError(
+                f"Unexpected history response (not an object): {body!r}"
+            )
+        return body
+
+    @staticmethod
+    def extract_output_images(history_entry: dict[str, Any]) -> list[dict[str, Any]]:
+        """Flatten ComfyUI history outputs into a list of image refs.
+
+        Each item carries at least ``filename``, ``subfolder``, ``type``, and
+        the originating ``node_id``.  Non-image outputs are ignored.
+        """
+
+        outputs = history_entry.get("outputs") or {}
+        if not isinstance(outputs, dict):
+            return []
+        images: list[dict[str, Any]] = []
+        for node_id, node_output in outputs.items():
+            if not isinstance(node_output, dict):
+                continue
+            for img in node_output.get("images") or []:
+                if not isinstance(img, dict):
+                    continue
+                images.append(
+                    {
+                        "node_id": node_id,
+                        "filename": img.get("filename"),
+                        "subfolder": img.get("subfolder", ""),
+                        "type": img.get("type", "output"),
+                    }
+                )
+        return images
+
     def _ws_url(self, client_id: str | None = None) -> str:
         cid = client_id or self.client_id
         parsed = urlparse(self.base_url)
