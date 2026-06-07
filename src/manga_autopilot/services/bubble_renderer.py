@@ -103,20 +103,25 @@ def _render_text(
     if not text:
         return
     color = _hex_to_rgb(font.color)
-    # Without a font file we use the bitmap default; size is informational.
     if direction == "vertical":
         # Render each character on its own line, right-aligned, descending.
         line_height = max(10, int(font.size * font.line_height))
         char_x = int(x + w - font.size - 4)
         cy = int(y + 4)
         for ch in text:
-            draw.text((char_x, cy), ch, fill=color)
+            if _should_rotate_vertical_punctuation(ch):
+                # The full glyph rotation requires a TTF renderer; without
+                # one we still draw the character (monospace default). The
+                # classifier is exposed so the bubble service can later
+                # rotate using a real font.
+                draw.text((char_x, cy), ch, fill=color)
+            else:
+                draw.text((char_x, cy), ch, fill=color)
             cy += line_height
             if cy > y + h - line_height:
                 break
     else:
         anchor = _text_anchor(direction, x, y, w, h)
-        # text() supports anchor only on newer Pillow; fall back gracefully.
         try:
             draw.text(
                 (int(x + w / 2), int(y + h / 2)),
@@ -126,6 +131,16 @@ def _render_text(
             )
         except TypeError:
             draw.text((int(x + 4), int(y + h / 2 - font.size / 2)), text, fill=color)
+
+
+# Japanese vertical punctuation that traditionally rotates 90deg clockwise.
+_VERTICAL_ROTATE_CHARS = set("、。,.「」『』?!！？・…ー")
+
+
+def _should_rotate_vertical_punctuation(char: str) -> bool:
+    """Return True for punctuation that should rotate in vertical Japanese."""
+
+    return char in _VERTICAL_ROTATE_CHARS
 
 
 def _draw_tail(
