@@ -1,17 +1,34 @@
 ---
 name: Bug report
-about: Report a bug
+about: Report a defect in ComfyUI Manga Autopilot
+title: 'bug: <short summary>'
 labels: ['type:bug']
+assignees: []
 ---
 
-## Description
+## Summary
+<!-- A one-line description of the bug. -->
 
-## Reproduction steps
+## Steps to reproduce
+1.
+2.
+3.
 
-## Expected behavior
+## Expected behaviour
+<!-- What you expected to happen. -->
 
-## Actual behavior
+## Actual behaviour
+<!-- What actually happened. Paste the traceback or HTTP response. -->
 
 ## Environment
+- ComfyUI version:
+- ComfyUI Manga Autopilot version / commit:
+- Python version:
+- OS:
+- LLM provider (manual / ollama / openai_compatible):
 
-## Logs / screenshots
+## Logs
+<!-- Paste relevant portions of the ComfyUI console, generation_log.json,
+or qa_report.json. Remove any sensitive data. -->
+
+## Notes
