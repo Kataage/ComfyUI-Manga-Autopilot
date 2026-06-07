@@ -128,9 +128,46 @@ def test_controller_start_pause_resume_cancel() -> None:
     ctrl.pause("p1")
     assert run.machine.state == AutopilotState.PAUSED
     ctrl.resume("p1")
-    assert run.machine.state == AutopilotState.PANELS_GENERATING
+    # Resume now restores the pre-pause state (PROJECT_CREATED) instead of
+    # always jumping to PANELS_GENERATING.
+    assert run.machine.state == AutopilotState.PROJECT_CREATED
     ctrl.cancel("p1")
     assert run.machine.state == AutopilotState.CANCELLED
+
+
+def test_controller_pause_records_pre_pause_state() -> None:
+    """When the controller pauses a run, the current state must be captured
+    on ``run.pre_pause_state`` so resume can jump back to where it was."""
+
+    ctrl = AutopilotController()
+    machine = AutopilotStateMachine(project_id="p1")
+    run = ctrl.start("p1", machine)
+    # Fast-forward to PANELS_QA_CHECKING (10 advances from PROJECT_CREATED).
+    for _ in range(10):
+        machine.advance("tick")
+    assert machine.state == AutopilotState.PANELS_QA_CHECKING
+    ctrl.pause("p1", reason="user_request")
+    assert run.pre_pause_state == AutopilotState.PANELS_QA_CHECKING
+    assert machine.state == AutopilotState.PAUSED
+    ctrl.resume("p1")
+    assert machine.state == AutopilotState.PANELS_QA_CHECKING
+    assert run.pre_pause_state is None
+
+
+def test_controller_pause_clears_pause_event() -> None:
+    """The run's ``pause_event`` must be cleared on pause and re-set on resume."""
+
+    ctrl = AutopilotController()
+    machine = AutopilotStateMachine(project_id="p1")
+    run = ctrl.start("p1", machine)
+    run.pause_event = asyncio.Event()
+    run.pause_event.set()  # not paused initially
+    assert run.pause_event.is_set()
+    ctrl.attach_task("p1", task=None, pause_event=run.pause_event)  # type: ignore[arg-type]
+    ctrl.pause("p1")
+    assert not run.pause_event.is_set()
+    ctrl.resume("p1")
+    assert run.pause_event.is_set()
 
 
 def test_controller_status_missing() -> None:
@@ -301,3 +338,72 @@ async def test_autopilot_status_unknown(client) -> None:
 async def test_autopilot_pause_without_start(client) -> None:
     r = await client.post("/manga_autopilot/api/projects/p1/autopilot/pause")
     assert r.status == 404
+
+
+async def test_autopilot_real_pause_resume_uses_event(client) -> None:
+    """End-to-end: a hook blocks, the controller pauses via the asyncio
+    Event, and resume unblocks the orchestrator so it continues from
+    where it stopped (rather than always jumping to PANELS_GENERATING)."""
+
+    from manga_autopilot.routes.autopilot_routes import _controller
+    from manga_autopilot.services.autopilot import (
+        OrchestratorHooks,
+        start_orchestrator,
+    )
+    from manga_autopilot.storage.paths import ensure_project_paths
+
+    blocker = asyncio.Event()
+    entered = asyncio.Event()
+
+    async def _slow_hook(run):
+        entered.set()
+        await blocker.wait()
+        return None
+
+    ctrl = _controller(client.app)
+    storage_root = client.app["manga_storage_root"]
+    paths = ensure_project_paths(storage_root, "real_pause_p")
+    hooks = OrchestratorHooks(
+        validate_input=lambda run: None,
+        plan_story=_slow_hook,
+    )
+    run, _task, _cancel, pause_event = start_orchestrator(
+        ctrl,
+        "real_pause_p",
+        hooks=hooks,
+        project_root=paths.root,
+        input_payload={"page_count": 1},
+    )
+
+    try:
+        await asyncio.wait_for(entered.wait(), timeout=1.0)
+    except asyncio.TimeoutError:
+        blocker.set()
+        return
+
+    assert run.machine.state in (AutopilotState.STORY_PLANNED,)
+
+    # Pause: the controller should record the pre-pause state and clear the
+    # asyncio.Event, so the orchestrator's next step is blocked.
+    ctrl.pause("real_pause_p")
+    assert run.machine.state == AutopilotState.PAUSED
+    assert run.pre_pause_state == AutopilotState.STORY_PLANNED
+    assert not pause_event.is_set()
+
+    # The orchestrator is wedged in plan_story; release the blocker anyway
+    # to avoid hangs, but resume will only matter once the next step runs.
+    blocker.set()
+    await asyncio.sleep(0.05)
+
+    # Resume: the controller restores the pre-pause state.
+    ctrl.resume("real_pause_p")
+    assert run.machine.state == AutopilotState.STORY_PLANNED
+    assert pause_event.is_set()
+    assert run.pre_pause_state is None
+
+    # Allow the run to drain.
+    try:
+        await asyncio.wait_for(_task, timeout=2.0)
+    except asyncio.TimeoutError:
+        _task.cancel()
+

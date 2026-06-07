@@ -50,14 +50,46 @@ STORAGE_ROOT_KEY = "manga_storage_root"
 REGISTRY_KEY = "manga_workflow_registry"
 DEFAULT_STORAGE_KEY = "manga_default_storage_root"
 
+# When this env var is set, ``register_all`` falls back to ``tempfile.mkdtemp``
+# even in production.  Tests rely on this so that a stray local run can't
+# pollute the user's real ComfyUI data directory.
+_TEST_TEMP_ENV = "MANGA_AUTOPILOT_FORCE_TEMP_STORAGE"
+
 
 def _default_storage_root() -> Path:
-    """Return a writable storage root for the current process."""
+    """Return a durable on-disk storage root.
+
+    Resolution order (first match wins):
+
+    1. ``$MANGA_AUTOPILOT_FORCE_TEMP_STORAGE`` set -> ``tempfile.mkdtemp``
+       (used by tests; never call this from a production startup).
+    2. ``$MANGA_AUTOPILOT_STORAGE_ROOT`` env override.
+    3. ``$COMFYUI_USER_DIR/manga_autopilot``.
+    4. ``<cwd>/user/default/manga_autopilot`` (ComfyUI's default user dir).
+    5. ``~/.manga_autopilot`` final fallback.
+
+    The directory is created on demand so callers do not have to remember
+    to ``mkdir -p`` it.
+    """
+
+    if os.environ.get(_TEST_TEMP_ENV):
+        return Path(tempfile.mkdtemp(prefix="manga_autopilot_routes_")).resolve()
 
     override = os.environ.get("MANGA_AUTOPILOT_STORAGE_ROOT")
     if override:
-        return Path(override).expanduser().resolve()
-    return Path(tempfile.mkdtemp(prefix="manga_autopilot_routes_")).resolve()
+        root = Path(override).expanduser().resolve()
+    else:
+        comfy_user = os.environ.get("COMFYUI_USER_DIR")
+        if comfy_user:
+            root = (Path(comfy_user) / "manga_autopilot").resolve()
+        else:
+            cwd_comfy_user = Path.cwd() / "user" / "default" / "manga_autopilot"
+            if cwd_comfy_user.parent.parent.exists():
+                root = cwd_comfy_user.resolve()
+            else:
+                root = (Path.home() / ".manga_autopilot").resolve()
+    root.mkdir(parents=True, exist_ok=True)
+    return root
 
 
 def _ensure_storage_root(app: web.Application, storage_root: str | Path | None) -> Path:
@@ -65,6 +97,7 @@ def _ensure_storage_root(app: web.Application, storage_root: str | Path | None) 
 
     if storage_root is not None:
         root = Path(storage_root).expanduser().resolve()
+        root.mkdir(parents=True, exist_ok=True)
     elif STORAGE_ROOT_KEY in app and isinstance(app[STORAGE_ROOT_KEY], Path):
         root = app[STORAGE_ROOT_KEY]
     else:

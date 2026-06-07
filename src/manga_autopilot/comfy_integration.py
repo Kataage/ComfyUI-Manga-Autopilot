@@ -12,8 +12,6 @@ no-op so the rest of the package stays testable.
 from __future__ import annotations
 
 import logging
-import os
-import tempfile
 from pathlib import Path
 
 log = logging.getLogger(__name__)
@@ -35,12 +33,15 @@ def _resolve_app_and_routes(server_obj: object) -> tuple[object | None, object |
 
 
 def _default_storage_root() -> Path:
-    """Pick a writable storage root when neither env nor caller set one."""
+    """Pick a durable on-disk storage root for this ComfyUI process.
 
-    override = os.environ.get("MANGA_AUTOPILOT_STORAGE_ROOT")
-    if override:
-        return Path(override).expanduser().resolve()
-    return Path(tempfile.mkdtemp(prefix="manga_autopilot_")).resolve()
+    Delegates to :func:`manga_autopilot.default_storage_root` which resolves
+    the user data directory using the documented precedence rules.
+    """
+
+    from manga_autopilot import default_storage_root
+
+    return default_storage_root()
 
 
 def attach_routes_to_prompt_server() -> bool:

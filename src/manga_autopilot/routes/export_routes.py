@@ -78,9 +78,15 @@ async def export_webtoon(request: web.Request) -> web.Response:
     page_pngs = body.get("page_pngs") or []
     if not isinstance(page_pngs, list) or not page_pngs:
         raise web.HTTPBadRequest(text="page_pngs must be a non-empty list of paths")
+    allow_asset_images = bool(
+        body.get("allow_asset_images")
+        or request.app.get("manga_allow_asset_images")
+    )
     svc = _service(request.app)
     try:
-        resolved = svc.resolve_page_pngs(project_id, page_pngs)
+        resolved = svc.resolve_page_pngs(
+            project_id, page_pngs, allow_asset_images=allow_asset_images
+        )
     except ValueError as exc:
         raise web.HTTPBadRequest(text=str(exc)) from exc
     outputs = svc.webtoon(project_id, resolved)
@@ -96,9 +102,15 @@ async def export_pdf(request: web.Request) -> web.Response:
     pdf_size: PDFSize = body.get("pdf_size", "A4")
     margin_mm = float(body.get("margin_mm", 10.0))
     dpi = int(body.get("dpi", 300))
+    allow_asset_images = bool(
+        body.get("allow_asset_images")
+        or request.app.get("manga_allow_asset_images")
+    )
     svc = _service(request.app)
     try:
-        resolved = svc.resolve_page_pngs(project_id, page_pngs)
+        resolved = svc.resolve_page_pngs(
+            project_id, page_pngs, allow_asset_images=allow_asset_images
+        )
     except ValueError as exc:
         raise web.HTTPBadRequest(text=str(exc)) from exc
     out = svc.pdf(project_id, resolved, pdf_size=pdf_size, margin_mm=margin_mm, dpi=dpi)
