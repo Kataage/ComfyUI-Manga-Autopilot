@@ -58,13 +58,20 @@ def register_all(
     which is the common case for tests and for ComfyUI's ``PromptServer``.
     """
 
-    from manga_autopilot.routes import health_routes, workflow_routes
+    from manga_autopilot.routes import (
+        bubble_routes,
+        health_routes,
+        workflow_routes,
+    )
 
     if isinstance(router, web.Application):
+        if storage_root is not None:
+            router["manga_storage_root"] = Path(storage_root).expanduser().resolve()
         _ensure_registry(router, storage_root)
 
     health_routes.register(router)
     workflow_routes.register(router)
+    bubble_routes.register(router)
 
 
 __all__ = ["RouteRegistrar", "register_all"]
