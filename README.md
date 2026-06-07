@@ -64,25 +64,43 @@ later issue, not yet wired up).
   unblocks the wait.  Mid-step pause is not automatic — hooks that may
   run for a long time should observe `run.pause_event` themselves if
   they need to bail out faster.
+- **1-page v1.0 happy path** — `POST /projects` → `POST /autopilot/start`
+  with `page_count=1` walks the full default pipeline: `StoryPlanner`
+  → `CharacterPlanner` → `PagePlanner` → `PanelPlanner` →
+  `PromptBuilder` → `GenerationLoop` (candidate → executor → QA → retry
+  → fallback) → `PageRenderer` → `ExportService` → `ManifestWriter`.
+  Each panel image lands in `assets/panels/`, the page render lands in
+  `exports/pages/page_0001.png`, and `manifest.json` +
+  `generation_log.json` are written.  A 1-page end-to-end integration
+  test (`test_one_page_e2e.py`) exercises this against fake LLM / fake
+  executor and verifies every artefact on disk.
+- **Project + panel HTTP APIs** — `GET/POST /projects`,
+  `GET/PATCH/DELETE /projects/{id}`, `GET /projects/_suggest_id`
+  (spec §21.2) and `POST /panels/{id}/{generate,regenerate,repair}`,
+  `PATCH /panels/{id}`, `GET /panels/{id}` (spec §21.6).  Generation
+  endpoints persist a `GenerationJob` (status / candidates / selected
+  candidate / retries) to `jobs/{job_id}.json` and update the
+  underlying `PanelRecord` with the new `image_path` + history.
 - **Web extension** — sidebar tab, project picker, page editor,
   character manager, progress monitor, export center, all mounted from
   `web/index.js`.
 
 ### Planned (spec-described, not yet wired up)
 
-- **LLM-driven story / character / page / panel planners.**  Today the
-  default orchestrator hooks call the corresponding services with
-  empty / placeholder inputs.  The planner modules themselves are
-  implemented and unit-tested, but the default project bootstrap does
-  not yet feed them with an LLM response — that wiring is tracked
-  separately.
+- **Multi-page autopilot runs.**  The default hooks are designed for
+  `page_count=1`; longer runs need richer LLM prompts, page-aware
+  bubble layouts, and progressive manifest updates.
 - **External GPU worker (Modal-style) end-to-end.**  `GPUBridge` knows
   how to serialise a workflow and fall back to local ComfyUI on
   timeout, but it is not yet used by the default orchestrator.
-- **Image-quality / prompt-alignment / character-consistency checkers.**
-  The QA + retry service has the hooks, but the per-checker scoring
-  defaults to a constant.  Real CLIP / IP-Adapter / face-similarity
-  scoring is on the roadmap.
+- **Real-image QA scoring.**  Today the QA loop runs the heuristics
+  (prompt alignment, bubble space, palette).  Real CLIP / IP-Adapter /
+  face-similarity scoring is on the roadmap; the `GenerationLoop`
+  already invokes the checkers and re-renders on failure, so dropping
+  in a better scorer does not change the surrounding wiring.
+- **Bubble lettering inside the autopilot.**  The `lettering` hook is
+  a no-op placeholder; bubble auto-placement is fully implemented but
+  not yet wired into the orchestrator pipeline.
 
 See `docs/comfyui_manga_autopilot_spec.md` §30-§42 for the detailed
 status of every phase.

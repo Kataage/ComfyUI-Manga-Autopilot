@@ -69,24 +69,44 @@ ComfyUI のカスタムノード拡張で、1 つのアイデアから短い漫�
   呼ぶと状態機械を pause 直前のステートに巻き戻し、ブロックを解除する。
   ステップ **実行中** の即時 pause は自動では効かないため、長時間走る
   hook は必要に応じて `run.pause_event` を自分自身で監視すること。
+- **1 ページ v1.0 happy path** — `POST /projects` → `POST /autopilot/start`
+  (`page_count=1`) で、デフォルトパイプラインを一通り完走する:
+  `StoryPlanner` → `CharacterPlanner` → `PagePlanner` → `PanelPlanner` →
+  `PromptBuilder` → `GenerationLoop` (候補生成 → executor 実行 → QA →
+  リトライ → fallback) → `PageRenderer` → `ExportService` →
+  `ManifestWriter`。 生成されたコマ画像は `assets/panels/`、ページ
+  レンダーは `exports/pages/page_0001.png`、`manifest.json` +
+  `generation_log.json` が書き出される。 fake LLM / fake executor
+  を使う 1 ページ E2E テスト (`test_one_page_e2e.py`) がディスク上の
+  成果物を検証する。
+- **Project / Panel HTTP API** — `GET/POST /projects`、
+  `GET/PATCH/DELETE /projects/{id}`、`GET /projects/_suggest_id` (spec
+  §21.2) と `POST /panels/{id}/{generate,regenerate,repair}`、
+  `PATCH /panels/{id}`、`GET /panels/{id}` (spec §21.6)。 生成
+  エンドポイントは `GenerationJob` (status / candidates / 選択候補 /
+  リトライ履歴) を `jobs/{job_id}.json` に永続化し、対象の
+  `PanelRecord` の `image_path` と history を更新する。
 - **Web 拡張** — サイドバータブ、プロジェクトピッカー、ページエディタ、
   キャラクターマネージャー、進捗モニター、書き出しセンターを
   `web/index.js` からマウント。
 
 ### Planned (未接続 / スタブ)
 
-- **LLM 駆動の story / character / page / panel planner のフル接続。**
-  デフォルトの Orchestrator フックは対応するサービスを空 / プレースホルダ
-  入力で呼ぶ。プランナー本体は実装 + ユニットテスト済みだが、デフォルトの
-  プロジェクトブートストラップはまだ LLM 応答を渡していない。配線は別
-  イシューで追跡。
+- **複数ページの自動操縦。** デフォルトのフックは `page_count=1` を
+  想定して書かれており、複数ページ実行には LLM プロンプトの強化、
+  ページ単位の吹き出しレイアウト、段階的な manifest 更新が必要。
 - **外部 GPU worker (Modal 風) のエンドツーエンド接続。** `GPUBridge` は
   ワークフローのシリアライズとローカル ComfyUI フォールバックを実装済み
   だが、デフォルト Orchestrator からはまだ使われていない。
-- **画像品質 / プロンプト整合性 / キャラクター一貫性チェッカー。**
-  QA + リトライサービスにはフックはあるが、各チェッカーのスコアは定数を
- 返している。 実際の CLIP / IP-Adapter / 顔類似度スコアリングはロードマップ
-  上の作業。
+- **実画像 QA スコアリング。** 現在はヒューリスティック (プロンプト整合性、
+  吹き出しスペース、パレット) を使っている。 CLIP / IP-Adapter / 顔
+  類似度スコアリングはロードマップ上の作業。`GenerationLoop` は既に
+  チェッカーを呼び出して失敗時に再生成するので、チェッカーを差し替える
+  だけで周辺のコードはそのまま動く。
+- **Autopilot 内の吹き出しレタリング。** `lettering` フックはまだ
+  no-op プレースホルダ。 吹き出し自動配置 (`bubble_layout.py`) は
+  完全実装済みでユニットテストもあるが、Orchestrator パイプラインには
+  未接続。
 
 各フェーズの詳細ステータスは `docs/comfyui_manga_autopilot_spec.md`
 §30-§42 を参照。
