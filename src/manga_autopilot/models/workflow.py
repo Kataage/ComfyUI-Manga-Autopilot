@@ -81,20 +81,52 @@ class WorkflowDefinition(BaseModel):
             )
         return value
 
-    def required_bindings(self) -> tuple[str, ...]:
-        """Return the list of bindings required for this workflow type."""
+    # -- per-type required binding tables -------------------------------------
+    # These are the canonical spec-12.3 binding requirements.  ``width`` /
+    # ``height`` are required for workflows that synthesise pixels from
+    # scratch; workflows that consume an existing image (upscale, face_detail,
+    # inpaint) inherit dimensions from the input.
+    _PROMPT_REQUIRED: frozenset[str] = frozenset({"text_to_image"})
+    _REFERENCE_REQUIRED: frozenset[str] = frozenset(
+        {"reference_to_image", "image_to_image", "inpaint", "face_detail", "upscale"}
+    )
+    _DIMENSION_REQUIRED: frozenset[str] = frozenset(
+        {"text_to_image", "reference_to_image", "image_to_image", "background_only"}
+    )
 
-        base = (
-            "positive_prompt",
-            "negative_prompt",
-            "seed",
-            "width",
-            "height",
-        )
-        output_binding = ("output_node", "filename_prefix")
-        if self.type_value() in {"reference_to_image", "image_to_image"}:
-            return base + ("reference_image",) + output_binding
-        return base + output_binding
+    def required_bindings(self) -> tuple[str, ...]:
+        """Return the list of bindings required for this workflow type.
+
+        The base set:
+
+        - positive_prompt
+        - negative_prompt
+        - seed
+
+        Plus, depending on the workflow type:
+
+        - ``width`` and ``height`` for pixel-synthesising workflows
+        - ``reference_image`` for workflows that consume an image
+
+        For output selection, at least one of ``output_node`` or
+        ``filename_prefix`` must be bound.  We expose the pair as
+        :data:`OUTPUT_BINDING_ALTERNATIVES` so callers can special-case it.
+        """
+
+        wtype = self.type_value()
+        parts: list[str] = ["positive_prompt", "negative_prompt", "seed"]
+        if wtype in self._DIMENSION_REQUIRED:
+            parts.extend(["width", "height"])
+        if wtype in self._REFERENCE_REQUIRED:
+            parts.append("reference_image")
+        return tuple(parts)
+
+    OUTPUT_BINDING_ALTERNATIVES: tuple[str, ...] = ("output_node", "filename_prefix")
+
+    def has_output_binding(self) -> bool:
+        """Return whether either output alternative is bound."""
+
+        return any(key in self.bindings for key in self.OUTPUT_BINDING_ALTERNATIVES)
 
     def type_value(self) -> str:
         return self.type.value if isinstance(self.type, WorkflowType) else str(self.type)
@@ -102,12 +134,16 @@ class WorkflowDefinition(BaseModel):
     @model_validator(mode="after")
     def _ensure_required_bindings(self) -> WorkflowDefinition:
         required = set(self.required_bindings())
-        # At least one of output_node / filename_prefix must be bound.
         present = set(self.bindings)
         missing = required - present
-        if missing and "output_node" not in present and "filename_prefix" not in present:
+        if missing:
             raise ValueError(
                 f"workflow is missing required bindings: {sorted(missing)}"
+            )
+        if not self.has_output_binding():
+            raise ValueError(
+                "workflow must bind at least one of: "
+                + ", ".join(self.OUTPUT_BINDING_ALTERNATIVES)
             )
         return self
 

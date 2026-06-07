@@ -32,6 +32,8 @@ class PanelLayout(BaseModel):
     margin: float = Field(default=0.0, ge=0.0, le=512.0)
     bleed: bool = False
     rotation: float | None = Field(default=None, ge=-180.0, le=180.0)
+    image_path: str | None = Field(default=None, max_length=1024)
+    image_fit: str = Field(default="cover", pattern=r"^(cover|contain|stretch)$")
 
     @field_validator("panel_id")
     @classmethod

@@ -97,3 +97,7 @@
   window.MangaAutopilot = window.MangaAutopilot || {};
   window.MangaAutopilot.mountProgressMonitor = ProgressMonitor;
 })();
+
+export function mountProgressMonitor(container, opts) {
+  return window.MangaAutopilot?.mountProgressMonitor?.(container, opts);
+}

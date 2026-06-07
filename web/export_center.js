@@ -88,3 +88,7 @@
   window.MangaAutopilot = window.MangaAutopilot || {};
   window.MangaAutopilot.mountExportCenter = ExportCenter;
 })();
+
+export function mountExportCenter(container, opts) {
+  return window.MangaAutopilot?.mountExportCenter?.(container, opts);
+}

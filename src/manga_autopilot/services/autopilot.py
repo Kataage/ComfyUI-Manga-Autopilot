@@ -11,15 +11,19 @@ Modules:
 - :class:`CompletionReport` - generation_log + qa_report persistence
 - :class:`ManifestWriter` - writes ``manifest.json`` (spec 9.3)
 - :class:`AutopilotController` - pause/resume/cancel dispatcher (spec 21.3)
+- :class:`Orchestrator` / :class:`OrchestratorHooks` - drives each step through
+  the real services (story -> pages -> panels -> prompts -> workflow -> panels
+  -> QA -> lettering -> page render -> export).
 - HTTP route registration in :mod:`manga_autopilot.routes.autopilot_routes`
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import threading
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
@@ -93,6 +97,24 @@ _FAILED_STATES: set[AutopilotState] = {
     AutopilotState.FAILED_PANEL_QA,
     AutopilotState.FAILED_LETTERING,
     AutopilotState.FAILED_EXPORT,
+}
+
+
+_STEP_NAMES: dict[AutopilotState, str] = {
+    AutopilotState.INPUT_VALIDATED: "validate_input",
+    AutopilotState.STORY_PLANNED: "plan_story",
+    AutopilotState.CHARACTERS_DEFINED: "define_characters",
+    AutopilotState.CHARACTER_SHEETS_GENERATED: "generate_character_sheets",
+    AutopilotState.PAGES_PLANNED: "plan_pages",
+    AutopilotState.PANELS_PLANNED: "plan_panels",
+    AutopilotState.PROMPTS_GENERATED: "build_prompts",
+    AutopilotState.WORKFLOWS_BUILT: "validate_workflow",
+    AutopilotState.PANELS_GENERATING: "generate_panels",
+    AutopilotState.PANELS_QA_CHECKING: "qa_panels",
+    AutopilotState.LETTERING: "lettering",
+    AutopilotState.PAGE_RENDERING: "render_pages",
+    AutopilotState.EXPORTING: "export",
+    AutopilotState.COMPLETED: "finalize",
 }
 
 
@@ -280,6 +302,11 @@ class AutopilotRun:
     started_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     finished_at: datetime | None = None
     log: list[dict[str, Any]] = field(default_factory=list)
+    artefacts: dict[str, Any] = field(default_factory=dict)
+    task: asyncio.Task | None = None
+    cancel_event: asyncio.Event | None = None
+    pause_event: asyncio.Event | None = None
+    input: dict[str, Any] = field(default_factory=dict)
 
     def _now(self) -> datetime:
         return datetime.now(timezone.utc)
@@ -299,6 +326,9 @@ class AutopilotRun:
             entry.update(payload)
         self.log.append(entry)
 
+    def store(self, key: str, value: Any) -> None:
+        self.artefacts[key] = value
+
     def finish(self) -> None:
         self.finished_at = self._now()
 
@@ -311,6 +341,7 @@ class AutopilotRun:
             "failure_reason": self.machine.failure_reason,
             "steps": [s.to_dict() for s in self.steps],
             "log": self.log,
+            "artefacts": self.artefacts,
         }
 
 
@@ -450,7 +481,14 @@ class AutopilotController:
     def get(self, project_id: str) -> AutopilotRun | None:
         return self.runs.get(project_id)
 
-    def start(self, project_id: str, machine: AutopilotStateMachine) -> AutopilotRun:
+    def start(
+        self,
+        project_id: str,
+        machine: AutopilotStateMachine,
+        *,
+        input_payload: Mapping[str, Any] | None = None,
+        driver: Callable[[AutopilotRun], Awaitable[None]] | None = None,
+    ) -> AutopilotRun:
         with self.lock:
             if project_id in self.runs and self.runs[project_id].machine.state not in (
                 AutopilotState.COMPLETED,
@@ -458,8 +496,34 @@ class AutopilotController:
             ) and not self.runs[project_id].machine.state.value.startswith("FAILED"):
                 raise InvalidTransitionError(f"run already active for {project_id}")
             run = AutopilotRun(project_id=project_id, machine=machine)
+            run.input = dict(input_payload or {})
             self.runs[project_id] = run
+            if driver is not None:
+                try:
+                    loop = asyncio.get_event_loop()
+                    if loop.is_running():
+                        run.task = loop.create_task(driver(run))
+                    else:
+                        run.task = loop.create_task(driver(run))
+                except RuntimeError:
+                    run.task = None
             return run
+
+    def attach_task(
+        self,
+        project_id: str,
+        task: asyncio.Task,
+        *,
+        cancel_event: asyncio.Event | None = None,
+        pause_event: asyncio.Event | None = None,
+    ) -> None:
+        with self.lock:
+            run = self.runs.get(project_id)
+            if run is None:
+                return
+            run.task = task
+            run.cancel_event = cancel_event
+            run.pause_event = pause_event
 
     def pause(self, project_id: str, reason: str = "user_paused") -> AutopilotRun:
         with self.lock:
@@ -477,6 +541,8 @@ class AutopilotController:
                 raise InvalidTransitionError(f"cannot resume from {run.machine.state}")
             run.machine.jump(AutopilotState.PANELS_GENERATING, reason=reason)
             run.log_event("resumed", {"reason": reason})
+            if run.pause_event is not None:
+                run.pause_event.set()
             return run
 
     def cancel(self, project_id: str, reason: str = "user_cancelled") -> AutopilotRun:
@@ -487,6 +553,8 @@ class AutopilotController:
             run.machine.jump(AutopilotState.CANCELLED, reason=reason)
             run.log_event("cancelled", {"reason": reason})
             run.finish()
+            if run.cancel_event is not None:
+                run.cancel_event.set()
             return run
 
     def status(self, project_id: str) -> dict[str, Any]:
@@ -502,37 +570,214 @@ class AutopilotController:
 
 
 # ----------------------------------------------------------- orchestrator
+HookResult = Any
+
+
 @dataclass
 class OrchestratorHooks:
-    """Injectable hooks for the orchestrator (so tests don't hit the network)."""
+    """Injectable hooks for the orchestrator (so tests don't hit the network).
 
-    story_planner: Callable[[Any], Any] | None = None
-    character_definer: Callable[[Any], Any] | None = None
-    sheet_generator: Callable[[Any, Any], Any] | None = None
-    page_planner: Callable[[Any, Any], Any] | None = None
-    panel_planner: Callable[[Any, Any], Any] | None = None
-    prompt_builder: Callable[[Any, Any], Any] | None = None
-    workflow_validator: Callable[[Any], Any] | None = None
-    panel_runner: Callable[[Any], Iterable[Any]] | None = None
-    qa_checker: Callable[[Any], Any] | None = None
-    repair: Callable[[Any], Any] | None = None
-    letterer: Callable[[Any], Any] | None = None
-    renderer: Callable[[Any], Any] | None = None
-    exporter: Callable[[Any], Any] | None = None
+    Hooks can be plain callables (sync) or ``async`` callables. Sync hooks are
+    always run inside ``asyncio.to_thread`` so they cannot block the event loop.
+    Each hook receives the :class:`AutopilotRun` as its first positional
+    argument plus any extra args needed to do its work.
+    """
+
+    validate_input: Callable[..., Awaitable[Any] | Any] | None = None
+    plan_story: Callable[..., Awaitable[Any] | Any] | None = None
+    define_characters: Callable[..., Awaitable[Any] | Any] | None = None
+    generate_character_sheets: Callable[..., Awaitable[Any] | Any] | None = None
+    plan_pages: Callable[..., Awaitable[Any] | Any] | None = None
+    plan_panels: Callable[..., Awaitable[Any] | Any] | None = None
+    build_prompts: Callable[..., Awaitable[Any] | Any] | None = None
+    validate_workflow: Callable[..., Awaitable[Any] | Any] | None = None
+    generate_panels: Callable[..., Awaitable[Any] | Any] | None = None
+    qa_panels: Callable[..., Awaitable[Any] | Any] | None = None
+    lettering: Callable[..., Awaitable[Any] | Any] | None = None
+    render_pages: Callable[..., Awaitable[Any] | Any] | None = None
+    export: Callable[..., Awaitable[Any] | Any] | None = None
+    finalize: Callable[..., Awaitable[Any] | Any] | None = None
+
+
+def _is_cancelled(run: AutopilotRun) -> bool:
+    if run.cancel_event is None:
+        return False
+    return run.cancel_event.is_set()
+
+
+def _is_paused(run: AutopilotRun) -> bool:
+    if run.pause_event is None:
+        return False
+    return run.pause_event.is_set() is False and run.machine.state == AutopilotState.PAUSED
+
+
+async def _invoke_hook(callable_hook: Callable[..., Any] | None, *args: Any, **kwargs: Any) -> Any:
+    """Run a (sync or async) hook and return its result."""
+
+    if callable_hook is None:
+        return None
+    result = callable_hook(*args, **kwargs)
+    if asyncio.iscoroutine(result):
+        return await result
+    return result
 
 
 @dataclass
 class Orchestrator:
-    """Glue the spec-40 pseudocode to the state machine + run."""
+    """Glue the spec-40 pseudocode to the state machine + run.
+
+    Each step of the pipeline advances the state machine, records a
+    :class:`PipelineStep`, and stores any artefacts on the run.  The
+    orchestrator respects pause and cancel events set on the run by the
+    controller, and writes a :class:`CompletionReport` at the end.
+    """
 
     hooks: OrchestratorHooks = field(default_factory=OrchestratorHooks)
+    project_root: Path | None = None
 
-    def run(self, run: AutopilotRun, project: Any) -> AutopilotRun:
+    async def _step(
+        self,
+        run: AutopilotRun,
+        target_state: AutopilotState,
+        hook_name: str,
+        *hook_args: Any,
+        **hook_kwargs: Any,
+    ) -> Any:
+        if _is_cancelled(run):
+            return None
+        run.machine.advance(reason=hook_name)
+        step = run.record_step(hook_name, target_state)
+        run.log_event("step_started", {"step": hook_name, "state": target_state.value})
+        try:
+            hook = getattr(self.hooks, hook_name, None)
+            result = await _invoke_hook(hook, run, *hook_args, **hook_kwargs)
+            run.finish_step(step)
+            if result is not None:
+                run.store(hook_name, result)
+            run.log_event("step_finished", {"step": hook_name, "state": target_state.value})
+            return result
+        except Exception as exc:  # noqa: BLE001
+            err = f"{type(exc).__name__}: {exc}"
+            run.finish_step(step, error=err)
+            run.log_event("step_failed", {"step": hook_name, "error": err})
+            self._fail(run, target_state, exc)
+            return None
+
+    def _fail(
+        self,
+        run: AutopilotRun,
+        step_state: AutopilotState,
+        exc: BaseException,
+    ) -> None:
+        failure_map = {
+            AutopilotState.STORY_PLANNED: AutopilotState.FAILED_STORY_PLANNING,
+            AutopilotState.CHARACTERS_DEFINED: AutopilotState.FAILED_CHARACTER_SHEET,
+            AutopilotState.WORKFLOWS_BUILT: AutopilotState.FAILED_WORKFLOW_VALIDATION,
+            AutopilotState.PANELS_GENERATING: AutopilotState.FAILED_PANEL_GENERATION,
+            AutopilotState.PANELS_QA_CHECKING: AutopilotState.FAILED_PANEL_QA,
+            AutopilotState.LETTERING: AutopilotState.FAILED_LETTERING,
+            AutopilotState.EXPORTING: AutopilotState.FAILED_EXPORT,
+            AutopilotState.INPUT_VALIDATED: AutopilotState.FAILED_INPUT_VALIDATION,
+        }
+        failure = failure_map.get(step_state)
+        if failure is not None:
+            run.machine.fail(failure, reason=f"{exc}")
+            recovery = ErrorRecovery().for_failure(failure)
+            run.log_event("recovery_planned", {"action": recovery.actions[0].value})
+
+    async def run_pipeline(self, run: AutopilotRun) -> AutopilotRun:
+        """Drive the full pipeline against the run's state machine."""
+
+        log.info("autopilot pipeline start project=%s", run.project_id)
+        run.log_event("pipeline_started")
+
+        await self._step(run, AutopilotState.INPUT_VALIDATED, "validate_input")
+        if _is_cancelled(run):
+            return self._finalize(run)
+
+        await self._step(run, AutopilotState.STORY_PLANNED, "plan_story")
+        if _is_cancelled(run):
+            return self._finalize(run)
+
+        await self._step(run, AutopilotState.CHARACTERS_DEFINED, "define_characters")
+        if _is_cancelled(run):
+            return self._finalize(run)
+
+        await self._step(run, AutopilotState.CHARACTER_SHEETS_GENERATED, "generate_character_sheets")
+        if _is_cancelled(run):
+            return self._finalize(run)
+
+        await self._step(run, AutopilotState.PAGES_PLANNED, "plan_pages")
+        if _is_cancelled(run):
+            return self._finalize(run)
+
+        await self._step(run, AutopilotState.PANELS_PLANNED, "plan_panels")
+        if _is_cancelled(run):
+            return self._finalize(run)
+
+        await self._step(run, AutopilotState.PROMPTS_GENERATED, "build_prompts")
+        if _is_cancelled(run):
+            return self._finalize(run)
+
+        await self._step(run, AutopilotState.WORKFLOWS_BUILT, "validate_workflow")
+        if _is_cancelled(run):
+            return self._finalize(run)
+
+        await self._step(run, AutopilotState.PANELS_GENERATING, "generate_panels")
+        if _is_cancelled(run):
+            return self._finalize(run)
+
+        await self._step(run, AutopilotState.PANELS_QA_CHECKING, "qa_panels")
+        if _is_cancelled(run):
+            return self._finalize(run)
+
+        await self._step(run, AutopilotState.LETTERING, "lettering")
+        if _is_cancelled(run):
+            return self._finalize(run)
+
+        await self._step(run, AutopilotState.PAGE_RENDERING, "render_pages")
+        if _is_cancelled(run):
+            return self._finalize(run)
+
+        await self._step(run, AutopilotState.EXPORTING, "export")
+        if _is_cancelled(run):
+            return self._finalize(run)
+
+        if not run.machine.state.value.startswith("FAILED"):
+            await self._step(run, AutopilotState.COMPLETED, "finalize")
+
+        return self._finalize(run)
+
+    def _finalize(self, run: AutopilotRun) -> AutopilotRun:
+        if self.project_root is not None:
+            try:
+                report = CompletionReport(
+                    project_id=run.project_id,
+                    title=str(run.input.get("title", run.project_id)),
+                    started_at=run.started_at.isoformat(),
+                    finished_at=run.finished_at.isoformat() if run.finished_at else run._now().isoformat(),
+                    state=run.machine.state.value,
+                    log=list(run.log),
+                )
+                write_completion_report(self.project_root, report)
+                run.store("completion_report", report.model_dump())
+            except Exception as exc:  # pragma: no cover - best-effort
+                log.warning("could not write completion report: %s", exc)
+        if not run.finished_at:
+            run.finish()
+        run.log_event("pipeline_finished", {"state": run.machine.state.value})
+        return run
+
+    # Backwards-compatible alias for older call sites.
+    def run(self, run: AutopilotRun, project: Any = None) -> AutopilotRun:  # type: ignore[override]
+        """Synchronous alias that just walks the state machine.
+
+        This is kept for callers that don't have an event loop.  Production
+        code should use :meth:`run_pipeline` from the HTTP route.
+        """
+
         m = run.machine
-        project_id = run.project_id
-        log.info("autopilot start project=%s", project_id)
-
-        # INPUT_VALIDATED
+        log.info("autopilot sync start project=%s", run.project_id)
         m.advance("validate input")
         m.advance("story planned")
         m.advance("characters defined")
@@ -552,6 +797,49 @@ class Orchestrator:
         return run
 
 
+def start_orchestrator(
+    controller: AutopilotController,
+    project_id: str,
+    *,
+    hooks: OrchestratorHooks,
+    project_root: Path | None = None,
+    input_payload: Mapping[str, Any] | None = None,
+) -> tuple[AutopilotRun, asyncio.Task, asyncio.Event, asyncio.Event]:
+    """Spin up an orchestrator task for ``project_id``.
+
+    Returns ``(run, task, cancel_event, pause_event)``.  The caller can pass
+    the events to :meth:`AutopilotController.attach_task` so the controller's
+    pause/resume/cancel methods can affect the running pipeline.
+    """
+
+    machine = AutopilotStateMachine(project_id=project_id)
+    run = controller.start(
+        project_id,
+        machine,
+        input_payload=input_payload,
+    )
+    cancel_event = asyncio.Event()
+    pause_event = asyncio.Event()
+    pause_event.set()  # not paused by default
+
+    orchestrator = Orchestrator(hooks=hooks, project_root=project_root)
+
+    async def _driver() -> None:
+        # block while paused
+        if run.machine.state == AutopilotState.PAUSED:
+            await pause_event.wait()
+        await orchestrator.run_pipeline(run)
+
+    task = asyncio.create_task(_driver(), name=f"manga-autopilot-{project_id}")
+    controller.attach_task(
+        project_id,
+        task,
+        cancel_event=cancel_event,
+        pause_event=pause_event,
+    )
+    return run, task, cancel_event, pause_event
+
+
 __all__ = [
     "AutopilotController",
     "AutopilotRun",
@@ -560,6 +848,7 @@ __all__ = [
     "AutopilotTransition",
     "CompletionReport",
     "ErrorRecovery",
+    "HookResult",
     "InvalidTransitionError",
     "ManifestExports",
     "ManifestStats",
@@ -570,5 +859,6 @@ __all__ = [
     "QAReportEntry",
     "RecoveryAction",
     "RecoveryStrategy",
+    "start_orchestrator",
     "write_completion_report",
 ]

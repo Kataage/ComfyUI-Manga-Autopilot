@@ -19,13 +19,83 @@ ComfyUI のカスタムノード拡張で、1 つのアイデアから短い漫�
 [`docs/comfyui_manga_autopilot_spec.md`](docs/comfyui_manga_autopilot_spec.md)
 (v1.0.0) の設計に準拠しています。
 
+## ステータス (v0.x → v1.0.0)
+
+このセクションは「今日、何が実際に動くのか」の唯一の正解です。
+機能リストは **Implemented** (テストと HTTP API でカバー済み) と
+**Planned** (仕様書には記載済みだが、未接続 / スタブ) に分けています。
+
+### Implemented (実装済み)
+
+- **HTTP API** — `/manga_autopilot/api/{health,workflows,…}` を ComfyUI の
+  `PromptServer` Application に登録。 各ハンドラは Application コンテキスト
+  の `manga_storage_root` / `manga_workflow_registry` を解決するので、
+  ComfyUI 起動後に character / export / workflow ルートが 500 にならない。
+- **ワークフローレジストリ** — 登録、一覧、取得、更新、削除。タイプ別の
+  必須 binding 検証 (`text_to_image` は `positive_prompt/negative_prompt/
+  seed/width/height` + `output_node` または `filename_prefix` の片方が必須;
+  `upscale` は `reference_image` が必須; `reference_to_image` /
+  `image_to_image` は `reference_image` を追加; など)。
+- **ワークフローのテストラン** — `/workflows/{id}/test-run` は
+  `ComfyClient.submit_workflow` 経由で ComfyUI に投入し、`/history/{id}`
+  をポーリングし、`/view` で画像を取得して
+  `{storage_root}/test_runs/{workflow_id}/` に保存する。
+- **ComfyClient** — `/prompt`、`/history/{id}`、`/view`、`/upload/image`、
+  `/object_info`、`/system_stats`、`/devices`、`/extensions`、WebSocket
+  `/ws` の全トランスポート層。
+- **プロジェクトストレージレイアウト** — `ensure_storage_root` /
+  `ensure_project_paths` が仕様書 §9.1 のディレクトリを作成する。
+- **キャラクターサービス** — CRUD、参照画像アップロード(サイズ / 拡張子
+  検証)、`build_character_prompt`、IP-Adapter / LoRA オーバーライド、
+  シートビューヘルパー、キャラクタカード書き出し。
+- **吹き出しサービス** — CRUD、分類器による回転付き自動配置、PNG
+  レンダリング。
+- **ページレンダラー** — コマ枠 **および** 生成画像を 1 枚のページ PNG に
+  合成 (`cover` / `contain` / `stretch` のフィットモード、任意回転)。
+- **書き出しサービス** — PNG ページ、Webtoon 連結 + スライス、
+  PDF (A4/B5/Kindle/custom、余白、DPI)、プロジェクトバンドラー。
+- **書き出しパスの安全性** — `ExportService.resolve_page_pngs` は
+  プロジェクトストレージツリー外のファイルを拒否する。
+- **プロジェクトインポーター** — 安全な zip 展開 (Zip Slip 対策: 絶対パス
+  と `..` セグメントを拒否)。
+- **Autopilot** — 16 ステート + 8 失敗ステートの状態機械、エラーリカバリ
+  テーブル、`AutopilotController` (pause / resume / cancel)、各ステップ
+  をストーリー → ページ → コマ → プロンプト → ワークフロー → コマ生成 →
+  QA → レタリング → ページ描画 → 書き出し → finalize の順に進める
+  `Orchestrator` (各ステップは注入可能なフック)。
+  HTTP `/autopilot/{start,pause,resume,cancel,status}` はバックグラウンドの
+  `asyncio.Task` で Orchestrator を起動し、pause / cancel イベントを尊重する。
+- **Web 拡張** — サイドバータブ、プロジェクトピッカー、ページエディタ、
+  キャラクターマネージャー、進捗モニター、書き出しセンターを
+  `web/index.js` からマウント。
+
+### Planned (未接続 / スタブ)
+
+- **LLM 駆動の story / character / page / panel planner のフル接続。**
+  デフォルトの Orchestrator フックは対応するサービスを空 / プレースホルダ
+  入力で呼ぶ。プランナー本体は実装 + ユニットテスト済みだが、デフォルトの
+  プロジェクトブートストラップはまだ LLM 応答を渡していない。配線は別
+  イシューで追跡。
+- **外部 GPU worker (Modal 風) のエンドツーエンド接続。** `GPUBridge` は
+  ワークフローのシリアライズとローカル ComfyUI フォールバックを実装済み
+  だが、デフォルト Orchestrator からはまだ使われていない。
+- **画像品質 / プロンプト整合性 / キャラクター一貫性チェッカー。**
+  QA + リトライサービスにはフックはあるが、各チェッカーのスコアは定数を
+ 返している。 実際の CLIP / IP-Adapter / 顔類似度スコアリングはロードマップ
+  上の作業。
+
+各フェーズの詳細ステータスは `docs/comfyui_manga_autopilot_spec.md`
+§30-§42 を参照。
+
 ## 特徴
 
 - **プロジェクト + ストーリー構成** (LLM 駆動、JSON 修復機能付き)
-- **キャラクターマネージャー** - 参照画像アップロード、IP-Adapter、LoRA バインディング
-- **ワークフローレジストリ** - ライブの ComfyUI `object_info` に対するスキーマ検証と
-  ワンクリックのテストラン
-- **ページ / コマエディタ** - テンプレートベースのレイアウトと SVG/PNG レンダリング
+- **キャラクターマネージャー** - 参照画像アップロード、IP-Adapter、LoRA
+  バインディング
+- **ワークフローレジストリ** - ライブの ComfyUI `object_info` に対する
+  スキーマ検証とワンクリックのテストラン
+- **ページ / コマエディタ** - テンプレートベースのレイアウトと SVG/PNG
+  レンダリング
 - **吹き出し** - 自動配置、縦書き日本語対応、PNG 出力
 - **候補生成** - シードポリシーによる複数候補 / **QA スコアリング** /
   リトライプロンプト (spec 17-18)
@@ -63,16 +133,6 @@ ComfyUI を再起動すると、UI に「Manga Autopilot」タブが表示され
 
 詳細は [`docs/quickstart.ja.md`](docs/quickstart.ja.md) を参照してください。
 
-```text
-1. ComfyUI を起動
-2. custom_nodes に本リポジトリを配置
-3. 依存関係をインストール
-4. Manga Autopilot タブを開く
-5. サンプルワークフロー (workflows/anime_t2i_api.json) を登録
-6. サンプルプロジェクトを作成
-7. 「Export PNG」を実行
-```
-
 ## サンプルワークフロー
 
 `workflows/` ディレクトリにすぐに登録できる API 形式のワークフローを
@@ -89,15 +149,12 @@ ComfyUI を再起動すると、UI に「Manga Autopilot」タブが表示され
 - [`docs/quickstart.ja.md`](docs/quickstart.ja.md) - 最短手順
 - [`docs/install.ja.md`](docs/install.ja.md) - インストール
 - [`docs/workflow_binding.ja.md`](docs/workflow_binding.ja.md) - ワークフロー登録
-- [`docs/character_consistency.ja.md`](docs/character_consistency.ja.md) - キャラクター一貫性
+- [`docs/character_consistency.ja.md`](docs/character_consistency.ja.md) -
+  キャラクター一貫性
 - [`docs/troubleshooting.ja.md`](docs/troubleshooting.ja.md) - トラブルシューティング
 - [`docs/contribution.ja.md`](docs/contribution.ja.md) - コントリビューション
-- [`docs/comfyui_manga_autopilot_spec.md`](docs/comfyui_manga_autopilot_spec.md) - 仕様書
-
-## ステータス
-
-v1.0.0 リリース前につき、公開 API とフォルダ構成は変更される可能性があります。
-実装は上記の仕様に対してイシュー単位で進めています。
+- [`docs/comfyui_manga_autopilot_spec.md`](docs/comfyui_manga_autopilot_spec.md) -
+  仕様書
 
 ## ライセンス
 

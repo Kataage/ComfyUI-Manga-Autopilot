@@ -292,3 +292,11 @@
   window.MangaAutopilot.mountCharacterManager = CharacterManager;
   window.MangaAutopilot.characterPresets = { EXPRESSIONS, POSES, ROLES };
 })();
+
+export function mountCharacterManager(container, opts) {
+  return window.MangaAutopilot?.mountCharacterManager?.(container, opts);
+}
+
+export const characterPresets = window.MangaAutopilot?.characterPresets || {
+  EXPRESSIONS: [], POSES: [], ROLES: [],
+};

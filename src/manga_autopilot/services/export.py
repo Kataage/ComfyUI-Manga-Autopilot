@@ -16,14 +16,18 @@ import logging
 import zipfile
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Literal
 
 from PIL import Image
 
 from manga_autopilot.models.panel import PanelLayout
 from manga_autopilot.services.page_renderer import render_page_to_png
-from manga_autopilot.storage.paths import ensure_project_paths, project_paths
+from manga_autopilot.storage.paths import (
+    EXPORT_SUBDIRS,
+    ensure_project_paths,
+    project_paths,
+)
 
 log = logging.getLogger(__name__)
 
@@ -242,9 +246,36 @@ class ProjectBundler:
 
 @dataclass
 class ProjectImporter:
-    """Import a previously-bundled project zip back into storage."""
+    """Import a previously-bundled project zip back into storage.
+
+    The importer is **safe against Zip Slip** attacks (CVE-2018-1002200 family)
+    and against absolute / parent-traversal paths inside the archive.  Every
+    entry is resolved relative to the project root and rejected if it escapes
+    that root.
+    """
 
     storage_root: Path
+
+    def _safe_target(self, target_root: Path, name: str) -> Path:
+        """Validate ``name`` resolves inside ``target_root`` and return the safe path."""
+
+        # Normalise slashes; reject absolute paths outright.
+        normalised = name.replace("\\", "/")
+        if normalised.startswith("/") or normalised.startswith("\\"):
+            raise ValueError(f"zip entry has an absolute path: {name!r}")
+        # ``PurePosixPath`` treats ``..`` lexically so it can't escape the root.
+        candidate = PurePosixPath(normalised)
+        if any(part == ".." for part in candidate.parts):
+            raise ValueError(f"zip entry escapes the project root: {name!r}")
+        dest = (target_root / candidate).resolve()
+        target_resolved = target_root.resolve()
+        try:
+            dest.relative_to(target_resolved)
+        except ValueError as exc:
+            raise ValueError(
+                f"zip entry {name!r} escapes the project root after resolution"
+            ) from exc
+        return dest
 
     def import_zip(self, zip_path: str | Path, project_id: str | None = None) -> Path:
         zip_path = Path(zip_path)
@@ -256,7 +287,18 @@ class ProjectImporter:
                 raise ValueError("zip is empty")
             inferred_id = project_id or zip_path.stem
             target = ensure_project_paths(self.storage_root, inferred_id)
-            zf.extractall(target.root)
+            for entry in zf.infolist():
+                safe_name = self._safe_target(target.root, entry.filename)
+                if entry.is_dir():
+                    safe_name.mkdir(parents=True, exist_ok=True)
+                    continue
+                safe_name.parent.mkdir(parents=True, exist_ok=True)
+                with zf.open(entry) as src, safe_name.open("wb") as out:
+                    while True:
+                        chunk = src.read(64 * 1024)
+                        if not chunk:
+                            break
+                        out.write(chunk)
         return target.root
 
 
@@ -349,6 +391,50 @@ class ExportService:
             if d.exists():
                 files.extend(sorted(p for p in d.rglob("*") if p.is_file()))
         return files
+
+    def resolve_page_pngs(
+        self,
+        project_id: str,
+        page_pngs: Sequence[str | Path],
+    ) -> list[Path]:
+        """Validate that every page PNG lives inside the project's export tree.
+
+        Only paths that resolve to a file directly inside
+        ``{storage_root}/projects/{project_id}/exports/pages/`` (or one of its
+        sibling export subdirs: webtoon / pdf) are accepted.  Absolute paths
+        and paths that escape the project root raise :class:`ValueError`.
+        """
+
+        paths = project_paths(self.storage_root, project_id)
+        allowed_roots = [paths.export(sub).resolve() for sub in EXPORT_SUBDIRS]
+        allowed_roots.append(paths.assets.resolve())  # panel images may live here
+        resolved: list[Path] = []
+        for raw in page_pngs:
+            p = Path(raw).expanduser()
+            if not p.is_absolute():
+                raise ValueError(
+                    f"page_pngs entries must be absolute paths; got {p!r}"
+                )
+            abs_path = p.resolve()
+            if not abs_path.is_file():
+                raise ValueError(f"page_pngs entry does not exist: {abs_path}")
+            inside = any(
+                _is_within(abs_path, root) for root in allowed_roots
+            )
+            if not inside:
+                raise ValueError(
+                    f"page_pngs entry is outside the project storage tree: {abs_path}"
+                )
+            resolved.append(abs_path)
+        return resolved
+
+
+def _is_within(path: Path, root: Path) -> bool:
+    try:
+        path.relative_to(root)
+        return True
+    except ValueError:
+        return False
 
 
 __all__ = [

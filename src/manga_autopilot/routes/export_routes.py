@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import logging
-from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from aiohttp import web
@@ -80,7 +79,11 @@ async def export_webtoon(request: web.Request) -> web.Response:
     if not isinstance(page_pngs, list) or not page_pngs:
         raise web.HTTPBadRequest(text="page_pngs must be a non-empty list of paths")
     svc = _service(request.app)
-    outputs = svc.webtoon(project_id, [Path(p) for p in page_pngs])
+    try:
+        resolved = svc.resolve_page_pngs(project_id, page_pngs)
+    except ValueError as exc:
+        raise web.HTTPBadRequest(text=str(exc)) from exc
+    outputs = svc.webtoon(project_id, resolved)
     return web.json_response({"webtoon": [str(p) for p in outputs]})
 
 
@@ -94,7 +97,11 @@ async def export_pdf(request: web.Request) -> web.Response:
     margin_mm = float(body.get("margin_mm", 10.0))
     dpi = int(body.get("dpi", 300))
     svc = _service(request.app)
-    out = svc.pdf(project_id, [Path(p) for p in page_pngs], pdf_size=pdf_size, margin_mm=margin_mm, dpi=dpi)
+    try:
+        resolved = svc.resolve_page_pngs(project_id, page_pngs)
+    except ValueError as exc:
+        raise web.HTTPBadRequest(text=str(exc)) from exc
+    out = svc.pdf(project_id, resolved, pdf_size=pdf_size, margin_mm=margin_mm, dpi=dpi)
     return web.json_response({"pdf": str(out)})
 
 
