@@ -14,6 +14,7 @@ import asyncio
 import json
 import logging
 from collections.abc import AsyncIterator
+from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse, urlunparse
 
@@ -241,6 +242,43 @@ class ComfyClient:
                     }
                 )
         return images
+
+    # ------------------------------------------------------------- /view API
+    async def fetch_view(
+        self,
+        filename: str,
+        *,
+        subfolder: str = "",
+        type: str = "output",
+    ) -> bytes:
+        """Download the binary contents of a ComfyUI output file."""
+
+        if not filename:
+            raise ValueError("filename must be non-empty")
+        params: dict[str, Any] = {"filename": filename, "type": type}
+        if subfolder:
+            params["subfolder"] = subfolder
+        return await self.get_bytes("/view", **params)
+
+    async def fetch_image_to(
+        self,
+        destination: Path,
+        *,
+        filename: str,
+        subfolder: str = "",
+        type: str = "output",
+    ) -> Path:
+        """Download a ComfyUI output image and write it to ``destination``.
+
+        The destination's parent directories are created on demand.  Returns
+        the destination path for convenience.
+        """
+
+        dest = Path(destination)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        payload = await self.fetch_view(filename, subfolder=subfolder, type=type)
+        dest.write_bytes(payload)
+        return dest
 
     def _ws_url(self, client_id: str | None = None) -> str:
         cid = client_id or self.client_id
