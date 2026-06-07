@@ -23,6 +23,7 @@ from manga_autopilot.services.autopilot import (
     ManifestStats,
     ManifestWriter,
     Orchestrator,
+    OrchestratorHooks,
     QAReportEntry,
     RecoveryAction,
     write_completion_report,
@@ -406,4 +407,113 @@ async def test_autopilot_real_pause_resume_uses_event(client) -> None:
         await asyncio.wait_for(_task, timeout=2.0)
     except asyncio.TimeoutError:
         _task.cancel()
+
+
+async def test_orchestrator_step_blocks_on_pause_event_when_state_paused() -> None:
+    """Regression for the round-2 review.
+
+    When ``machine.state == PAUSED`` (i.e. the controller has paused the
+    run) the orchestrator's ``_step`` must block on ``pause_event.wait()``
+    rather than short-circuit and let the pipeline walk on to the next
+    step.  The previous implementation had
+    ``if run.machine.state != PAUSED: await pause_event.wait()`` followed
+    by ``if _is_paused(run): return None``, which meant that a paused run
+    would silently skip every subsequent step and finalize.
+    """
+
+    machine = AutopilotStateMachine(project_id="p_pause")
+    # Drive the state machine to PANELS_QA_CHECKING then jump to PAUSED
+    # to mimic what the controller does on pause().
+    for _ in range(10):
+        machine.advance("seed")
+    assert machine.state == AutopilotState.PANELS_QA_CHECKING
+    machine.jump(AutopilotState.PAUSED, reason="user_paused")
+
+    run = AutopilotRun(project_id="p_pause", machine=machine)
+    run.pause_event = asyncio.Event()
+    run.pause_event.clear()  # pause is in effect
+
+    invoked = asyncio.Event()
+    orch = Orchestrator()
+
+    async def _hook(r) -> str:
+        invoked.set()
+        return "ok"
+
+    orch.hooks = OrchestratorHooks(plan_story=_hook)
+
+    # Start the step; it must block on the cleared pause event, NOT
+    # short-circuit and return None.
+    step_task = asyncio.create_task(
+        orch._step(run, AutopilotState.STORY_PLANNED, "plan_story")
+    )
+    # Give the event loop a chance to schedule the task.
+    await asyncio.sleep(0.05)
+    assert not step_task.done(), "_step returned while paused; it must block on the event"
+    assert not invoked.is_set(), "the hook must not have been called yet"
+    assert machine.state == AutopilotState.PAUSED
+
+    # Now resume: controller sets the event and rewinds the state to the
+    # pre-pause state.
+    machine.jump(AutopilotState.PANELS_QA_CHECKING, reason="user_resumed")
+    run.pause_event.set()
+
+    result = await asyncio.wait_for(step_task, timeout=1.0)
+    assert result == "ok"
+    assert invoked.is_set()
+    # The state machine must have advanced by exactly one step (from
+    # PANELS_QA_CHECKING, the rewound pre-pause state) to LETTERING.
+    assert machine.state == AutopilotState.LETTERING
+
+
+async def test_orchestrator_step_blocks_across_multiple_steps() -> None:
+    """After the user pauses mid-pipeline, EVERY subsequent ``_step`` call
+    must block on the pause event rather than return immediately.  Only
+    the resume call should unblock them all in order."""
+
+    machine = AutopilotStateMachine(project_id="p_multi")
+    run = AutopilotRun(project_id="p_multi", machine=machine)
+    run.pause_event = asyncio.Event()
+    run.pause_event.set()  # not paused initially
+
+    call_log: list[str] = []
+
+    async def _make_hook(name: str):
+        async def _hook(r):
+            call_log.append(name)
+            return name
+        return _hook
+
+    orch = Orchestrator()
+    orch.hooks = OrchestratorHooks(
+        validate_input=await _make_hook("v"),
+        plan_story=await _make_hook("p"),
+    )
+
+    # First step: not paused, should run.
+    result_v = await asyncio.wait_for(
+        orch._step(run, AutopilotState.INPUT_VALIDATED, "validate_input"),
+        timeout=1.0,
+    )
+    assert result_v == "v"
+    assert machine.state == AutopilotState.INPUT_VALIDATED
+
+    # Pause: clear event, jump state to PAUSED.
+    machine.jump(AutopilotState.PAUSED, reason="user_paused")
+    run.pause_event.clear()
+
+    # Schedule the next two steps; they must both block.
+    step1 = asyncio.create_task(
+        orch._step(run, AutopilotState.STORY_PLANNED, "plan_story")
+    )
+    await asyncio.sleep(0.05)
+    assert not step1.done()
+
+    # Resume: rewind state, set event.
+    machine.jump(AutopilotState.INPUT_VALIDATED, reason="user_resumed")
+    run.pause_event.set()
+
+    result_p = await asyncio.wait_for(step1, timeout=1.0)
+    assert result_p == "p"
+    assert call_log == ["v", "p"]
 
