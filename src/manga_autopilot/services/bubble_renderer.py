@@ -40,6 +40,30 @@ def _ellipse_points(
     return pts
 
 
+def _cloud_points(
+    x: float, y: float, w: float, h: float, lobes: int = 9
+) -> list[tuple[float, float]]:
+    """Return a cloud-shaped point list made of overlapping circles.
+
+    Each lobe is a small circle on the ellipse perimeter.  Drawing the
+    polygon as a single ``PIL.ImageDraw.polygon`` gives a cloud-like
+    silhouette with a single outline.
+    """
+
+    cx, cy = x + w / 2, y + h / 2
+    rx, ry = w / 2, h / 2
+    lobe_radius = min(w, h) / (2 * lobes)
+    pts: list[tuple[float, float]] = []
+    for i in range(lobes):
+        theta = (2 * math.pi * i) / lobes
+        lx = cx + (rx - lobe_radius) * math.cos(theta)
+        ly = cy + (ry - lobe_radius) * math.sin(theta)
+        for k in range(16):
+            phi = (2 * math.pi * k) / 16
+            pts.append((lx + lobe_radius * math.cos(phi), ly + lobe_radius * math.sin(phi)))
+    return pts
+
+
 def _jagged_points(
     x: float, y: float, w: float, h: float, spikes: int = 18, jitter: float = 0.12
 ) -> list[tuple[float, float]]:
@@ -142,6 +166,28 @@ def draw_bubble_on_canvas(
         points = _jagged_points(x, y, width, height)
         draw.polygon(points, fill=fill, outline=outline)
         _draw_tail(draw, points, bubble.tail_target, fill, outline, stroke)
+    elif bubble.type == "thought":
+        points = _cloud_points(x, y, width, height)
+        draw.polygon(points, fill=fill, outline=outline)
+        # Two small leading circles act as a "thought" tail.
+        if bubble.tail_target is not None:
+            tx, ty = bubble.tail_target.x, bubble.tail_target.y
+            for radius in (10, 5):
+                d = ((tx - x) ** 2 + (ty - y) ** 2) ** 0.5
+                if d == 0:
+                    break
+                ux = (tx - x) / d
+                uy = (ty - y) / d
+                cxp = tx + ux * radius
+                cyp = ty + uy * radius
+                draw.ellipse(
+                    [
+                        (cxp - radius, cyp - radius),
+                        (cxp + radius, cyp + radius),
+                    ],
+                    fill=fill,
+                    outline=outline,
+                )
     else:
         points = _ellipse_points(x, y, width, height)
         draw.polygon(points, fill=fill, outline=outline)
