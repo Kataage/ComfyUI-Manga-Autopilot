@@ -326,6 +326,42 @@ class ComfyClient:
             )
         return body
 
+    # --------------------------------------------------------- /object_info
+    async def get_object_info(self, node_class: str | None = None) -> dict[str, Any]:
+        """Return the ComfyUI node registry, optionally filtered by class.
+
+        When ``node_class`` is ``None``, the full registry is returned as a
+        mapping of class name -> info.  When provided, the single matching
+        entry is returned (or an empty dict if not found).
+        """
+
+        if node_class:
+            full = await self.get_json("/object_info", node_class=node_class)
+            if not isinstance(full, dict):
+                raise ComfyUIRequestError(
+                    f"Unexpected /object_info response: {full!r}"
+                )
+            entry = full.get(node_class)
+            return entry if isinstance(entry, dict) else {}
+        full = await self.get_json("/object_info")
+        if not isinstance(full, dict):
+            raise ComfyUIRequestError(
+                f"Unexpected /object_info response: {full!r}"
+            )
+        return full
+
+    async def has_node(self, node_class: str) -> bool:
+        """Return whether a given node class is registered with ComfyUI."""
+
+        entry = await self.get_object_info(node_class)
+        return bool(entry)
+
+    async def list_node_classes(self) -> list[str]:
+        """Return the list of node class names known to ComfyUI."""
+
+        info = await self.get_object_info()
+        return [name for name, payload in info.items() if isinstance(payload, dict)]
+
     def _ws_url(self, client_id: str | None = None) -> str:
         cid = client_id or self.client_id
         parsed = urlparse(self.base_url)
