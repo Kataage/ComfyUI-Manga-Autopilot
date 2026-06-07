@@ -280,6 +280,52 @@ class ComfyClient:
         dest.write_bytes(payload)
         return dest
 
+    # ----------------------------------------------------------- /upload API
+    async def upload_image(
+        self,
+        source: str | Path | bytes,
+        *,
+        filename: str | None = None,
+        subfolder: str = "",
+        image_type: str = "input",
+        overwrite: bool = True,
+        content_type: str = "image/png",
+    ) -> dict[str, Any]:
+        """Upload a reference image to ComfyUI's ``/upload/image`` endpoint.
+
+        ``source`` may be a filesystem path or raw bytes.  When a path is
+        supplied, ``filename`` defaults to the path's basename.  Returns the
+        ComfyUI response dict (typically containing ``name``, ``subfolder``,
+        ``type``).
+        """
+
+        if isinstance(source, (str, Path)):
+            path = Path(source)
+            data = path.read_bytes()
+            upload_name = filename or path.name
+        elif isinstance(source, (bytes, bytearray)):
+            data = bytes(source)
+            if not filename:
+                raise ValueError("filename is required when uploading raw bytes")
+            upload_name = filename
+        else:
+            raise TypeError(f"Unsupported source type: {type(source).__name__}")
+
+        fields: dict[str, Any] = {
+            "image": (upload_name, data, content_type),
+            "type": image_type,
+            "overwrite": "true" if overwrite else "false",
+        }
+        if subfolder:
+            fields["subfolder"] = subfolder
+
+        body = await self.post_multipart("/upload/image", fields)
+        if not isinstance(body, dict):
+            raise ComfyUIRequestError(
+                f"Unexpected /upload/image response: {body!r}"
+            )
+        return body
+
     def _ws_url(self, client_id: str | None = None) -> str:
         cid = client_id or self.client_id
         parsed = urlparse(self.base_url)
