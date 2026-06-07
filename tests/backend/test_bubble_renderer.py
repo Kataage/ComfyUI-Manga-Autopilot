@@ -78,6 +78,25 @@ def test_vertical_text_uses_descending_layout() -> None:
     draw_bubble_on_canvas(canvas, _bubble(text="abc", direction="vertical"), 50, 50, 200, 300)
 
 
+def test_vertical_japanese_text_renders() -> None:
+    canvas = Image.new("RGB", (400, 800), (255, 255, 255))
+    draw_bubble_on_canvas(
+        canvas,
+        _bubble(text="こんにちは、世界！", direction="vertical"),
+        50, 50, 250, 600,
+    )
+    # The test passes if no exception is raised.
+
+
+def test_vertical_punctuation_classifier() -> None:
+    from manga_autopilot.services.bubble_renderer import (
+        _should_rotate_vertical_punctuation,
+    )
+    assert _should_rotate_vertical_punctuation("、")
+    assert _should_rotate_vertical_punctuation("。")
+    assert not _should_rotate_vertical_punctuation("あ")
+
+
 def test_custom_font_size() -> None:
     canvas = Image.new("RGB", (400, 400), (255, 255, 255))
     bubble = _bubble(
