@@ -161,6 +161,8 @@ def register_all(
         character_routes,
         export_routes,
         health_routes,
+        panel_routes,
+        project_routes,
         workflow_routes,
     )
 
@@ -175,6 +177,8 @@ def register_all(
     character_routes.register(router)
     autopilot_routes.register(router)
     export_routes.register(router)
+    project_routes.register(router)
+    panel_routes.register(router)
 
 
 __all__ = [

@@ -8,6 +8,13 @@ from manga_autopilot.models.character import (
     LoraRef,
     Outfit,
 )
+from manga_autopilot.models.job import (
+    CandidateImageMeta,
+    GenerationJob,
+    JobStatus,
+    read_job,
+    write_job,
+)
 from manga_autopilot.models.project import (
     OutputFormat,
     Project,
@@ -18,9 +25,12 @@ from manga_autopilot.models.project import (
 
 __all__ = [
     "AssetRef",
+    "CandidateImageMeta",
     "Character",
     "CharacterAppearance",
     "ColorPalette",
+    "GenerationJob",
+    "JobStatus",
     "LoraRef",
     "Outfit",
     "OutputFormat",
@@ -28,4 +38,6 @@ __all__ = [
     "ProjectGenerationSettings",
     "ProjectSettings",
     "ProjectStatus",
+    "read_job",
+    "write_job",
 ]
