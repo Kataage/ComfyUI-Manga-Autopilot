@@ -62,6 +62,7 @@ def register_all(
         autopilot_routes,
         bubble_routes,
         character_routes,
+        export_routes,
         health_routes,
         workflow_routes,
     )
@@ -76,6 +77,7 @@ def register_all(
     bubble_routes.register(router)
     character_routes.register(router)
     autopilot_routes.register(router)
+    export_routes.register(router)
 
 
 __all__ = ["RouteRegistrar", "register_all"]
