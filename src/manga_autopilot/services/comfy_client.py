@@ -128,6 +128,58 @@ class ComfyClient:
                 body=text,
             ) from exc
 
+    # ----------------------------------------------------------- /prompt API
+    async def submit_workflow(
+        self,
+        workflow: dict[str, Any],
+        *,
+        client_id: str | None = None,
+        extra_data: dict[str, Any] | None = None,
+    ) -> str:
+        """Submit an API-format workflow and return the assigned ``prompt_id``.
+
+        ``workflow`` is the bare ``{node_id: {class_type, inputs}}`` mapping --
+        the same shape ComfyUI's ``/prompt`` endpoint expects under the
+        ``prompt`` key.  The wrapper attaches ``client_id`` (defaulting to
+        ``self.client_id``) and optional ``extra_data``.
+        """
+
+        if not isinstance(workflow, dict) or not workflow:
+            raise ValueError("workflow must be a non-empty mapping of node ids")
+
+        payload: dict[str, Any] = {
+            "prompt": workflow,
+            "client_id": client_id or self.client_id,
+        }
+        if extra_data:
+            payload["extra_data"] = extra_data
+
+        response = await self.post_json("/prompt", payload)
+        if not isinstance(response, dict):
+            raise ComfyUIRequestError(
+                f"Unexpected /prompt response (not an object): {response!r}"
+            )
+
+        if "error" in response and response.get("error"):
+            raise ComfyUIRequestError(
+                f"/prompt rejected: {response.get('error')}",
+                body=str(response),
+            )
+
+        prompt_id = response.get("prompt_id")
+        if not isinstance(prompt_id, str) or not prompt_id:
+            raise ComfyUIRequestError(
+                f"/prompt response missing prompt_id: {response!r}",
+                body=str(response),
+            )
+        return prompt_id
+
+    async def get_queue_state(self) -> dict[str, Any]:
+        """Return ComfyUI's current queue state (running + pending)."""
+
+        body = await self.get_json("/queue")
+        return body if isinstance(body, dict) else {"queue": body}
+
 
 __all__ = [
     "ComfyClient",
