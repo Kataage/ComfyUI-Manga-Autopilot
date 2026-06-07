@@ -58,10 +58,12 @@ later issue, not yet wired up).
   injectable hooks (story → pages → panels → prompts → workflow →
   panels → QA → lettering → render → export → finalize).  HTTP
   `/autopilot/{start,pause,resume,cancel,status}` routes kick off the
-  orchestrator in a background `asyncio.Task`; the orchestrator
-  cooperatively `await`s an `asyncio.Event` on each step, so `pause`
-  is honoured mid-step and `resume` restores the pipeline to the
-  state it was in before the pause.
+  orchestrator in a background `asyncio.Task`.  The orchestrator honours
+  pause **at the start of every step** by awaiting an `asyncio.Event`;
+  a `resume` call rewinds the state machine to the pre-pause state and
+  unblocks the wait.  Mid-step pause is not automatic — hooks that may
+  run for a long time should observe `run.pause_event` themselves if
+  they need to bail out faster.
 - **Web extension** — sidebar tab, project picker, page editor,
   character manager, progress monitor, export center, all mounted from
   `web/index.js`.

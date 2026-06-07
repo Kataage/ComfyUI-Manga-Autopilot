@@ -64,9 +64,11 @@ ComfyUI のカスタムノード拡張で、1 つのアイデアから短い漫�
   QA → レタリング → ページ描画 → 書き出し → finalize の順に進める
   `Orchestrator` (各ステップは注入可能なフック)。
   HTTP `/autopilot/{start,pause,resume,cancel,status}` はバックグラウンドの
-  `asyncio.Task` で Orchestrator を起動する。Orchestrator は各ステップの
-  頭で `asyncio.Event` を `await` するので、pause はステップの途中でも
-  尊重され、resume は pause 直前のステートへ戻る。
+  `asyncio.Task` で Orchestrator を起動する。Orchestrator は **各ステップ
+  開始時に** `asyncio.Event` を `await` して pause を尊重する。`resume` を
+  呼ぶと状態機械を pause 直前のステートに巻き戻し、ブロックを解除する。
+  ステップ **実行中** の即時 pause は自動では効かないため、長時間走る
+  hook は必要に応じて `run.pause_event` を自分自身で監視すること。
 - **Web 拡張** — サイドバータブ、プロジェクトピッカー、ページエディタ、
   キャラクターマネージャー、進捗モニター、書き出しセンターを
   `web/index.js` からマウント。

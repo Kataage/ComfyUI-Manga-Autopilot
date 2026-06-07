@@ -194,10 +194,15 @@ async def test_test_run_workflow_submits_and_saves(client, monkeypatch, tmp_path
 
     fake = _FakeComfyClient()
     client.app["manga_comfy_client"] = fake
+    # Enable the server-side opt-in so this test can supply its own
+    # output_dir.  In production this is set by the operator, not the
+    # client — see test_test_run_workflow_rejects_external_output_dir
+    # for the locked-down default.
+    client.app["manga_allow_external_test_run_dir"] = True
 
     resp = await client.post(
         "/manga_autopilot/api/workflows/anime_t2i_default/test-run",
-        json={"overrides": {"positive_prompt": "1girl, blue hair"}, "output_dir": str(tmp_path), "allow_external_output_dir": True},
+        json={"overrides": {"positive_prompt": "1girl, blue hair"}, "output_dir": str(tmp_path)},
     )
     assert resp.status == 200
     body = await resp.json()
@@ -211,10 +216,10 @@ async def test_test_run_workflow_submits_and_saves(client, monkeypatch, tmp_path
 
 
 async def test_test_run_workflow_rejects_external_output_dir(client) -> None:
-    """The /test-run endpoint must ignore ``output_dir`` unless the caller
-    explicitly opts in via ``allow_external_output_dir`` (or a per-app
-    override is set).  Otherwise it locks to
-    ``{storage_root}/test_runs/{workflow_id}``."""
+    """The /test-run endpoint must ignore ``output_dir`` unless the server
+    itself has set ``app["manga_allow_external_test_run_dir"] = True``.
+    A malicious client must NOT be able to enable this by passing
+    ``allow_external_output_dir`` in the request body."""
 
     payload = _payload()
     payload["api_graph"] = {
@@ -245,13 +250,59 @@ async def test_test_run_workflow_rejects_external_output_dir(client) -> None:
             return Path(dest)
 
     client.app["manga_comfy_client"] = _FakeClient()
+    # The server flag is NOT set, so the request must be rejected even
+    # though the client tries to set allow_external_output_dir in the body.
+    assert not client.app.get("manga_allow_external_test_run_dir")
     resp = await client.post(
         "/manga_autopilot/api/workflows/anime_t2i_default/test-run",
-        json={"output_dir": "/tmp/should-be-rejected"},
+        json={"output_dir": "/tmp/should-be-rejected", "allow_external_output_dir": True},
     )
     assert resp.status == 400
     text = await resp.text()
-    assert "allow_external_output_dir" in text or "locked" in text
+    assert "locked" in text.lower() or "manga_allow_external_test_run_dir" in text
+
+
+async def test_test_run_workflow_body_flag_is_ignored(client) -> None:
+    """A request-body ``allow_external_output_dir`` flag must be ignored
+    even when the server-side flag is set; that flag is the sole
+    authority."""
+
+    payload = _payload()
+    payload["api_graph"] = {
+        "9": {"class_type": "SaveImage", "inputs": {"filename_prefix": "x"}},
+    }
+    await client.post("/manga_autopilot/api/workflows", json=payload)
+
+    class _FakeClient:
+        async def submit_workflow(self, graph, **kwargs):
+            return "prompt-z"
+
+        async def get_history(self, prompt_id):
+            return {
+                "prompt-z": {
+                    "status": {"completed": True},
+                    "outputs": {
+                        "9": {
+                            "images": [
+                                {"filename": "out.png", "subfolder": "", "type": "output"}
+                            ]
+                        }
+                    },
+                }
+            }
+
+        async def fetch_image_to(self, dest, **kwargs):
+            Path(dest).write_bytes(b"\x89PNG\r\n\x1a\n")
+            return Path(dest)
+
+    client.app["manga_comfy_client"] = _FakeClient()
+    # Server flag also unset — the body flag must NOT be enough to escape.
+    client.app.pop("manga_allow_external_test_run_dir", None)
+    resp = await client.post(
+        "/manga_autopilot/api/workflows/anime_t2i_default/test-run",
+        json={"output_dir": "/tmp/escape", "allow_external_output_dir": True},
+    )
+    assert resp.status == 400
 
 
 async def test_test_run_workflow_uses_default_dir(client, tmp_path) -> None:
