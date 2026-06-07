@@ -29,9 +29,15 @@ async def handle_health(_request: web.Request) -> web.Response:
 
 
 def register(router) -> None:  # type: ignore[no-untyped-def]
-    """Register the health route on the provided router."""
+    """Register the health route on the provided router.
 
-    router.add_get(HEALTH_PATH, handle_health)
+    ``router`` may be either a ComfyUI ``PromptServer.routes`` collection
+    (which exposes ``add_get`` directly) or a full :class:`aiohttp.web.Application`
+    (in which case routes are added on the application's router).
+    """
+
+    target = router.router if hasattr(router, "router") else router
+    target.add_get(HEALTH_PATH, handle_health)
 
 
 __all__ = ["HEALTH_PATH", "handle_health", "register"]

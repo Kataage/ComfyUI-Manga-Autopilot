@@ -11,26 +11,60 @@ keeps tests independent of ComfyUI's global ``PromptServer`` singleton.
 
 from __future__ import annotations
 
+import logging
+import tempfile
 from collections.abc import Callable
-from typing import Protocol
+from pathlib import Path
+from typing import Protocol, runtime_checkable
 
 from aiohttp import web
 
+log = logging.getLogger(__name__)
 
+
+@runtime_checkable
 class RouteRegistrar(Protocol):
     """Protocol covering the subset of aiohttp routing we rely on."""
 
-    def add_get(self, path: str, handler: Callable[[web.Request], web.StreamResponse]) -> object: ...
+    def add_get(
+        self, path: str, handler: Callable[[web.Request], web.StreamResponse]
+    ) -> object: ...
 
-    def add_post(self, path: str, handler: Callable[[web.Request], web.StreamResponse]) -> object: ...
+    def add_post(
+        self, path: str, handler: Callable[[web.Request], web.StreamResponse]
+    ) -> object: ...
 
 
-def register_all(router: RouteRegistrar) -> None:
-    """Register every backend route group on the supplied router."""
+def _ensure_registry(app: web.Application, storage_root: str | None) -> None:
+    from manga_autopilot.services.workflow_registry import WorkflowRegistry
 
-    from manga_autopilot.routes import health_routes
+    if storage_root:
+        app["manga_workflow_registry"] = WorkflowRegistry.open(storage_root)
+        return
+    if "manga_workflow_registry" not in app:
+        tmp = Path(tempfile.mkdtemp(prefix="manga_autopilot_routes_"))
+        app["manga_workflow_registry"] = WorkflowRegistry.open(tmp)
+
+
+def register_all(
+    router: RouteRegistrar | web.Application,
+    *,
+    storage_root: str | None = None,
+) -> None:
+    """Register every backend route group on the supplied router.
+
+    ``router`` may be either a thin :class:`RouteRegistrar` (in which case
+    ``storage_root`` is unused) or a full :class:`aiohttp.web.Application`,
+    which is the common case for tests and for ComfyUI's ``PromptServer``.
+    """
+
+    from manga_autopilot.routes import health_routes, workflow_routes
+
+    if isinstance(router, web.Application):
+        _ensure_registry(router, storage_root)
 
     health_routes.register(router)
+    workflow_routes.register(router)
 
 
 __all__ = ["RouteRegistrar", "register_all"]
