@@ -1,5 +1,13 @@
 """Pydantic models that live on disk."""
 
+from manga_autopilot.models.character import (
+    AssetRef,
+    Character,
+    CharacterAppearance,
+    ColorPalette,
+    LoraRef,
+    Outfit,
+)
 from manga_autopilot.models.project import (
     OutputFormat,
     Project,
@@ -9,6 +17,12 @@ from manga_autopilot.models.project import (
 )
 
 __all__ = [
+    "AssetRef",
+    "Character",
+    "CharacterAppearance",
+    "ColorPalette",
+    "LoraRef",
+    "Outfit",
     "OutputFormat",
     "Project",
     "ProjectGenerationSettings",
