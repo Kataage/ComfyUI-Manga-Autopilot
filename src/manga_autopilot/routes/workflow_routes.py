@@ -258,19 +258,17 @@ async def test_run_workflow(request: web.Request) -> web.Response:
     payload = await _payload_or_400_async(request)
     overrides = dict(payload.get("overrides") or {})
     output_dir = payload.get("output_dir")
-    allow_external = bool(
-        payload.get("allow_external_output_dir")
-        or request.app.get("manga_allow_external_test_run_dir")
-    )
+    # Lockdown: ``output_dir`` is ignored unless the server itself has
+    # opted in via the per-app ``manga_allow_external_test_run_dir`` flag.
+    # The request body is intentionally NOT consulted — otherwise a
+    # malicious client could just set ``allow_external_output_dir=true``
+    # in its own payload to escape the test_runs directory.
+    allow_external = bool(request.app.get("manga_allow_external_test_run_dir"))
     if output_dir and not allow_external:
-        # Refuse arbitrary destinations by default.  Callers that need to
-        # drop files outside the project's test_runs directory must opt in
-        # explicitly so this endpoint can't be coerced into overwriting
-        # arbitrary paths.
         raise web.HTTPBadRequest(
             text=(
-                "output_dir is locked to {storage}/test_runs/{workflow_id} "
-                "unless allow_external_output_dir=true is supplied."
+                "output_dir is locked to {storage}/test_runs/{workflow_id}; "
+                "the server has not enabled manga_allow_external_test_run_dir."
             ).format(
                 storage=Path(str(request.app.get("manga_storage_root", "."))).expanduser(),
                 workflow_id=wid,
