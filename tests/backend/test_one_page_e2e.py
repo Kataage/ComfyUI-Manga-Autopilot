@@ -1,4 +1,4 @@
-"""End-to-end integration test for the 1-page v1.0 autopilot (issue #152).
+"""End-to-end integration test for the 1-page and 2-page autopilot (issues #152, #156).
 
 This test wires the full pipeline together against a real aiohttp
 test client and a temporary storage root:
@@ -6,21 +6,21 @@ test client and a temporary storage root:
 1. ``POST /projects`` to create a project
 2. Inject a fake :class:`LLMProvider` and a fake :class:`GenerationExecutor`
    so the autopilot can run without a network
-3. ``POST /projects/{id}/autopilot/start`` with ``page_count=1``
+3. ``POST /projects/{id}/autopilot/start`` with ``page_count=1`` or ``page_count=2``
 4. Poll ``/projects/{id}/autopilot/status`` until the run finishes
 5. Verify the on-disk artefacts (panel image, page export, manifest,
    generation_log) match the v1.0 spec acceptance criteria (§28.2).
 
 The test exercises the real default hooks wired in
-:func:`manga_autopilot.routes.autopilot_routes._default_hooks_for_project`,
-not custom test-only hooks.  This is the single source of truth that
-issue #152 wants to keep green.
+:mfunc:`manga_autopilot.routes.autopilot_routes._default_hooks_for_project`,
+not custom test-only hooks.
 """
 
 from __future__ import annotations
 
 import asyncio
 import json
+import re
 from pathlib import Path
 from typing import Any
 
@@ -34,8 +34,17 @@ from manga_autopilot.services.llm_provider import LLMProvider, LLMSettings
 
 
 # --------------------------------------------------------- fakes
+def _parse_page_count(prompt: str) -> int:
+    """Extract page_count from a planner prompt (e.g. 'ページ数: 2' or 'ページ数は 2')."""
+    m = re.search(r"ページ数[：:は]\s*(\d+)", prompt)
+    return int(m.group(1)) if m else 1
+
+
 class FakeLLMProvider(LLMProvider):
-    """LLM that returns canned plans for story / page / panel planners."""
+    """LLM that returns canned plans for story / page / panel planners.
+
+    Supports multi-page by parsing ``page_count`` from the prompt text.
+    """
 
     def __init__(self, settings: LLMSettings | None = None) -> None:
         super().__init__(settings or LLMSettings())
@@ -49,22 +58,26 @@ class FakeLLMProvider(LLMProvider):
         system: str | None = None,
     ) -> str:
         self.calls.append({"prompt": prompt, "schema_keys": list((schema or {}).keys())})
-        # Story planner: 1 page, 1 panel.
-        if "StoryPlan" in prompt or "story" in prompt.lower() and "title" in (schema or {}).get("required", []):
+        required = (schema or {}).get("required", [])
+        # Story planner: schema has "title" + "pages"
+        if "title" in required and "pages" in required:
+            pc = _parse_page_count(prompt)
+            pages = [
+                {
+                    "pageNumber": i + 1,
+                    "summary": f"Page {i + 1} summary",
+                    "emotionalGoal": "determined",
+                    "visualGoal": "wide shot",
+                    "panelCount": 1,
+                }
+                for i in range(pc)
+            ]
             return json.dumps(
                 {
-                    "title": "Sample One-Page",
-                    "logline": "A hero stands tall.",
+                    "title": f"Sample {pc}-Page",
+                    "logline": "A hero adventure.",
                     "genre": "fantasy",
-                    "pages": [
-                        {
-                            "pageNumber": 1,
-                            "summary": "Hero stands tall",
-                            "emotionalGoal": "determined",
-                            "visualGoal": "wide shot",
-                            "panelCount": 1,
-                        }
-                    ],
+                    "pages": pages,
                 }
             )
         # Character planner
@@ -85,20 +98,19 @@ class FakeLLMProvider(LLMProvider):
             )
         # Page planner
         if (schema or {}).get("required") and "pages" in (schema or {}).get("required", []):
-            return json.dumps(
+            pc = _parse_page_count(prompt)
+            pages = [
                 {
-                    "pages": [
-                        {
-                            "pageNumber": 1,
-                            "summary": "Hero stands tall",
-                            "emotionalGoal": "determined",
-                            "visualGoal": "wide shot",
-                            "panelCount": 1,
-                        }
-                    ]
+                    "pageNumber": i + 1,
+                    "summary": f"Page {i + 1} summary",
+                    "emotionalGoal": "determined",
+                    "visualGoal": "wide shot",
+                    "panelCount": 1,
                 }
-            )
-        # Panel planner
+                for i in range(pc)
+            ]
+            return json.dumps({"pages": pages})
+        # Panel planner (called once per page by plan_panels)
         if (schema or {}).get("required") and "panels" in (schema or {}).get("required", []):
             return json.dumps(
                 {
@@ -295,3 +307,99 @@ async def test_one_page_autopilot_completes_end_to_end(e2e_client) -> None:
     assert rendered_path.exists()
     page_size = rendered_path.stat().st_size
     assert page_size > 0
+
+
+# --------------------------------------------------------- 2-page test
+async def test_two_page_autopilot_completes_end_to_end(e2e_client) -> None:
+    """2-page autopilot: idea -> story(2 pages) -> panels -> images -> bubbles -> 2 PNGs -> manifest."""
+    cli, tmp_path, llm, executor = e2e_client
+
+    # 1. Create the project.
+    create_resp = await cli.post(
+        "/manga_autopilot/api/projects",
+        json={"name": "Two-Page Sample", "title": "Two-Page"},
+    )
+    assert create_resp.status == 201
+    project_id = (await create_resp.json())["id"]
+
+    # 2. Start the autopilot with page_count=2.
+    start_resp = await cli.post(
+        f"/manga_autopilot/api/projects/{project_id}/autopilot/start",
+        json={
+            "idea": "A hero journeys across two pages",
+            "page_count": 2,
+            "panels_per_page": 1,
+            "candidate_count": 1,
+            "max_retries": 0,
+        },
+    )
+    assert start_resp.status == 202
+
+    # 3. Wait for completion.
+    final = await _wait_for_completion(cli, project_id, timeout=10.0)
+    assert final["state"] == "COMPLETED"
+
+    project_root = tmp_path / "projects" / project_id
+
+    # 4. Two panel records exist, each with an image.
+    panels_path = project_root / "panels.json"
+    assert panels_path.exists()
+    panels = json.loads(panels_path.read_text(encoding="utf-8"))
+    assert len(panels) == 2
+    for rec in panels:
+        assert rec["image_path"] is not None
+        assert Path(rec["image_path"]).exists()
+        assert rec["status"] == "generated"
+    # Panels belong to different pages.
+    page_numbers = {rec["page_number"] for rec in panels}
+    assert page_numbers == {1, 2}
+
+    # 5. Two page PNGs were rendered.
+    exports_dir = project_root / "exports" / "pages"
+    rendered_pages = sorted(p.name for p in exports_dir.iterdir() if p.suffix == ".png")
+    assert "page_0001.png" in rendered_pages
+    assert "page_0002.png" in rendered_pages
+    assert (exports_dir / "page_0001.png").stat().st_size > 0
+    assert (exports_dir / "page_0002.png").stat().st_size > 0
+
+    # 6. Two GenerationJob JSONs exist under jobs/.
+    jobs_dir = project_root / "jobs"
+    assert jobs_dir.is_dir()
+    job_files = list(jobs_dir.iterdir())
+    assert len(job_files) == 2
+    for jf in job_files:
+        job = json.loads(jf.read_text(encoding="utf-8"))
+        assert job["status"] == "completed"
+        assert job["selected_candidate_id"] is not None
+
+    # 7. Manifest reflects 2 pages.
+    manifest_path = project_root / "manifest.json"
+    assert manifest_path.exists()
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert manifest["project_id"] == project_id
+    assert manifest["status"] == "completed"
+    assert manifest["stats"]["page_count"] == 2
+    assert manifest["stats"]["panel_count"] == 2
+    assert manifest["stats"]["generated_images"] == 2
+    assert len(manifest["exports"]["pages"]) >= 2
+
+    # 8. generation_log.json confirms COMPLETED.
+    log_path = project_root / "generation_log.json"
+    assert log_path.exists()
+    log_payload = json.loads(log_path.read_text(encoding="utf-8"))
+    assert log_payload["state"] == "COMPLETED"
+
+    # 9. LLM and executor were exercised for both panels.
+    assert len(llm.calls) >= 1
+    assert len(executor.calls) == 2
+
+    # 10. Bubbles exist for both panels.
+    bubbles_path = project_root / "bubbles.json"
+    assert bubbles_path.exists()
+    bubbles = json.loads(bubbles_path.read_text(encoding="utf-8"))
+    assert len(bubbles) >= 2
+    panel_ids = {b["panel_id"] for b in bubbles}
+    assert len(panel_ids) == 2  # one bubble per panel
+    for b in bubbles:
+        assert b["text"]
+        assert b["panel_id"]
