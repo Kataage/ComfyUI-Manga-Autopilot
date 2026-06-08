@@ -324,6 +324,17 @@ Set the executor via `manga_panel_executor` or
 `manga_panel_executor_factory` on the aiohttp app.  See
 `tests/backend/test_remote_executor_e2e.py` for a complete example.
 
+## Modal Worker MVP
+
+An experimental Modal worker example is available at
+`examples/modal-worker/`.  This is a skeleton for future Modal GPU
+execution and does not require a Modal account or GPU in CI.
+
+- Pure-Python helpers work without the Modal SDK
+- Follows the `RemoteHTTPExecutor` contract
+- No real ComfyUI or model execution yet
+- See `examples/modal-worker/README.md` for details
+
 ## Documentation
 
 - [`CHANGELOG.md`](CHANGELOG.md) — release history
