@@ -207,6 +207,25 @@ async def _wait_for_completion(cli, project_id: str, timeout: float = 15.0) -> d
     return last  # unreachable but satisfies type checker
 
 
+async def _wait_for_terminal(cli, project_id: str, timeout: float = 15.0) -> dict[str, Any]:
+    """Wait for any terminal state (COMPLETED, FAILED, CANCELLED)."""
+    deadline = asyncio.get_event_loop().time() + timeout
+    last: dict[str, Any] = {}
+    while asyncio.get_event_loop().time() < deadline:
+        resp = await cli.get(
+            f"/manga_autopilot/api/projects/{project_id}/autopilot/status"
+        )
+        assert resp.status == 200
+        body = await resp.json()
+        last = body
+        state = body.get("state", "")
+        if state == "COMPLETED" or state.startswith("FAILED") or state == "CANCELLED":
+            return body
+        await asyncio.sleep(0.05)
+    pytest.fail(f"autopilot did not reach terminal state within {timeout}s; last state={last.get('state')}")
+    return last  # unreachable but satisfies type checker
+
+
 # ---- Test ----
 
 async def test_autopilot_can_generate_panels_with_fake_remote_executor(
@@ -300,3 +319,113 @@ async def test_autopilot_can_generate_panels_with_fake_remote_executor(
     assert manifest["stats"]["page_count"] == 1
     assert manifest["stats"]["panel_count"] == 1
     assert manifest["stats"]["generated_images"] == 1
+
+
+# ---- Failure fixture ----
+
+@pytest.fixture()
+async def remote_fail_e2e_client(aiohttp_client, tmp_path: Path):
+    """E2E fixture where the remote worker always returns status='error'."""
+    from manga_autopilot.services.remote_executor import (
+        FakeRemoteWorker,
+        RemoteHTTPExecutor,
+        RemoteWorkerSettings,
+    )
+
+    llm = FakeLLMProvider()
+    worker = FakeRemoteWorker(mode="status_error")
+
+    runner = web.AppRunner(worker.app())
+    await runner.setup()
+    site = web.TCPSite(runner, "127.0.0.1", 0)
+    await site.start()
+    server = site._server
+    assert server is not None
+    sockets = server.sockets
+    assert sockets is not None
+    port = sockets[0].getsockname()[1]
+
+    settings = RemoteWorkerSettings(
+        base_url=f"http://127.0.0.1:{port}",
+        timeout_sec=10.0,
+    )
+
+    app = web.Application()
+    app["manga_llm_provider"] = llm
+    app["manga_default_workflow_id"] = "anime_t2i_default"
+    app["manga_panel_executor_factory"] = lambda project_id: RemoteHTTPExecutor(
+        settings=settings,
+        project_id=project_id,
+    )
+
+    register_all(app, storage_root=str(tmp_path))
+    cli = await aiohttp_client(app)
+
+    yield cli, tmp_path, llm, worker
+
+    await runner.cleanup()
+
+
+async def test_autopilot_records_failure_when_remote_executor_fails(
+    remote_fail_e2e_client,
+) -> None:
+    """Autopilot reaches FAILED state when remote worker returns error."""
+    cli, tmp_path, llm, worker = remote_fail_e2e_client
+
+    # 1. Create project.
+    create_resp = await cli.post(
+        "/manga_autopilot/api/projects",
+        json={"name": "RemoteFail E2E", "title": "RemoteFail"},
+    )
+    assert create_resp.status == 201
+    project_id = (await create_resp.json())["id"]
+
+    # 2. Start autopilot — remote worker will fail.
+    start_resp = await cli.post(
+        f"/manga_autopilot/api/projects/{project_id}/autopilot/start",
+        json={
+            "idea": "A hero standing on a cliff",
+            "page_count": 1,
+            "panels_per_page": 1,
+            "candidate_count": 1,
+            "max_retries": 0,
+        },
+    )
+    assert start_resp.status == 202
+
+    # 3. Wait for terminal state — should be FAILED.
+    final = await _wait_for_terminal(cli, project_id, timeout=20.0)
+    assert final["state"].startswith("FAILED"), (
+        f"expected FAILED state, got {final['state']}"
+    )
+
+    project_root = tmp_path / "projects" / project_id
+
+    # 4. generation_log.json exists with FAILED state.
+    log_path = project_root / "generation_log.json"
+    assert log_path.exists()
+    log_payload = json.loads(log_path.read_text(encoding="utf-8"))
+    assert log_payload["state"].startswith("FAILED")
+
+    # 5. Remote worker received the request (attempted generation).
+    assert len(worker.requests) >= 1
+
+    # 6. panels.json exists but panel is not marked as generated.
+    panels_path = project_root / "panels.json"
+    if panels_path.exists():
+        panels = json.loads(panels_path.read_text(encoding="utf-8"))
+        for rec in panels:
+            # Either no image_path or status is not "generated".
+            assert rec.get("status") != "generated" or rec.get("image_path") is None, (
+                f"panel should not be generated when remote worker fails: {rec}"
+            )
+
+    # 7. No completed page PNG or manifest is produced.
+    manifest_path = project_root / "manifest.json"
+    # These may or may not exist depending on pipeline stage, but if they
+    # exist the manifest should NOT say "completed".
+    if manifest_path.exists():
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        assert manifest.get("status") != "completed", (
+            "manifest should not report completed when remote executor fails"
+        )

@@ -304,6 +304,10 @@ pytest -m release_gate -q
 現時点では:
 
 - `RemoteHTTPExecutor` が `GenerationExecutor` プロトコルを実装
+- 型付き例外: `RemoteExecutorHTTPError`、`RemoteExecutorTimeoutError`、
+  `RemoteExecutorResponseError`、`RemoteExecutorImageError`
+- リモートワーカー失敗時に Autopilot が `FAILED` 状態になり、
+  `generation_log.json` に失敗理由が記録される
 - CI テスト用の `FakeRemoteWorker` インプロセスサーバーを同梱
 - Modal / RunPod / 外部 GPU との本番連携は**まだ未実装**
 - 標準 CI で外部ネットワークサービスは不要

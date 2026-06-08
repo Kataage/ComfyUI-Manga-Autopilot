@@ -308,6 +308,10 @@ external HTTP GPU worker (e.g. Modal, RunPod, or a remote ComfyUI
 server).  In this release:
 
 - `RemoteHTTPExecutor` implements the `GenerationExecutor` protocol
+- Typed exceptions: `RemoteExecutorHTTPError`, `RemoteExecutorTimeoutError`,
+  `RemoteExecutorResponseError`, `RemoteExecutorImageError`
+- When the remote worker fails, Autopilot reaches `FAILED` state and
+  `generation_log.json` records the failure reason
 - A `FakeRemoteWorker` in-process server is used for CI testing
 - The real Modal / RunPod / external GPU integration is **not yet
   implemented**
