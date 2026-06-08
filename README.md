@@ -91,6 +91,11 @@ later issue, not yet wired up).
 - **Web extension** — sidebar tab, project picker, page editor,
   character manager, progress monitor, export center, all mounted from
   `web/index.js`.
+- **ComfyExecutor E2E** — a fake `ComfyClient` + real `WorkflowRegistry`
+  + real `ComfyExecutor` path exercises `/prompt` → `/history` → `/view`
+  end-to-end without a live ComfyUI server.  Workflow binding overrides
+  (positive/negative/seed/width/height) are verified on the submitted
+  graph (`test_comfy_executor_e2e.py`).
 
 ### Planned (spec-described, not yet wired up)
 

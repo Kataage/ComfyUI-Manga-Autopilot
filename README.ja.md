@@ -96,6 +96,11 @@ ComfyUI のカスタムノード拡張で、1 つのアイデアから短い漫�
 - **Web 拡張** — サイドバータブ、プロジェクトピッカー、ページエディタ、
   キャラクターマネージャー、進捗モニター、書き出しセンターを
   `web/index.js` からマウント。
+- **ComfyExecutor E2E** — フェイク `ComfyClient` + 実 `WorkflowRegistry` +
+  実 `ComfyExecutor` 経路で、実 ComfyUI サーバーなしに
+  `/prompt` → `/history` → `/view` のフローを E2E 検証。
+  ワークフロー binding override（positive/negative/seed/width/height）が
+  送信グラフに反映されることを確認（`test_comfy_executor_e2e.py`）。
 
 ### Planned (未接続 / スタブ)
 
