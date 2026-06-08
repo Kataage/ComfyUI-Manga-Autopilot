@@ -164,3 +164,7 @@ Validate this header in your worker if needed.
 - `image_base64` is the MVP format.  Future versions may use artifact
   URLs (S3 / R2 signed URLs) instead.
 - No Modal SDK or RunPod integration is required for this contract.
+
+## See also
+
+- [`../modal-worker/README.md`](../modal-worker/README.md) — Modal worker MVP example

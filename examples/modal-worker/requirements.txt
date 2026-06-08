@@ -1,0 +1,3 @@
+# Optional Modal SDK dependency.
+# Not required for CI or normal operation.
+modal>=0.60

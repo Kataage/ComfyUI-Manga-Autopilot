@@ -138,6 +138,16 @@ The following items are **out of scope** for v1.0 and remain in the Planned sect
 | Autopilot E2E via async polling | Done | `test_autopilot_can_generate_panels_with_async_remote_executor` | Yes | 1-page / 1-panel; full pipeline |
 | Autopilot FAILED on async job error | Done | `test_autopilot_records_failure_when_async_remote_job_errors` | Yes | generation_log.json has FAILED state |
 
+### Modal Worker MVP
+
+| Area | Status | Test | CI | Notes |
+|------|--------|------|----|-------|
+| Imports without Modal SDK | Done | `test_modal_worker_example_imports_without_modal_sdk` | Yes | Pure-Python helpers always available |
+| Validates required payload fields | Done | `test_modal_worker_validates_required_payload_fields` | Yes | Raises ValueError on missing fields |
+| Builds success response contract | Done | `test_modal_worker_builds_success_response_contract` | Yes | status=completed, image_base64, metadata.executor |
+| Builds error response contract | Done | `test_modal_worker_builds_error_response_contract` | Yes | status=error, error message |
+| Placeholder image is valid base64 | Done | `test_modal_worker_placeholder_image_is_valid_base64` | Yes | Decodes to PNG bytes |
+
 ## How to Use
 
 ### Before every release

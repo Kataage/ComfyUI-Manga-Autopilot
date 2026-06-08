@@ -319,6 +319,17 @@ pytest -m release_gate -q
 `manga_panel_executor_factory` で設定します。
 詳細は `tests/backend/test_remote_executor_e2e.py` を参照してください。
 
+## Modal ワーカー MVP
+
+実験的な Modal ワーカーの例を `examples/modal-worker/` に用意しています。
+将来の Modal GPU 実行のためのスケルトンであり、CI で Modal アカウントや
+GPU は不要です。
+
+- Modal SDK なしでも動作する純 Python ヘルパーを同梱
+- `RemoteHTTPExecutor` contract に準拠
+- 現時点では ComfyUI やモデル実行は未実装
+- 詳細は `examples/modal-worker/README.md` を参照
+
 ## ドキュメント
 
 - [`CHANGELOG.md`](CHANGELOG.md) — リリース履歴
