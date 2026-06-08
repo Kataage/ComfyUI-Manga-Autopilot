@@ -41,8 +41,8 @@ def _parse_page_count(prompt: str) -> int:
 
 
 def _parse_page_number(prompt: str) -> int:
-    """Extract pageNumber from a panel planner prompt (e.g. 'pageNumber: 3')."""
-    m = re.search(r'"?pageNumber"?\s*[：:]\s*(\d+)', prompt)
+    """Extract pageNumber from a panel planner prompt (e.g. 'pageNumber: 3' or 'page_number: 3')."""
+    m = re.search(r'"?(?:pageNumber|page_number)"?\s*[：:]\s*(\d+)', prompt)
     return int(m.group(1)) if m else 1
 
 
@@ -66,6 +66,14 @@ _PANEL_DIALOGUES: dict[int, str] = {
     2: "任せる",
     3: "了解",
     4: "よし",
+}
+
+# Per-page per-panel dialogue texts for 4-page × 2-panel tests.
+_PAGE_PANEL_DIALOGUES: dict[int, dict[int, str]] = {
+    1: {1: "行くぞ", 2: "ここからだ"},
+    2: {1: "負けない", 2: "進むしかない"},
+    3: {1: "見えた", 2: "まだ終わらない"},
+    4: {1: "決める", 2: "終わらせる"},
 }
 
 
@@ -142,9 +150,11 @@ class FakeLLMProvider(LLMProvider):
         # Panel planner (called once per page by plan_panels)
         if (schema or {}).get("required") and "panels" in (schema or {}).get("required", []):
             pc = _parse_panel_count(prompt)
+            pn = _parse_page_number(prompt)
             panels = []
             for i in range(pc):
-                text = _PANEL_DIALOGUES.get(i + 1, "行くぞ")
+                page_dialogues = _PAGE_PANEL_DIALOGUES.get(pn, {})
+                text = page_dialogues.get(i + 1, _PANEL_DIALOGUES.get(i + 1, "行くぞ"))
                 panels.append(
                     {
                         "panelNumber": i + 1,
@@ -722,3 +732,132 @@ async def test_three_panel_per_page_autopilot_completes_end_to_end(e2e_client) -
     for b in bubbles:
         assert b["text"]
         assert b["panel_id"]
+
+
+# --------------------------------------------------------- 4-page × 2-panel test
+async def test_four_page_two_panel_autopilot_completes_end_to_end(e2e_client) -> None:
+    """4-page × 2-panel autopilot: 8 panels total, 4 page PNGs, 8 bubbles."""
+    cli, tmp_path, llm, executor = e2e_client
+
+    # 1. Create the project.
+    create_resp = await cli.post(
+        "/manga_autopilot/api/projects",
+        json={"name": "4P2C Sample", "title": "4P2C"},
+    )
+    assert create_resp.status == 201
+    project_id = (await create_resp.json())["id"]
+
+    # 2. Start the autopilot with page_count=4, panels_per_page=2.
+    start_resp = await cli.post(
+        f"/manga_autopilot/api/projects/{project_id}/autopilot/start",
+        json={
+            "idea": "Four-page dramatic scene with two panels each",
+            "page_count": 4,
+            "panels_per_page": 2,
+            "candidate_count": 1,
+            "max_retries": 0,
+        },
+    )
+    assert start_resp.status == 202
+
+    # 3. Wait for completion.
+    final = await _wait_for_completion(cli, project_id, timeout=25.0)
+    assert final["state"] == "COMPLETED"
+
+    project_root = tmp_path / "projects" / project_id
+
+    # 4. 8 panel records exist (2 per page × 4 pages), each with an image.
+    panels_path = project_root / "panels.json"
+    assert panels_path.exists()
+    panels = json.loads(panels_path.read_text(encoding="utf-8"))
+    assert len(panels) == 8
+    for rec in panels:
+        assert rec["image_path"] is not None
+        assert Path(rec["image_path"]).exists()
+        assert rec["status"] == "generated"
+    # page_number set is {1,2,3,4}.
+    page_numbers = {rec["page_number"] for rec in panels}
+    assert page_numbers == {1, 2, 3, 4}
+    # Each page has exactly 2 panels.
+    from collections import Counter
+    page_panel_counts = Counter(rec["page_number"] for rec in panels)
+    for pn in (1, 2, 3, 4):
+        assert page_panel_counts[pn] == 2
+    # 8 distinct panel_ids.
+    panel_ids = {rec["panel_id"] for rec in panels}
+    assert len(panel_ids) == 8
+
+    # 5. Four page PNGs were rendered.
+    exports_dir = project_root / "exports" / "pages"
+    rendered_pages = sorted(p.name for p in exports_dir.iterdir() if p.suffix == ".png")
+    assert rendered_pages == ["page_0001.png", "page_0002.png", "page_0003.png", "page_0004.png"]
+    for name in rendered_pages:
+        p = exports_dir / name
+        assert p.exists()
+        assert p.stat().st_size > 0
+
+    # 6. 8 GenerationJob JSONs exist under jobs/.
+    jobs_dir = project_root / "jobs"
+    assert jobs_dir.is_dir()
+    job_files = list(jobs_dir.iterdir())
+    assert len(job_files) == 8
+    for jf in job_files:
+        job = json.loads(jf.read_text(encoding="utf-8"))
+        assert job["status"] == "completed"
+        assert job["selected_candidate_id"] is not None
+
+    # 7. Manifest reflects 4 pages, 8 panels.
+    manifest_path = project_root / "manifest.json"
+    assert manifest_path.exists()
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert manifest["project_id"] == project_id
+    assert manifest["status"] == "completed"
+    assert manifest["stats"]["page_count"] == 4
+    assert manifest["stats"]["panel_count"] == 8
+    assert manifest["stats"]["generated_images"] == 8
+    export_page_names = [Path(p).name for p in manifest["exports"]["pages"]]
+    assert sorted(export_page_names) == [
+        "page_0001.png", "page_0002.png", "page_0003.png", "page_0004.png"
+    ]
+
+    # 8. generation_log.json confirms COMPLETED.
+    log_path = project_root / "generation_log.json"
+    assert log_path.exists()
+    log_payload = json.loads(log_path.read_text(encoding="utf-8"))
+    assert log_payload["state"] == "COMPLETED"
+
+    # 9. LLM and executor were exercised for all 8 panels.
+    assert len(llm.calls) >= 1
+    assert len(executor.calls) == 8
+
+    # 10. Bubbles exist for all 8 panels with distinct panel_ids.
+    bubbles_path = project_root / "bubbles.json"
+    assert bubbles_path.exists()
+    bubbles = json.loads(bubbles_path.read_text(encoding="utf-8"))
+    assert len(bubbles) >= 8
+    bubble_panel_ids = {b["panel_id"] for b in bubbles}
+    assert len(bubble_panel_ids) == 8
+    for b in bubbles:
+        assert b["text"]
+        assert b["panel_id"]
+
+    # 11. Each page has at least 2 bubbles.
+    from collections import defaultdict
+    bubbles_by_page: dict[int, list] = defaultdict(list)
+    for b in bubbles:
+        # Derive page from panel_id: "panel_p{n}_c{m}" → extract page number.
+        panel_rec = next(rec for rec in panels if rec["panel_id"] == b["panel_id"])
+        bubbles_by_page[panel_rec["page_number"]].append(b)
+    for pn in (1, 2, 3, 4):
+        assert len(bubbles_by_page[pn]) >= 2, f"page {pn} has {len(bubbles_by_page[pn])} bubbles, expected >= 2"
+
+    # 12. Dialogues match _PAGE_PANEL_DIALOGUES.
+    dialogue_texts = {b["panel_id"]: b["text"] for b in bubbles}
+    assert dialogue_texts["panel_001_01"] == "行くぞ"
+    assert dialogue_texts["panel_001_02"] == "ここからだ"
+    assert dialogue_texts["panel_002_01"] == "負けない"
+    assert dialogue_texts["panel_002_02"] == "進むしかない"
+    assert dialogue_texts["panel_003_01"] == "見えた"
+    assert dialogue_texts["panel_003_02"] == "まだ終わらない"
+    assert dialogue_texts["panel_004_01"] == "決める"
+    assert dialogue_texts["panel_004_02"] == "終わらせる"

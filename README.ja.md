@@ -85,7 +85,7 @@ ComfyUI のカスタムノード拡張で、1 つのアイデアから短い漫�
   fallback レイアウトを割り当てる。 ページは `export_page_png` で
   `exports/pages/page_NNNN.png` に書き出される。 E2E テストで
   1ページ/2パネル、1ページ/3パネル、2ページ/1パネル、
-  4ページ/1パネルの構成を検証済み。
+  4ページ/1パネル、4ページ/2パネルの構成を検証済み。
 - **Project / Panel HTTP API** — `GET/POST /projects`、
   `GET/PATCH/DELETE /projects/{id}`、`GET /projects/_suggest_id` (spec
   §21.2) と `POST /panels/{id}/{generate,regenerate,repair}`、

@@ -80,7 +80,7 @@ later issue, not yet wired up).
   `GenerationJob`, `SpeechBubble`, and fallback layout.  Pages are
   rendered via `export_page_png` into `exports/pages/page_NNNN.png`.
   End-to-end tests cover 1-page/2-panel, 1-page/3-panel,
-  2-page/1-panel, and 4-page/1-panel configurations.
+  2-page/1-panel, 4-page/1-panel, and 4-page/2-panel configurations.
 - **Project + panel HTTP APIs** — `GET/POST /projects`,
   `GET/PATCH/DELETE /projects/{id}`, `GET /projects/_suggest_id`
   (spec §21.2) and `POST /panels/{id}/{generate,regenerate,repair}`,
