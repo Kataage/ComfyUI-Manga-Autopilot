@@ -46,12 +46,26 @@ def _parse_page_number(prompt: str) -> int:
     return int(m.group(1)) if m else 1
 
 
+def _parse_panel_count(prompt: str) -> int:
+    """Extract panel_count from a panel planner prompt (e.g. 'パネル数は 2')."""
+    m = re.search(r"パネル数[：:は]\s*(\d+)", prompt)
+    return int(m.group(1)) if m else 1
+
+
 # Per-page dialogue texts for multi-page tests.
 _PAGE_DIALOGUES: dict[int, str] = {
     1: "行くぞ",
     2: "ここからだ",
     3: "負けない",
     4: "終わらせる",
+}
+
+# Per-panel dialogue texts for multi-panel tests.
+_PANEL_DIALOGUES: dict[int, str] = {
+    1: "行くぞ",
+    2: "任せる",
+    3: "了解",
+    4: "よし",
 }
 
 
@@ -127,33 +141,32 @@ class FakeLLMProvider(LLMProvider):
             return json.dumps({"pages": pages})
         # Panel planner (called once per page by plan_panels)
         if (schema or {}).get("required") and "panels" in (schema or {}).get("required", []):
-            pn = _parse_page_number(prompt)
-            text = _PAGE_DIALOGUES.get(pn, "行くぞ")
-            return json.dumps(
-                {
-                    "panels": [
-                        {
-                            "panelNumber": 1,
-                            "purpose": "hero shot",
-                            "shot": "wide",
-                            "cameraAngle": "low",
-                            "action": "stands tall",
-                            "emotion": "determined",
-                            "characters": ["char_hero"],
-                            "background": "open field",
-                            "visualPriority": "character",
-                            "dialogue": [
-                                {
-                                    "speaker": "Hero",
-                                    "text": text,
-                                    "type": "speech",
-                                    "characterId": "char_hero",
-                                }
-                            ],
-                        }
-                    ]
-                }
-            )
+            pc = _parse_panel_count(prompt)
+            panels = []
+            for i in range(pc):
+                text = _PANEL_DIALOGUES.get(i + 1, "行くぞ")
+                panels.append(
+                    {
+                        "panelNumber": i + 1,
+                        "purpose": f"panel {i + 1} shot",
+                        "shot": "wide",
+                        "cameraAngle": "low",
+                        "action": "action",
+                        "emotion": "determined",
+                        "characters": ["char_hero"],
+                        "background": "open field",
+                        "visualPriority": "character",
+                        "dialogue": [
+                            {
+                                "speaker": "Hero",
+                                "text": text,
+                                "type": "speech",
+                                "characterId": "char_hero",
+                            }
+                        ],
+                    }
+                )
+            return json.dumps({"panels": panels})
         # Prompt builder -- needs positive / negative
         if (schema or {}).get("required") and "positive" in (schema or {}).get("required", []):
             return json.dumps(
@@ -517,3 +530,97 @@ async def test_four_page_autopilot_completes_end_to_end(e2e_client) -> None:
         assert b["text"]
         assert b["panel_id"]
         assert b["type"] in ("normal", "shout", "thought", "narration", "whisper", "radio")
+
+
+# --------------------------------------------------------- multi-panel test
+async def test_multi_panel_per_page_autopilot_completes_end_to_end(e2e_client) -> None:
+    """1-page / 2-panel autopilot: 1 page with 2 panels, each with its own bubble."""
+    cli, tmp_path, llm, executor = e2e_client
+
+    # 1. Create the project.
+    create_resp = await cli.post(
+        "/manga_autopilot/api/projects",
+        json={"name": "Multi-Panel Sample", "title": "Multi-Panel"},
+    )
+    assert create_resp.status == 201
+    project_id = (await create_resp.json())["id"]
+
+    # 2. Start the autopilot with page_count=1, panels_per_page=2.
+    start_resp = await cli.post(
+        f"/manga_autopilot/api/projects/{project_id}/autopilot/start",
+        json={
+            "idea": "Two heroes face each other",
+            "page_count": 1,
+            "panels_per_page": 2,
+            "candidate_count": 1,
+            "max_retries": 0,
+        },
+    )
+    assert start_resp.status == 202
+
+    # 3. Wait for completion.
+    final = await _wait_for_completion(cli, project_id, timeout=10.0)
+    assert final["state"] == "COMPLETED"
+
+    project_root = tmp_path / "projects" / project_id
+
+    # 4. Two panel records exist on page 1, each with an image.
+    panels_path = project_root / "panels.json"
+    assert panels_path.exists()
+    panels = json.loads(panels_path.read_text(encoding="utf-8"))
+    assert len(panels) == 2
+    for rec in panels:
+        assert rec["image_path"] is not None
+        assert Path(rec["image_path"]).exists()
+        assert rec["status"] == "generated"
+        assert rec["page_number"] == 1
+    # Panel IDs are distinct.
+    panel_ids = {rec["panel_id"] for rec in panels}
+    assert len(panel_ids) == 2
+
+    # 5. One page PNG was rendered (both panels composited into page_0001.png).
+    exports_dir = project_root / "exports" / "pages"
+    rendered_pages = sorted(p.name for p in exports_dir.iterdir() if p.suffix == ".png")
+    assert "page_0001.png" in rendered_pages
+    assert (exports_dir / "page_0001.png").stat().st_size > 0
+
+    # 6. Two GenerationJob JSONs exist under jobs/.
+    jobs_dir = project_root / "jobs"
+    assert jobs_dir.is_dir()
+    job_files = list(jobs_dir.iterdir())
+    assert len(job_files) == 2
+    for jf in job_files:
+        job = json.loads(jf.read_text(encoding="utf-8"))
+        assert job["status"] == "completed"
+        assert job["selected_candidate_id"] is not None
+
+    # 7. Manifest reflects 1 page, 2 panels.
+    manifest_path = project_root / "manifest.json"
+    assert manifest_path.exists()
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert manifest["project_id"] == project_id
+    assert manifest["status"] == "completed"
+    assert manifest["stats"]["page_count"] == 1
+    assert manifest["stats"]["panel_count"] == 2
+    assert manifest["stats"]["generated_images"] == 2
+
+    # 8. generation_log.json confirms COMPLETED.
+    log_path = project_root / "generation_log.json"
+    assert log_path.exists()
+    log_payload = json.loads(log_path.read_text(encoding="utf-8"))
+    assert log_payload["state"] == "COMPLETED"
+
+    # 9. LLM and executor were exercised for both panels.
+    assert len(llm.calls) >= 1
+    assert len(executor.calls) == 2
+
+    # 10. Bubbles exist for both panels with distinct panel_ids.
+    bubbles_path = project_root / "bubbles.json"
+    assert bubbles_path.exists()
+    bubbles = json.loads(bubbles_path.read_text(encoding="utf-8"))
+    assert len(bubbles) >= 2
+    bubble_panel_ids = {b["panel_id"] for b in bubbles}
+    assert len(bubble_panel_ids) == 2
+    for b in bubbles:
+        assert b["text"]
+        assert b["panel_id"]
