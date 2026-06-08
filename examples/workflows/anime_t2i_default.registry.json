@@ -1,0 +1,104 @@
+{
+  "workflow_id": "anime_t2i_default",
+  "name": "Anime Text-to-Image Default (Example)",
+  "type": "text_to_image",
+  "file": "examples/workflows/anime_t2i_default.workflow.json",
+  "description": "Minimal text-to-image workflow for Manga Autopilot. Requires a ComfyUI server with a compatible checkpoint.",
+  "bindings": {
+    "positive_prompt": {
+      "node_id": "6",
+      "input": "text"
+    },
+    "negative_prompt": {
+      "node_id": "7",
+      "input": "text"
+    },
+    "seed": {
+      "node_id": "3",
+      "input": "seed"
+    },
+    "steps": {
+      "node_id": "3",
+      "input": "steps"
+    },
+    "cfg": {
+      "node_id": "3",
+      "input": "cfg"
+    },
+    "width": {
+      "node_id": "5",
+      "input": "width"
+    },
+    "height": {
+      "node_id": "5",
+      "input": "height"
+    },
+    "checkpoint": {
+      "node_id": "4",
+      "input": "ckpt_name"
+    },
+    "filename_prefix": {
+      "node_id": "9",
+      "input": "filename_prefix"
+    }
+  },
+  "api_graph": {
+    "3": {
+      "class_type": "KSampler",
+      "inputs": {
+        "seed": 42,
+        "steps": 28,
+        "cfg": 7.0,
+        "sampler_name": "euler_ancestral",
+        "scheduler": "normal",
+        "denoise": 1.0,
+        "model": ["4", 0],
+        "positive": ["6", 0],
+        "negative": ["7", 0],
+        "latent_image": ["5", 0]
+      }
+    },
+    "4": {
+      "class_type": "CheckpointLoaderSimple",
+      "inputs": {
+        "ckpt_name": "example.safetensors"
+      }
+    },
+    "5": {
+      "class_type": "EmptyLatentImage",
+      "inputs": {
+        "width": 832,
+        "height": 1216,
+        "batch_size": 1
+      }
+    },
+    "6": {
+      "class_type": "CLIPTextEncode",
+      "inputs": {
+        "text": "1girl, masterpiece, best quality",
+        "clip": ["4", 1]
+      }
+    },
+    "7": {
+      "class_type": "CLIPTextEncode",
+      "inputs": {
+        "text": "lowres, bad anatomy, blurry",
+        "clip": ["4", 1]
+      }
+    },
+    "8": {
+      "class_type": "VAEDecode",
+      "inputs": {
+        "samples": ["3", 0],
+        "vae": ["4", 2]
+      }
+    },
+    "9": {
+      "class_type": "SaveImage",
+      "inputs": {
+        "filename_prefix": "ComfyUI",
+        "images": ["8", 0]
+      }
+    }
+  }
+}
