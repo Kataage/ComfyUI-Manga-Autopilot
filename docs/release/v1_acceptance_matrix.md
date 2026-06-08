@@ -111,6 +111,20 @@ The following items are **out of scope** for v1.0 and remain in the Planned sect
 | Existing ComfyExecutor tests remain green | Done | `test_one_page_autopilot_uses_comfy_executor_path` | Yes | No regression |
 | No external network service required | Done | — | Yes | FakeRemoteWorker is in-process |
 
+### Remote Executor Hardening
+
+| Area | Status | Test | CI | Notes |
+|------|--------|------|----|-------|
+| HTTP 500 → RemoteExecutorHTTPError | Done | `test_remote_executor_raises_on_http_500` | Yes | Status code + body + URL in message |
+| Timeout → RemoteExecutorTimeoutError | Done | `test_remote_executor_raises_on_timeout` | Yes | Timeout seconds + URL in message |
+| Worker status error → RemoteExecutorResponseError | Done | `test_remote_executor_raises_on_status_error` | Yes | `{"status": "error", "error": "model not found"}` |
+| Invalid JSON → RemoteExecutorResponseError | Done | `test_remote_executor_raises_on_invalid_json` | Yes | Non-JSON text response |
+| Missing image_base64 → RemoteExecutorResponseError | Done | `test_remote_executor_raises_on_missing_image_base64` | Yes | JSON without image payload |
+| Invalid base64 → RemoteExecutorImageError | Done | `test_remote_executor_raises_on_invalid_base64` | Yes | Non-base64 string |
+| Invalid image bytes → RemoteExecutorImageError | Done | `test_remote_executor_raises_on_invalid_image_bytes` | Yes | Valid base64, not an image |
+| API key Authorization header | Done | `test_remote_executor_sends_authorization_header` | Yes | `Bearer {api_key}` |
+| Autopilot FAILED on remote error | Done | `test_autopilot_records_failure_when_remote_executor_fails` | Yes | generation_log.json has FAILED state |
+
 ## How to Use
 
 ### Before every release
