@@ -40,6 +40,21 @@ def _parse_page_count(prompt: str) -> int:
     return int(m.group(1)) if m else 1
 
 
+def _parse_page_number(prompt: str) -> int:
+    """Extract pageNumber from a panel planner prompt (e.g. 'pageNumber: 3')."""
+    m = re.search(r'"?pageNumber"?\s*[：:]\s*(\d+)', prompt)
+    return int(m.group(1)) if m else 1
+
+
+# Per-page dialogue texts for multi-page tests.
+_PAGE_DIALOGUES: dict[int, str] = {
+    1: "行くぞ",
+    2: "ここからだ",
+    3: "負けない",
+    4: "終わらせる",
+}
+
+
 class FakeLLMProvider(LLMProvider):
     """LLM that returns canned plans for story / page / panel planners.
 
@@ -112,6 +127,8 @@ class FakeLLMProvider(LLMProvider):
             return json.dumps({"pages": pages})
         # Panel planner (called once per page by plan_panels)
         if (schema or {}).get("required") and "panels" in (schema or {}).get("required", []):
+            pn = _parse_page_number(prompt)
+            text = _PAGE_DIALOGUES.get(pn, "行くぞ")
             return json.dumps(
                 {
                     "panels": [
@@ -128,7 +145,7 @@ class FakeLLMProvider(LLMProvider):
                             "dialogue": [
                                 {
                                     "speaker": "Hero",
-                                    "text": "行くぞ",
+                                    "text": text,
                                     "type": "speech",
                                     "characterId": "char_hero",
                                 }
@@ -403,3 +420,100 @@ async def test_two_page_autopilot_completes_end_to_end(e2e_client) -> None:
     for b in bubbles:
         assert b["text"]
         assert b["panel_id"]
+
+
+# --------------------------------------------------------- 4-page test
+async def test_four_page_autopilot_completes_end_to_end(e2e_client) -> None:
+    """4-page autopilot: idea -> story(4 pages) -> panels -> images -> bubbles -> 4 PNGs -> manifest."""
+    cli, tmp_path, llm, executor = e2e_client
+
+    # 1. Create the project.
+    create_resp = await cli.post(
+        "/manga_autopilot/api/projects",
+        json={"name": "Four-Page Sample", "title": "Four-Page"},
+    )
+    assert create_resp.status == 201
+    project_id = (await create_resp.json())["id"]
+
+    # 2. Start the autopilot with page_count=4.
+    start_resp = await cli.post(
+        f"/manga_autopilot/api/projects/{project_id}/autopilot/start",
+        json={
+            "idea": "A hero journey across four pages",
+            "page_count": 4,
+            "panels_per_page": 1,
+            "candidate_count": 1,
+            "max_retries": 0,
+        },
+    )
+    assert start_resp.status == 202
+
+    # 3. Wait for completion.
+    final = await _wait_for_completion(cli, project_id, timeout=15.0)
+    assert final["state"] == "COMPLETED"
+
+    project_root = tmp_path / "projects" / project_id
+
+    # 4. Four panel records exist, each with an image.
+    panels_path = project_root / "panels.json"
+    assert panels_path.exists()
+    panels = json.loads(panels_path.read_text(encoding="utf-8"))
+    assert len(panels) == 4
+    for rec in panels:
+        assert rec["image_path"] is not None
+        assert Path(rec["image_path"]).exists()
+        assert rec["status"] == "generated"
+    # Panels belong to pages 1-4.
+    page_numbers = {rec["page_number"] for rec in panels}
+    assert page_numbers == {1, 2, 3, 4}
+
+    # 5. Four page PNGs were rendered.
+    exports_dir = project_root / "exports" / "pages"
+    rendered_pages = sorted(p.name for p in exports_dir.iterdir() if p.suffix == ".png")
+    for pn in range(1, 5):
+        fname = f"page_{pn:04d}.png"
+        assert fname in rendered_pages, f"{fname} not found in {rendered_pages}"
+        assert (exports_dir / fname).stat().st_size > 0
+
+    # 6. Four GenerationJob JSONs exist under jobs/.
+    jobs_dir = project_root / "jobs"
+    assert jobs_dir.is_dir()
+    job_files = list(jobs_dir.iterdir())
+    assert len(job_files) == 4
+    for jf in job_files:
+        job = json.loads(jf.read_text(encoding="utf-8"))
+        assert job["status"] == "completed"
+        assert job["selected_candidate_id"] is not None
+
+    # 7. Manifest reflects 4 pages.
+    manifest_path = project_root / "manifest.json"
+    assert manifest_path.exists()
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert manifest["project_id"] == project_id
+    assert manifest["status"] == "completed"
+    assert manifest["stats"]["page_count"] == 4
+    assert manifest["stats"]["panel_count"] == 4
+    assert manifest["stats"]["generated_images"] == 4
+    assert len(manifest["exports"]["pages"]) >= 4
+
+    # 8. generation_log.json confirms COMPLETED.
+    log_path = project_root / "generation_log.json"
+    assert log_path.exists()
+    log_payload = json.loads(log_path.read_text(encoding="utf-8"))
+    assert log_payload["state"] == "COMPLETED"
+
+    # 9. LLM and executor were exercised for all four panels.
+    assert len(llm.calls) >= 1
+    assert len(executor.calls) == 4
+
+    # 10. Bubbles exist for all four panels with distinct panel_ids.
+    bubbles_path = project_root / "bubbles.json"
+    assert bubbles_path.exists()
+    bubbles = json.loads(bubbles_path.read_text(encoding="utf-8"))
+    assert len(bubbles) >= 4
+    panel_ids = {b["panel_id"] for b in bubbles}
+    assert len(panel_ids) == 4  # one bubble per panel, 4 panels
+    for b in bubbles:
+        assert b["text"]
+        assert b["panel_id"]
+        assert b["type"] in ("normal", "shout", "thought", "narration", "whisper", "radio")
