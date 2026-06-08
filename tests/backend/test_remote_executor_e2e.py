@@ -429,3 +429,205 @@ async def test_autopilot_records_failure_when_remote_executor_fails(
         assert manifest.get("status") != "completed", (
             "manifest should not report completed when remote executor fails"
         )
+
+
+# ---- Async success fixture ----
+
+@pytest.fixture()
+async def async_remote_e2e_client(aiohttp_client, tmp_path: Path):
+    """E2E fixture with async_success FakeRemoteWorker (queued → running → completed)."""
+    from manga_autopilot.services.remote_executor import (
+        FakeRemoteWorker,
+        RemoteHTTPExecutor,
+        RemoteWorkerSettings,
+    )
+
+    llm = FakeLLMProvider()
+    worker = FakeRemoteWorker(mode="async_success", seed=42)
+
+    runner = web.AppRunner(worker.app())
+    await runner.setup()
+    site = web.TCPSite(runner, "127.0.0.1", 0)
+    await site.start()
+    server = site._server
+    assert server is not None
+    sockets = server.sockets
+    assert sockets is not None
+    port = sockets[0].getsockname()[1]
+
+    settings = RemoteWorkerSettings(
+        base_url=f"http://127.0.0.1:{port}",
+        timeout_sec=10.0,
+        poll_interval_sec=0.01,
+        poll_timeout_sec=10.0,
+    )
+
+    app = web.Application()
+    app["manga_llm_provider"] = llm
+    app["manga_default_workflow_id"] = "anime_t2i_default"
+    app["manga_panel_executor_factory"] = lambda project_id: RemoteHTTPExecutor(
+        settings=settings,
+        project_id=project_id,
+    )
+
+    register_all(app, storage_root=str(tmp_path))
+    cli = await aiohttp_client(app)
+
+    yield cli, tmp_path, llm, worker
+
+    await runner.cleanup()
+
+
+async def test_autopilot_can_generate_panels_with_async_remote_executor(
+    async_remote_e2e_client,
+) -> None:
+    """1-page / 1-panel autopilot through async polling RemoteHTTPExecutor."""
+    cli, tmp_path, llm, worker = async_remote_e2e_client
+
+    create_resp = await cli.post(
+        "/manga_autopilot/api/projects",
+        json={"name": "AsyncRemote E2E", "title": "AsyncRemote"},
+    )
+    assert create_resp.status == 201
+    project_id = (await create_resp.json())["id"]
+
+    start_resp = await cli.post(
+        f"/manga_autopilot/api/projects/{project_id}/autopilot/start",
+        json={
+            "idea": "A hero standing on a cliff",
+            "page_count": 1,
+            "panels_per_page": 1,
+            "candidate_count": 1,
+            "max_retries": 0,
+        },
+    )
+    assert start_resp.status == 202
+
+    final = await _wait_for_completion(cli, project_id, timeout=30.0)
+    assert final["state"] == "COMPLETED"
+
+    project_root = tmp_path / "projects" / project_id
+
+    # POST was called, and polling happened.
+    assert len(worker.requests) == 1
+    assert len(worker.job_requests) >= 2
+
+    # Panel saved.
+    panels_path = project_root / "panels.json"
+    assert panels_path.exists()
+    panels = json.loads(panels_path.read_text(encoding="utf-8"))
+    assert len(panels) == 1
+    rec = panels[0]
+    assert rec["image_path"] is not None
+    assert Path(rec["image_path"]).exists()
+    assert rec["status"] == "generated"
+
+    # Job completed.
+    jobs_dir = project_root / "jobs"
+    job_files = list(jobs_dir.iterdir())
+    assert len(job_files) == 1
+    job = json.loads(job_files[0].read_text(encoding="utf-8"))
+    assert job["status"] == "completed"
+
+    # generation_log.json confirms COMPLETED.
+    log_path = project_root / "generation_log.json"
+    assert log_path.exists()
+    log_payload = json.loads(log_path.read_text(encoding="utf-8"))
+    assert log_payload["state"] == "COMPLETED"
+
+    # Manifest.
+    manifest_path = project_root / "manifest.json"
+    assert manifest_path.exists()
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert manifest["project_id"] == project_id
+    assert manifest["status"] == "completed"
+
+
+# ---- Async error fixture ----
+
+@pytest.fixture()
+async def async_remote_fail_e2e_client(aiohttp_client, tmp_path: Path):
+    """E2E fixture with async_error FakeRemoteWorker (queued → error)."""
+    from manga_autopilot.services.remote_executor import (
+        FakeRemoteWorker,
+        RemoteHTTPExecutor,
+        RemoteWorkerSettings,
+    )
+
+    llm = FakeLLMProvider()
+    worker = FakeRemoteWorker(mode="async_error")
+
+    runner = web.AppRunner(worker.app())
+    await runner.setup()
+    site = web.TCPSite(runner, "127.0.0.1", 0)
+    await site.start()
+    server = site._server
+    assert server is not None
+    sockets = server.sockets
+    assert sockets is not None
+    port = sockets[0].getsockname()[1]
+
+    settings = RemoteWorkerSettings(
+        base_url=f"http://127.0.0.1:{port}",
+        timeout_sec=10.0,
+        poll_interval_sec=0.01,
+        poll_timeout_sec=10.0,
+    )
+
+    app = web.Application()
+    app["manga_llm_provider"] = llm
+    app["manga_default_workflow_id"] = "anime_t2i_default"
+    app["manga_panel_executor_factory"] = lambda project_id: RemoteHTTPExecutor(
+        settings=settings,
+        project_id=project_id,
+    )
+
+    register_all(app, storage_root=str(tmp_path))
+    cli = await aiohttp_client(app)
+
+    yield cli, tmp_path, llm, worker
+
+    await runner.cleanup()
+
+
+async def test_autopilot_records_failure_when_async_remote_job_errors(
+    async_remote_fail_e2e_client,
+) -> None:
+    """Autopilot reaches FAILED when async remote job errors."""
+    cli, tmp_path, llm, worker = async_remote_fail_e2e_client
+
+    create_resp = await cli.post(
+        "/manga_autopilot/api/projects",
+        json={"name": "AsyncRemoteFail E2E", "title": "AsyncRemoteFail"},
+    )
+    assert create_resp.status == 201
+    project_id = (await create_resp.json())["id"]
+
+    start_resp = await cli.post(
+        f"/manga_autopilot/api/projects/{project_id}/autopilot/start",
+        json={
+            "idea": "A hero standing on a cliff",
+            "page_count": 1,
+            "panels_per_page": 1,
+            "candidate_count": 1,
+            "max_retries": 0,
+        },
+    )
+    assert start_resp.status == 202
+
+    final = await _wait_for_terminal(cli, project_id, timeout=30.0)
+    assert final["state"].startswith("FAILED"), (
+        f"expected FAILED state, got {final['state']}"
+    )
+
+    project_root = tmp_path / "projects" / project_id
+
+    # generation_log.json exists with FAILED state.
+    log_path = project_root / "generation_log.json"
+    assert log_path.exists()
+    log_payload = json.loads(log_path.read_text(encoding="utf-8"))
+    assert log_payload["state"].startswith("FAILED")
+
+    # Worker received the POST and at least one poll.
+    assert len(worker.requests) >= 1
+    assert len(worker.job_requests) >= 1

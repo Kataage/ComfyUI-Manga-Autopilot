@@ -5,10 +5,16 @@ This module provides :class:`RemoteHTTPExecutor`, a
 requests to a remote HTTP worker and receives deterministic PNG bytes
 in return.
 
-The worker contract is intentionally simple for v0.1 — a synchronous
-JSON request/response.  Future versions may add:
+The worker supports two modes:
 
-- Async job polling (``/v1/jobs/{id}``)
+- **Synchronous**: ``POST /v1/generate-panel`` returns ``completed``
+  with ``image_base64`` in a single response.
+- **Asynchronous**: ``POST`` returns ``queued`` or ``accepted`` with a
+  ``job_id``; the executor polls ``GET /v1/jobs/{job_id}`` until the
+  job reaches ``completed`` or ``error``.
+
+Future versions may add:
+
 - Artifact URLs (S3 / R2 signed URLs) instead of base64
 - Streaming / chunked transfers for large images
 """
@@ -71,6 +77,26 @@ class RemoteExecutorImageError(RemoteExecutorError):
     """Remote worker returned an invalid image payload."""
 
 
+class RemoteExecutorPollingTimeoutError(RemoteExecutorTimeoutError):
+    """Remote worker job did not complete within polling timeout."""
+
+    def __init__(self, job_id: str, timeout_sec: float, url: str) -> None:
+        self.job_id = job_id
+        super().__init__(timeout_sec, url)
+        self.args = (
+            f"job {job_id!r} did not complete within {timeout_sec}s polling: {url}",
+        )
+
+
+class RemoteExecutorJobError(RemoteExecutorResponseError):
+    """Remote worker job reached error state."""
+
+    def __init__(self, job_id: str, error: str) -> None:
+        self.job_id = job_id
+        self.job_error = error
+        super().__init__(f"job {job_id!r} failed: {error}")
+
+
 # --------------------------------------------------------------------- types
 
 @dataclass
@@ -80,6 +106,9 @@ class RemoteWorkerSettings:
     base_url: str = "http://127.0.0.1:9000"
     timeout_sec: float = 60.0
     api_key: str | None = None
+    poll_interval_sec: float = 0.1
+    poll_timeout_sec: float = 60.0
+    max_poll_attempts: int | None = None
 
 
 @dataclass
@@ -121,6 +150,7 @@ class RemoteGenerateResponse:
     """Response from ``POST /v1/generate-panel``."""
 
     status: str
+    job_id: str | None = None
     filename: str | None = None
     image_base64: str | None = None
     seed: int | None = None
@@ -131,6 +161,7 @@ class RemoteGenerateResponse:
     def from_dict(cls, data: dict[str, Any]) -> RemoteGenerateResponse:
         return cls(
             status=data.get("status", "error"),
+            job_id=data.get("job_id"),
             filename=data.get("filename"),
             image_base64=data.get("image_base64"),
             seed=data.get("seed"),
@@ -145,8 +176,13 @@ class RemoteHTTPExecutor(GenerationExecutor):
     """A :class:`GenerationExecutor` that delegates to a remote HTTP worker.
 
     The worker is expected to expose ``POST /v1/generate-panel`` which
-    accepts a JSON payload and returns a JSON response with
-    ``image_base64`` containing the rendered PNG.
+    accepts a JSON payload and returns a JSON response.
+
+    **Synchronous mode**: the response contains ``image_base64`` directly.
+
+    **Asynchronous mode**: the response contains ``job_id`` with status
+    ``queued`` / ``accepted`` / ``running``.  The executor then polls
+    ``GET /v1/jobs/{job_id}`` until the job completes or errors.
     """
 
     def __init__(
@@ -164,6 +200,99 @@ class RemoteHTTPExecutor(GenerationExecutor):
         if self._session_factory is not None:
             return self._session_factory()
         return aiohttp.ClientSession()
+
+    def _auth_headers(self) -> dict[str, str]:
+        headers: dict[str, str] = {"Content-Type": "application/json"}
+        if self.settings.api_key:
+            headers["Authorization"] = f"Bearer {self.settings.api_key}"
+        return headers
+
+    async def _fetch_json(self, session: aiohttp.ClientSession, url: str) -> dict[str, Any]:
+        """GET a URL and return parsed JSON.  Raises on HTTP or parse errors."""
+        timeout = aiohttp.ClientTimeout(total=self.settings.timeout_sec)
+        try:
+            async with session.get(url, headers=self._auth_headers(), timeout=timeout) as resp:
+                if resp.status != 200:
+                    body = await resp.text()
+                    raise RemoteExecutorHTTPError(resp.status, body, url)
+                try:
+                    return await resp.json()
+                except (aiohttp.ContentTypeError, ValueError) as exc:
+                    raise RemoteExecutorResponseError(
+                        f"remote worker returned invalid JSON from {url}: {exc}"
+                    ) from exc
+        except asyncio.TimeoutError as exc:
+            raise RemoteExecutorTimeoutError(self.settings.timeout_sec, url) from exc
+
+    def _decode_image(self, image_base64: str, candidate_id: str) -> Image.Image:
+        """Decode base64 PNG into a PIL Image."""
+        try:
+            raw = base64.b64decode(image_base64)
+        except Exception as exc:
+            raise RemoteExecutorImageError(
+                f"remote worker returned invalid base64: {exc}"
+            ) from exc
+        try:
+            image = Image.open(io.BytesIO(raw))
+            image.load()
+        except Exception as exc:
+            raise RemoteExecutorImageError(
+                f"remote worker returned invalid image bytes: {exc}"
+            ) from exc
+        return image
+
+    async def _poll_job(
+        self,
+        session: aiohttp.ClientSession,
+        job_id: str,
+        candidate_id: str,
+        workflow_id: str,
+    ) -> GenerationExecutorResult:
+        """Poll ``GET /v1/jobs/{job_id}`` until completed or error."""
+        base = self.settings.base_url.rstrip("/")
+        job_url = f"{base}/v1/jobs/{job_id}"
+        deadline = asyncio.get_event_loop().time() + self.settings.poll_timeout_sec
+        attempts = 0
+
+        while True:
+            attempts += 1
+            if self.settings.max_poll_attempts is not None:
+                if attempts > self.settings.max_poll_attempts:
+                    raise RemoteExecutorPollingTimeoutError(
+                        job_id, self.settings.poll_timeout_sec, job_url,
+                    )
+
+            data = await self._fetch_json(session, job_url)
+            status = data.get("status", "error")
+
+            if status == "completed":
+                image_b64 = data.get("image_base64")
+                if not image_b64:
+                    raise RemoteExecutorResponseError(
+                        f"job {job_id!r} completed but no image_base64"
+                    )
+                image = self._decode_image(image_b64, candidate_id)
+                return GenerationExecutorResult(
+                    candidate_id=candidate_id,
+                    prompt_id=data.get("metadata", {}).get(
+                        "prompt_id", f"remote_{candidate_id}"
+                    ),
+                    image=image,
+                    workflow_id=workflow_id,
+                )
+
+            if status == "error":
+                raise RemoteExecutorJobError(
+                    job_id, data.get("error", "unknown error")
+                )
+
+            # queued / running — check timeout and retry
+            if asyncio.get_event_loop().time() >= deadline:
+                raise RemoteExecutorPollingTimeoutError(
+                    job_id, self.settings.poll_timeout_sec, job_url,
+                )
+
+            await asyncio.sleep(self.settings.poll_interval_sec)
 
     async def submit(
         self,
@@ -185,16 +314,12 @@ class RemoteHTTPExecutor(GenerationExecutor):
             workflow_id=workflow_id or None,
         )
         url = self.settings.base_url.rstrip("/") + "/v1/generate-panel"
-        headers: dict[str, str] = {"Content-Type": "application/json"}
-        if self.settings.api_key:
-            headers["Authorization"] = f"Bearer {self.settings.api_key}"
-
         timeout = aiohttp.ClientTimeout(total=self.settings.timeout_sec)
         session = self._open()
         try:
             try:
                 async with session.post(
-                    url, json=request.to_dict(), headers=headers, timeout=timeout,
+                    url, json=request.to_dict(), headers=self._auth_headers(), timeout=timeout,
                 ) as resp:
                     if resp.status != 200:
                         body = await resp.text()
@@ -214,34 +339,34 @@ class RemoteHTTPExecutor(GenerationExecutor):
                 await session.close()
 
         response = RemoteGenerateResponse.from_dict(data)
-        if response.status != "completed":
-            raise RemoteExecutorResponseError(
-                f"remote worker returned status={response.status!r}: "
-                f"{response.error or 'unknown error'}"
+
+        # --- synchronous completed ---
+        if response.status == "completed":
+            if not response.image_base64:
+                raise RemoteExecutorResponseError("remote worker returned no image_base64")
+            image = self._decode_image(response.image_base64, candidate_id)
+            return GenerationExecutorResult(
+                candidate_id=candidate_id,
+                prompt_id=response.metadata.get("prompt_id", f"remote_{candidate_id}"),
+                image=image,
+                workflow_id=workflow_id,
             )
-        if not response.image_base64:
-            raise RemoteExecutorResponseError("remote worker returned no image_base64")
 
-        try:
-            raw = base64.b64decode(response.image_base64)
-        except Exception as exc:
-            raise RemoteExecutorImageError(
-                f"remote worker returned invalid base64: {exc}"
-            ) from exc
+        # --- async: queued / accepted / running with job_id ---
+        if response.status in ("queued", "accepted", "running") and response.job_id:
+            session_for_poll = self._open()
+            try:
+                return await self._poll_job(
+                    session_for_poll, response.job_id, candidate_id, workflow_id,
+                )
+            finally:
+                if self._session_factory is None:
+                    await session_for_poll.close()
 
-        try:
-            image = Image.open(io.BytesIO(raw))
-            image.load()
-        except Exception as exc:
-            raise RemoteExecutorImageError(
-                f"remote worker returned invalid image bytes: {exc}"
-            ) from exc
-
-        return GenerationExecutorResult(
-            candidate_id=candidate_id,
-            prompt_id=response.metadata.get("prompt_id", f"remote_{candidate_id}"),
-            image=image,
-            workflow_id=workflow_id,
+        # --- anything else is an error ---
+        raise RemoteExecutorResponseError(
+            f"remote worker returned status={response.status!r}: "
+            f"{response.error or 'unknown error'}"
         )
 
 
@@ -254,6 +379,8 @@ class FakeRemoteWorker:
 
     ``mode`` controls the response behaviour:
 
+    **Synchronous modes:**
+
     - ``"success"`` — deterministic PNG response (default)
     - ``"http_500"`` — HTTP 500 with text body
     - ``"status_error"`` — JSON ``{"status": "error", ...}``
@@ -262,6 +389,12 @@ class FakeRemoteWorker:
     - ``"invalid_base64"`` — JSON with non-base64 ``image_base64``
     - ``"invalid_image"`` — valid base64 but not a valid image
     - ``"timeout"`` — sleeps for ``delay_sec`` before responding
+
+    **Asynchronous modes:**
+
+    - ``"async_success"`` — queued → running → completed
+    - ``"async_error"`` — queued → error
+    - ``"async_timeout"`` — always returns running (never completes)
     """
 
     def __init__(
@@ -276,6 +409,20 @@ class FakeRemoteWorker:
         self.delay_sec = delay_sec
         self.requests: list[dict[str, Any]] = []
         self.headers: list[dict[str, str | Any]] = []
+        self.jobs: dict[str, dict[str, Any]] = {}
+        self.poll_count: dict[str, int] = {}
+        self.job_requests: list[dict[str, Any]] = []
+
+    def _make_image_b64(self, width: int, height: int, seed: int) -> str:
+        r = (seed * 7) % 256
+        g = (seed * 13) % 256
+        b = (seed * 23) % 256
+        img = Image.new("RGB", (width, height), (r, g, b))
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        return base64.b64encode(buf.getvalue()).decode("ascii")
+
+    # ---- POST /v1/generate-panel ----
 
     async def handle_generate(self, request: aiohttp.web.Request) -> aiohttp.web.Response:
         body = await request.json()
@@ -285,7 +432,6 @@ class FakeRemoteWorker:
         # --- timeout mode ---
         if self.mode == "timeout" and self.delay_sec > 0:
             await asyncio.sleep(self.delay_sec)
-            # After sleep, return error (client should have timed out).
             return aiohttp.web.json_response(
                 {"status": "error", "error": "delayed response"},
                 status=200,
@@ -316,12 +462,31 @@ class FakeRemoteWorker:
         width = int(body.get("width", 64))
         height = int(body.get("height", 64))
         seed = int(body.get("seed", self.seed))
+        panel_id = body.get("panel_id", "panel")
+
+        # --- async modes: return queued ---
+        if self.mode in ("async_success", "async_error", "async_timeout"):
+            import uuid
+            job_id = f"fake_job_{uuid.uuid4().hex[:8]}"
+            self.jobs[job_id] = {
+                "width": width,
+                "height": height,
+                "seed": seed,
+                "panel_id": panel_id,
+                "status": "queued",
+            }
+            self.poll_count[job_id] = 0
+            return aiohttp.web.json_response({
+                "status": "queued",
+                "job_id": job_id,
+                "metadata": {"executor": "fake-remote"},
+            })
 
         # --- missing image_base64 ---
         if self.mode == "missing_image":
             return aiohttp.web.json_response({
                 "status": "completed",
-                "filename": f"{body.get('panel_id', 'panel')}.png",
+                "filename": f"{panel_id}.png",
                 "seed": seed,
                 "metadata": {"executor": "fake-remote"},
             })
@@ -330,7 +495,7 @@ class FakeRemoteWorker:
         if self.mode == "invalid_base64":
             return aiohttp.web.json_response({
                 "status": "completed",
-                "filename": f"{body.get('panel_id', 'panel')}.png",
+                "filename": f"{panel_id}.png",
                 "image_base64": "this-is-not-base64!!!",
                 "seed": seed,
                 "metadata": {"executor": "fake-remote"},
@@ -338,39 +503,95 @@ class FakeRemoteWorker:
 
         # --- invalid image bytes (valid base64, not a valid image) ---
         if self.mode == "invalid_image":
-            import base64 as _b64
-            fake_bytes = _b64.b64encode(b"not-an-image").decode("ascii")
+            fake_bytes = base64.b64encode(b"not-an-image").decode("ascii")
             return aiohttp.web.json_response({
                 "status": "completed",
-                "filename": f"{body.get('panel_id', 'panel')}.png",
+                "filename": f"{panel_id}.png",
                 "image_base64": fake_bytes,
                 "seed": seed,
                 "metadata": {"executor": "fake-remote"},
             })
 
         # --- success (default) ---
-        r = (seed * 7) % 256
-        g = (seed * 13) % 256
-        b = (seed * 23) % 256
-        img = Image.new("RGB", (width, height), (r, g, b))
-        buf = io.BytesIO()
-        img.save(buf, format="PNG")
-        b64 = base64.b64encode(buf.getvalue()).decode("ascii")
-
+        b64 = self._make_image_b64(width, height, seed)
         return aiohttp.web.json_response({
             "status": "completed",
-            "filename": f"{body.get('panel_id', 'panel')}.png",
+            "filename": f"{panel_id}.png",
             "image_base64": b64,
             "seed": seed,
             "metadata": {
                 "executor": "fake-remote",
-                "prompt_id": f"fake_{body.get('panel_id', 'unknown')}",
+                "prompt_id": f"fake_{panel_id}",
             },
+        })
+
+    # ---- GET /v1/jobs/{job_id} ----
+
+    async def handle_get_job(self, request: aiohttp.web.Request) -> aiohttp.web.Response:
+        job_id = request.match_info["job_id"]
+        self.job_requests.append({"job_id": job_id})
+
+        job = self.jobs.get(job_id)
+        if job is None:
+            return aiohttp.web.json_response(
+                {"status": "error", "error": f"job {job_id!r} not found"},
+            )
+
+        self.poll_count[job_id] = self.poll_count.get(job_id, 0) + 1
+        poll_n = self.poll_count[job_id]
+
+        if self.mode == "async_timeout":
+            # Always running — never completes.
+            return aiohttp.web.json_response({
+                "status": "running",
+                "job_id": job_id,
+            })
+
+        if self.mode == "async_error":
+            # First poll returns running, second returns error.
+            if poll_n < 2:
+                return aiohttp.web.json_response({
+                    "status": "running",
+                    "job_id": job_id,
+                })
+            return aiohttp.web.json_response({
+                "status": "error",
+                "job_id": job_id,
+                "error": "model failed",
+            })
+
+        if self.mode == "async_success":
+            # First poll returns running, second returns completed.
+            if poll_n < 2:
+                return aiohttp.web.json_response({
+                    "status": "running",
+                    "job_id": job_id,
+                })
+            b64 = self._make_image_b64(
+                job["width"], job["height"], job["seed"],
+            )
+            return aiohttp.web.json_response({
+                "status": "completed",
+                "job_id": job_id,
+                "filename": f"{job['panel_id']}.png",
+                "image_base64": b64,
+                "seed": job["seed"],
+                "metadata": {
+                    "executor": "fake-remote",
+                    "prompt_id": f"fake_{job_id}",
+                },
+            })
+
+        return aiohttp.web.json_response({
+            "status": "error",
+            "job_id": job_id,
+            "error": f"unknown mode: {self.mode}",
         })
 
     def app(self) -> aiohttp.web.Application:
         app = aiohttp.web.Application()
         app.router.add_post("/v1/generate-panel", self.handle_generate)
+        app.router.add_get("/v1/jobs/{job_id}", self.handle_get_job)
         return app
 
 
@@ -380,6 +601,8 @@ __all__ = [
     "RemoteExecutorTimeoutError",
     "RemoteExecutorResponseError",
     "RemoteExecutorImageError",
+    "RemoteExecutorPollingTimeoutError",
+    "RemoteExecutorJobError",
     "RemoteWorkerSettings",
     "RemoteGenerateRequest",
     "RemoteGenerateResponse",
