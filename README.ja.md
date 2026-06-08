@@ -106,6 +106,11 @@ ComfyUI のカスタムノード拡張で、1 つのアイデアから短い漫�
   `MANGA_AUTOPILOT_REAL_COMFY_E2E=1`、`MANGA_AUTOPILOT_COMFY_BASE_URL`、
   `MANGA_AUTOPILOT_TEST_WORKFLOW_JSON` を設定すると実行。
   ローカル/LAN/クラウド GPU の ComfyUI インスタンスに対応。
+- **Webtoon + PDF Autopilot 書き出し** — ページ描画後に Autopilot の
+  書き出し hook が Webtoon（フル + ページ別スライス）と PDF を生成する。
+  `ManifestExports` には `webtoon`（PNG パスのリスト）と `pdf`
+  （`manga.pdf` のパス）が含まれる。 E2E テストでディスク上の
+  ファイルと manifest への反映を検証。
 
 ### Planned (未接続 / スタブ)
 
