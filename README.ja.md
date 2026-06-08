@@ -79,6 +79,13 @@ ComfyUI のカスタムノード拡張で、1 つのアイデアから短い漫�
   `generation_log.json` が書き出される。 fake LLM / fake executor
   を使う 1 ページ E2E テスト (`test_one_page_e2e.py`) がディスク上の
   成果物を検証する。
+- **マルチページ / マルチパネル自動操縦** — `page_count` と
+  `panels_per_page` パラメータで、1 ページに複数の `PanelRecord` を
+  生成し、各パネルに個別の `GenerationJob`、`SpeechBubble`、
+  fallback レイアウトを割り当てる。 ページは `export_page_png` で
+  `exports/pages/page_NNNN.png` に書き出される。 E2E テストで
+  1ページ/2パネル、1ページ/3パネル、2ページ/1パネル、
+  4ページ/1パネルの構成を検証済み。
 - **Project / Panel HTTP API** — `GET/POST /projects`、
   `GET/PATCH/DELETE /projects/{id}`、`GET /projects/_suggest_id` (spec
   §21.2) と `POST /panels/{id}/{generate,regenerate,repair}`、
@@ -92,9 +99,6 @@ ComfyUI のカスタムノード拡張で、1 つのアイデアから短い漫�
 
 ### Planned (未接続 / スタブ)
 
-- **複数ページの自動操縦。** デフォルトのフックは `page_count=1` を
-  想定して書かれており、複数ページ実行には LLM プロンプトの強化、
-  ページ単位の吹き出しレイアウト、段階的な manifest 更新が必要。
 - **外部 GPU worker (Modal 風) のエンドツーエンド接続。** `GPUBridge` は
   ワークフローのシリアライズとローカル ComfyUI フォールバックを実装済み
   だが、デフォルト Orchestrator からはまだ使われていない。

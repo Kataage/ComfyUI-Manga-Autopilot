@@ -74,6 +74,13 @@ later issue, not yet wired up).
   `generation_log.json` are written.  A 1-page end-to-end integration
   test (`test_one_page_e2e.py`) exercises this against fake LLM / fake
   executor and verifies every artefact on disk.
+- **Multi-page / multi-panel autopilot** — `page_count` and
+  `panels_per_page` parameters drive the orchestrator to create
+  multiple `PanelRecord`s per page; each panel gets its own
+  `GenerationJob`, `SpeechBubble`, and fallback layout.  Pages are
+  rendered via `export_page_png` into `exports/pages/page_NNNN.png`.
+  End-to-end tests cover 1-page/2-panel, 1-page/3-panel,
+  2-page/1-panel, and 4-page/1-panel configurations.
 - **Project + panel HTTP APIs** — `GET/POST /projects`,
   `GET/PATCH/DELETE /projects/{id}`, `GET /projects/_suggest_id`
   (spec §21.2) and `POST /panels/{id}/{generate,regenerate,repair}`,
@@ -87,9 +94,6 @@ later issue, not yet wired up).
 
 ### Planned (spec-described, not yet wired up)
 
-- **Multi-page autopilot runs.**  The default hooks are designed for
-  `page_count=1`; longer runs need richer LLM prompts, page-aware
-  bubble layouts, and progressive manifest updates.
 - **External GPU worker (Modal-style) end-to-end.**  `GPUBridge` knows
   how to serialise a workflow and fall back to local ComfyUI on
   timeout, but it is not yet used by the default orchestrator.

@@ -13,6 +13,7 @@ from aiohttp import web
 
 from manga_autopilot.models.page import PagePlan
 from manga_autopilot.models.panel import (
+    PanelLayout,
     PanelRecord,
     load_panel_records,
     write_panel_records,
@@ -380,7 +381,6 @@ def _make_lettering(
     storage_root: Path,
 ) -> Callable[[AutopilotRun], dict[str, Any]]:
     from manga_autopilot.models.bubble import SpeechBubble
-    from manga_autopilot.models.panel import PanelLayout
     from manga_autopilot.services.bubble_layout import place_bubbles
     from manga_autopilot.services.bubble_service import BubbleService
 
@@ -458,12 +458,87 @@ def _make_lettering(
     return _hook
 
 
+# Page dimensions used by export_page_png (spec section 20.1).
+_PAGE_WIDTH = 1200
+_PAGE_HEIGHT = 1600
+
+
+def _assign_fallback_layouts(
+    records: list[PanelRecord],
+    page_number: int,
+) -> list[PanelLayout]:
+    """Assign non-overlapping :class:`PanelLayout` for panels on one page.
+
+    Panels with an explicit ``record.layout`` keep it; the others receive
+    a computed layout so that all panels on the same page are visible and
+    do not overlap.  The layout follows a simple grid strategy:
+
+    * 1 panel  → full page (with 4 px outer margin)
+    * 2 panels → top / bottom halves
+    * 3 panels → top half / bottom-left / bottom-right
+    * 4+ panels → 2xN grid
+
+    The ``image_path`` is *not* set here; the caller does that.
+    """
+
+    n = len(records)
+    if n == 0:
+        return []
+
+    # If every record already has an explicit layout, just return them.
+    if all(r.layout is not None for r in records):
+        return [r.layout for r in records]  # type: ignore[misc]
+
+    margin = 4
+    pw = _PAGE_WIDTH - 2 * margin
+    ph = _PAGE_HEIGHT - 2 * margin
+
+    def _make(x: float, y: float, w: float, h: float, pid: str) -> PanelLayout:
+        return PanelLayout(panel_id=pid, x=x, y=y, width=w, height=h)
+
+    layouts: list[PanelLayout] = []
+    for idx, record in enumerate(records):
+        if record.layout is not None:
+            layouts.append(record.layout)
+            continue
+        pid = record.panel_id
+        if n == 1:
+            layouts.append(_make(margin, margin, pw, ph, pid))
+        elif n == 2:
+            if idx == 0:
+                layouts.append(_make(margin, margin, pw, ph / 2, pid))
+            else:
+                layouts.append(_make(margin, margin + ph / 2, pw, ph / 2, pid))
+        elif n == 3:
+            if idx == 0:
+                layouts.append(_make(margin, margin, pw, ph / 2, pid))
+            elif idx == 1:
+                layouts.append(_make(margin, margin + ph / 2, pw / 2, ph / 2, pid))
+            else:
+                layouts.append(_make(margin + pw / 2, margin + ph / 2, pw / 2, ph / 2, pid))
+        else:
+            # 4+ panels → 2-column grid
+            cols = 2
+            rows = (n + cols - 1) // cols
+            cell_w = pw / cols
+            cell_h = ph / rows
+            row = idx // cols
+            col = idx % cols
+            layouts.append(_make(
+                margin + col * cell_w,
+                margin + row * cell_h,
+                cell_w,
+                cell_h,
+                pid,
+            ))
+    return layouts
+
+
 def _make_render_page(
     _app: Application,
     project_id: str,
     storage_root: Path,
 ) -> Callable[[AutopilotRun], Any]:
-    from manga_autopilot.models.panel import PanelLayout
     from manga_autopilot.services.bubble_layout import place_bubbles
     from manga_autopilot.services.bubble_renderer import draw_bubble_on_canvas
     from manga_autopilot.services.bubble_service import BubbleService
@@ -508,20 +583,18 @@ def _make_render_page(
 
     def _hook(run: AutopilotRun) -> list[dict[str, Any]]:
         records = _read_panel_records(project_root)
-        pages: dict[int, list[tuple[PanelLayout, str]]] = {}
+        # Group records by page, then assign non-overlapping fallback layouts.
+        by_page: dict[int, list] = {}
         for record in records:
             if record.image_path is None:
                 continue
-            layout = record.layout or PanelLayout(
-                panel_id=record.panel_id,
-                x=0,
-                y=0,
-                width=512,
-                height=512,
-                image_path=record.image_path,
-            )
-            layout.image_path = record.image_path
-            pages.setdefault(record.page_number, []).append((layout, record.panel_id))
+            by_page.setdefault(record.page_number, []).append(record)
+        pages: dict[int, list[tuple[PanelLayout, str]]] = {}
+        for page_number, page_records in by_page.items():
+            layouts = _assign_fallback_layouts(page_records, page_number)
+            for record, layout in zip(page_records, layouts, strict=True):
+                layout.image_path = record.image_path
+                pages.setdefault(page_number, []).append((layout, record.panel_id))
         rendered: list[dict[str, Any]] = []
         for page_number, panel_entries in sorted(pages.items()):
             page_id = f"page_{page_number:04d}"

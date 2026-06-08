@@ -624,3 +624,101 @@ async def test_multi_panel_per_page_autopilot_completes_end_to_end(e2e_client) -
     for b in bubbles:
         assert b["text"]
         assert b["panel_id"]
+
+
+# --------------------------------------------------------- 3-panel test
+async def test_three_panel_per_page_autopilot_completes_end_to_end(e2e_client) -> None:
+    """1-page / 3-panel autopilot: 1 page with 3 panels, each with its own bubble."""
+    cli, tmp_path, llm, executor = e2e_client
+
+    # 1. Create the project.
+    create_resp = await cli.post(
+        "/manga_autopilot/api/projects",
+        json={"name": "Three-Panel Sample", "title": "Three-Panel"},
+    )
+    assert create_resp.status == 201
+    project_id = (await create_resp.json())["id"]
+
+    # 2. Start the autopilot with page_count=1, panels_per_page=3.
+    start_resp = await cli.post(
+        f"/manga_autopilot/api/projects/{project_id}/autopilot/start",
+        json={
+            "idea": "Three heroes in a dramatic scene",
+            "page_count": 1,
+            "panels_per_page": 3,
+            "candidate_count": 1,
+            "max_retries": 0,
+        },
+    )
+    assert start_resp.status == 202
+
+    # 3. Wait for completion.
+    final = await _wait_for_completion(cli, project_id, timeout=15.0)
+    assert final["state"] == "COMPLETED"
+
+    project_root = tmp_path / "projects" / project_id
+
+    # 4. Three panel records exist on page 1, each with an image.
+    panels_path = project_root / "panels.json"
+    assert panels_path.exists()
+    panels = json.loads(panels_path.read_text(encoding="utf-8"))
+    assert len(panels) == 3
+    for rec in panels:
+        assert rec["image_path"] is not None
+        assert Path(rec["image_path"]).exists()
+        assert rec["status"] == "generated"
+        assert rec["page_number"] == 1
+    # Panel IDs are distinct.
+    panel_ids = {rec["panel_id"] for rec in panels}
+    assert len(panel_ids) == 3
+
+    # 5. One page PNG was rendered (all three panels composited into page_0001.png).
+    exports_dir = project_root / "exports" / "pages"
+    rendered_pages = sorted(p.name for p in exports_dir.iterdir() if p.suffix == ".png")
+    assert "page_0001.png" in rendered_pages
+    page_path = exports_dir / "page_0001.png"
+    assert page_path.stat().st_size > 0
+
+    # 6. Three GenerationJob JSONs exist under jobs/.
+    jobs_dir = project_root / "jobs"
+    assert jobs_dir.is_dir()
+    job_files = list(jobs_dir.iterdir())
+    assert len(job_files) == 3
+    for jf in job_files:
+        job = json.loads(jf.read_text(encoding="utf-8"))
+        assert job["status"] == "completed"
+        assert job["selected_candidate_id"] is not None
+
+    # 7. Manifest reflects 1 page, 3 panels.
+    manifest_path = project_root / "manifest.json"
+    assert manifest_path.exists()
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert manifest["project_id"] == project_id
+    assert manifest["status"] == "completed"
+    assert manifest["stats"]["page_count"] == 1
+    assert manifest["stats"]["panel_count"] == 3
+    assert manifest["stats"]["generated_images"] == 3
+    # exports.pages contains page_0001.png
+    export_page_names = [Path(p).name for p in manifest["exports"]["pages"]]
+    assert "page_0001.png" in export_page_names
+
+    # 8. generation_log.json confirms COMPLETED.
+    log_path = project_root / "generation_log.json"
+    assert log_path.exists()
+    log_payload = json.loads(log_path.read_text(encoding="utf-8"))
+    assert log_payload["state"] == "COMPLETED"
+
+    # 9. LLM and executor were exercised for all three panels.
+    assert len(llm.calls) >= 1
+    assert len(executor.calls) == 3
+
+    # 10. Bubbles exist for all three panels with distinct panel_ids.
+    bubbles_path = project_root / "bubbles.json"
+    assert bubbles_path.exists()
+    bubbles = json.loads(bubbles_path.read_text(encoding="utf-8"))
+    assert len(bubbles) >= 3
+    bubble_panel_ids = {b["panel_id"] for b in bubbles}
+    assert len(bubble_panel_ids) == 3
+    for b in bubbles:
+        assert b["text"]
+        assert b["panel_id"]
