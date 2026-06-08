@@ -304,14 +304,24 @@ def _make_generate_panels(
         loop = GenerationLoop(
             project_root=project_root,
             config=GenerationLoopConfig(
-                candidate_count=int(run.input.get("candidate_count") or 1),
-                max_retries=int(run.input.get("max_retries") or 1),
-                threshold=float(run.input.get("threshold") or 0.5),
+                candidate_count=int(run.input["candidate_count"]) if run.input.get("candidate_count") is not None else 1,
+                max_retries=int(run.input["max_retries"]) if run.input.get("max_retries") is not None else 1,
+                threshold=float(run.input["threshold"]) if run.input.get("threshold") is not None else 0.5,
             ),
         )
         builder = PromptBuilder(provider=_llm_provider(app))
         rendered: list[dict[str, Any]] = []
+        failed_panel_ids: list[str] = []
+        skipped_panel_ids: list[str] = []
         for record in records:
+            # Idempotent: skip panels that are already generated.
+            if (
+                record.image_path is not None
+                and record.status == "generated"
+                and Path(record.image_path).exists()
+            ):
+                skipped_panel_ids.append(record.panel_id)
+                continue
             try:
                 try:
                     prompt = await builder.build(record.plan)
@@ -337,7 +347,11 @@ def _make_generate_panels(
                 )
                 if outcome.selected_image_path is not None:
                     record.image_path = str(outcome.selected_image_path)
-                record.status = "generated" if outcome.job.status.value == "completed" else "failed"
+                if outcome.job.status.value == "completed":
+                    record.status = "generated"
+                else:
+                    record.status = "failed"
+                    failed_panel_ids.append(record.panel_id)
                 record.history.append(
                     {
                         "kind": "autopilot_generation",
@@ -352,7 +366,12 @@ def _make_generate_panels(
                 log.warning("generate_panels failed for %s: %s", record.panel_id, exc)
                 record.status = "failed"
                 record.updated_at = datetime.now(timezone.utc)
+                failed_panel_ids.append(record.panel_id)
         _write_panel_records(project_root, records)
+        if failed_panel_ids:
+            raise RuntimeError(
+                f"panel generation failed for: {', '.join(failed_panel_ids)}"
+            )
         return rendered
 
     return _hook
