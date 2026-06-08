@@ -30,10 +30,22 @@ JOB_ID_PATTERN = re.compile(r"^[A-Za-z0-9_\-]{1,64}$")
 
 
 class JobStatus(str, Enum):
-    """Lifecycle states for a :class:`GenerationJob`."""
+    """Lifecycle states for a :class:`GenerationJob` (spec section 17.2).
+
+    Happy path: PENDING -> VALIDATING -> QUEUED -> RUNNING ->
+    FETCHING_RESULT -> QA_CHECKING -> COMPLETED.
+
+    On retry: ... -> QA_CHECKING -> RETRYING -> QUEUED -> ...
+    On terminal failure: any state -> FAILED / CANCELLED.
+    """
 
     PENDING = "pending"
+    VALIDATING = "validating"
+    QUEUED = "queued"
     RUNNING = "running"
+    FETCHING_RESULT = "fetching_result"
+    QA_CHECKING = "qa_checking"
+    RETRYING = "retrying"
     COMPLETED = "completed"
     FAILED = "failed"
     CANCELLED = "cancelled"

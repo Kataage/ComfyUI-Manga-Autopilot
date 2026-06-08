@@ -73,6 +73,18 @@ class FakeExecutor:
         )
 
 
+class _StatusRecordingLoop(GenerationLoop):
+    """Subclass that records every ``_set_status`` call for assertion."""
+
+    def __init__(self, *args: object, **kwargs: object) -> None:
+        super().__init__(*args, **kwargs)
+        self.status_history: list[JobStatus] = []
+
+    def _set_status(self, job: GenerationJob, status: JobStatus) -> None:
+        super()._set_status(job, status)
+        self.status_history.append(status)
+
+
 def _panel(panel_number: int = 1) -> PanelPlan:
     return PanelPlan(
         panel_number=panel_number,
@@ -340,3 +352,169 @@ def test_retry_action_use_fallback_is_distinct() -> None:
 
     assert RetryAction.USE_FALLBACK.value == "use_fallback"
     assert RetryAction.USE_FALLBACK != RetryAction.RETRY_SAME
+
+
+# ------------------------------------------------- status transition tests
+def test_generation_job_status_enum_includes_all_lifecycle_states() -> None:
+    """All 10 spec-17.2 lifecycle states must be present and stable."""
+    expected = {
+        "pending",
+        "validating",
+        "queued",
+        "running",
+        "fetching_result",
+        "qa_checking",
+        "retrying",
+        "completed",
+        "failed",
+        "cancelled",
+    }
+    actual = {s.value for s in JobStatus}
+    assert actual == expected
+
+
+async def test_loop_happy_path_transitions_through_expected_statuses(
+    tmp_path: Path,
+) -> None:
+    """Happy path (pass on first attempt) must hit:
+    VALIDATING -> QUEUED -> RUNNING -> FETCHING_RESULT -> QA_CHECKING -> COMPLETED.
+    """
+
+    executor = FakeExecutor()
+    loop = _StatusRecordingLoop(
+        project_root=tmp_path,
+        config=GenerationLoopConfig(
+            candidate_count=1,
+            max_retries=0,
+            threshold=0.0,
+            panel_width=64,
+            panel_height=64,
+        ),
+    )
+    outcome = await loop.run(
+        panel=_panel(),
+        page_number=1,
+        prompt=_prompt(),
+        workflow_id="anime_t2i_default",
+        executor=executor,
+        project_id="proj_test_001",
+    )
+    assert outcome.job.status == JobStatus.COMPLETED
+    h = loop.status_history
+    assert JobStatus.VALIDATING in h
+    assert JobStatus.QUEUED in h
+    assert JobStatus.RUNNING in h
+    assert JobStatus.FETCHING_RESULT in h
+    assert JobStatus.QA_CHECKING in h
+    assert JobStatus.COMPLETED in h
+    assert JobStatus.RETRYING not in h
+    # Validate ordering: VALIDATING < QUEUED < RUNNING < COMPLETED
+    i_val = h.index(JobStatus.VALIDATING)
+    i_qu = h.index(JobStatus.QUEUED)
+    i_run = h.index(JobStatus.RUNNING)
+    i_com = h.index(JobStatus.COMPLETED)
+    assert i_val < i_qu < i_run < i_com
+
+
+async def test_loop_retry_transitions_through_retrying(tmp_path: Path) -> None:
+    """When the first round fails QA but retry eventually falls back,
+    RETRYING must appear in the status history."""
+
+    executor = FakeExecutor()
+    loop = _StatusRecordingLoop(
+        project_root=tmp_path,
+        config=GenerationLoopConfig(
+            candidate_count=1,
+            max_retries=2,
+            threshold=0.99,  # unreachable -> triggers retry
+            panel_width=64,
+            panel_height=64,
+        ),
+    )
+    outcome = await loop.run(
+        panel=_panel(),
+        page_number=1,
+        prompt=_prompt(),
+        workflow_id="anime_t2i_default",
+        executor=executor,
+        project_id="proj_test_001",
+    )
+    assert outcome.job.status == JobStatus.COMPLETED
+    assert outcome.job.fallback_used is True
+    h = loop.status_history
+    assert JobStatus.RETRYING in h
+    # RETRYING should appear at least once (after the first failed round)
+    i_retry = h.index(JobStatus.RETRYING)
+    # There must be RUNNING before RETRYING
+    i_run_before = h.index(JobStatus.RUNNING)
+    assert i_run_before < i_retry
+
+
+async def test_loop_cancel_transitions_to_cancelled(tmp_path: Path) -> None:
+    """Cancellation must set job.status to CANCELLED and break the loop."""
+
+    executor = FakeExecutor()
+    loop = _StatusRecordingLoop(
+        project_root=tmp_path,
+        config=GenerationLoopConfig(
+            candidate_count=2,
+            max_retries=0,
+            threshold=0.0,
+            panel_width=32,
+            panel_height=32,
+        ),
+    )
+    cancel_calls = {"n": 0}
+
+    def _cancel() -> bool:
+        cancel_calls["n"] += 1
+        return cancel_calls["n"] >= 2
+
+    outcome = await loop.run(
+        panel=_panel(),
+        page_number=1,
+        prompt=_prompt(),
+        workflow_id="anime_t2i_default",
+        executor=executor,
+        project_id="proj_test_001",
+        cancel_check=_cancel,
+    )
+    assert outcome.job.status == JobStatus.CANCELLED
+    assert "cancelled" in outcome.job.error
+    # Status history must include the intermediate states before cancellation
+    h = loop.status_history
+    assert JobStatus.VALIDATING in h
+    assert JobStatus.QUEUED in h
+    assert JobStatus.RUNNING in h
+
+
+async def test_loop_executor_failure_transitions_to_failed(tmp_path: Path) -> None:
+    """When the executor raises, the job must reach FAILED status."""
+
+    executor = FakeExecutor(fail_on={"panel_001_c00"})
+    loop = _StatusRecordingLoop(
+        project_root=tmp_path,
+        config=GenerationLoopConfig(
+            candidate_count=1,
+            max_retries=0,
+            threshold=0.0,
+            panel_width=32,
+            panel_height=32,
+        ),
+    )
+    outcome = await loop.run(
+        panel=_panel(),
+        page_number=1,
+        prompt=_prompt(),
+        workflow_id="anime_t2i_default",
+        executor=executor,
+        project_id="proj_test_001",
+    )
+    assert outcome.job.status == JobStatus.FAILED
+    assert "fake executor failure" in outcome.job.error
+    # History shows the intermediate states before the exception
+    h = loop.status_history
+    assert JobStatus.VALIDATING in h
+    assert JobStatus.QUEUED in h
+    assert JobStatus.RUNNING in h
+    assert JobStatus.FETCHING_RESULT in h

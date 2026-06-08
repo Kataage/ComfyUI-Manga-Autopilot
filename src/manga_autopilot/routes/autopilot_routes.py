@@ -374,20 +374,141 @@ def _make_qa_panels(
     return _hook
 
 
+def _make_lettering(
+    _app: Application,
+    project_id: str,
+    storage_root: Path,
+) -> Callable[[AutopilotRun], dict[str, Any]]:
+    from manga_autopilot.models.bubble import SpeechBubble
+    from manga_autopilot.models.panel import PanelLayout
+    from manga_autopilot.services.bubble_layout import place_bubbles
+    from manga_autopilot.services.bubble_service import BubbleService
+
+    paths = ensure_project_paths(storage_root, project_id)
+    project_root = paths.root
+    service = BubbleService(project_root=project_root)
+
+    def _hook(run: AutopilotRun) -> dict[str, Any]:
+        records = _read_panel_records(project_root)
+        bubble_count = 0
+
+        for record in records:
+            dialogues = record.plan.dialogue if record.plan else []
+            bubbles: list[SpeechBubble] = []
+
+            if dialogues:
+                for idx, dlg in enumerate(dialogues):
+                    # Map Dialogue.type to BubbleType
+                    bubble_type_map = {
+                        "speech": "normal",
+                        "thought": "thought",
+                        "narration": "narration",
+                        "whisper": "whisper",
+                    }
+                    bubble_type = bubble_type_map.get(dlg.type, "normal")
+                    bubble = SpeechBubble(
+                        id=f"{record.panel_id}_b{idx:02d}",
+                        panel_id=record.panel_id,
+                        type=bubble_type,
+                        text=dlg.text,
+                        width=160.0,
+                        height=80.0,
+                        order=idx,
+                    )
+                    bubbles.append(bubble)
+            else:
+                # Fallback: at least one bubble so the page is never bare.
+                bubble = SpeechBubble(
+                    id=f"{record.panel_id}_b00",
+                    panel_id=record.panel_id,
+                    type="normal",
+                    text="行くぞ",
+                    width=160.0,
+                    height=80.0,
+                    order=0,
+                )
+                bubbles.append(bubble)
+
+            # Compute placements using the panel layout (if available).
+            panel_layout = record.layout
+            if panel_layout is None:
+                panel_layout = PanelLayout(
+                    panel_id=record.panel_id,
+                    x=0,
+                    y=0,
+                    width=512,
+                    height=512,
+                )
+            placements = place_bubbles(bubbles, panel_layout)
+            for placement in placements:
+                # Persist the placed position back onto the bubble.
+                b = placement.bubble
+                b.x = placement.x
+                b.y = placement.y
+                b.width = placement.width
+                b.height = placement.height
+                service.upsert(b)
+                bubble_count += 1
+
+        return {
+            "bubbles_path": str(service.bubbles_path),
+            "bubble_count": bubble_count,
+        }
+
+    return _hook
+
+
 def _make_render_page(
     _app: Application,
     project_id: str,
     storage_root: Path,
 ) -> Callable[[AutopilotRun], Any]:
     from manga_autopilot.models.panel import PanelLayout
+    from manga_autopilot.services.bubble_layout import place_bubbles
+    from manga_autopilot.services.bubble_renderer import draw_bubble_on_canvas
+    from manga_autopilot.services.bubble_service import BubbleService
     from manga_autopilot.services.export import export_page_png
 
     paths = ensure_project_paths(storage_root, project_id)
     project_root = paths.root
+    bubble_service = BubbleService(project_root=project_root)
 
-    def _hook(run: AutopilotRun) -> list[str]:
+    def _overlay_bubbles_on_page(
+        page_path: Path,
+        panel_entries: list[tuple[PanelLayout, str]],
+    ) -> int:
+        from PIL import Image
+
+        if not page_path.exists():
+            return 0
+
+        total_bubbles = 0
+        try:
+            with Image.open(page_path) as img:
+                canvas = img.convert("RGBA")
+                for layout, panel_id in panel_entries:
+                    bubbles = bubble_service.list_bubbles(panel_id=panel_id)
+                    if not bubbles:
+                        continue
+                    placements = place_bubbles(bubbles, layout)
+                    for placement in placements:
+                        draw_bubble_on_canvas(
+                            canvas,
+                            placement.bubble,
+                            placement.x,
+                            placement.y,
+                            placement.width,
+                            placement.height,
+                        )
+                        total_bubbles += 1
+                canvas.convert("RGB").save(page_path, format="PNG")
+        except Exception as exc:  # noqa: BLE001
+            log.warning("bubble overlay failed for %s: %s", page_path, exc)
+        return total_bubbles
+
+    def _hook(run: AutopilotRun) -> list[dict[str, Any]]:
         records = _read_panel_records(project_root)
-        pages: dict[int, list[PanelLayout]] = {}
+        pages: dict[int, list[tuple[PanelLayout, str]]] = {}
         for record in records:
             if record.image_path is None:
                 continue
@@ -400,13 +521,19 @@ def _make_render_page(
                 image_path=record.image_path,
             )
             layout.image_path = record.image_path
-            pages.setdefault(record.page_number, []).append(layout)
-        rendered: list[str] = []
-        for page_number, panels in sorted(pages.items()):
+            pages.setdefault(record.page_number, []).append((layout, record.panel_id))
+        rendered: list[dict[str, Any]] = []
+        for page_number, panel_entries in sorted(pages.items()):
             page_id = f"page_{page_number:04d}"
             try:
-                out_path = export_page_png(project_root, page_id, panels)
-                rendered.append(str(out_path))
+                panels_for_export = [entry[0] for entry in panel_entries]
+                out_path = export_page_png(project_root, page_id, panels_for_export)
+                bubble_count = _overlay_bubbles_on_page(out_path, panel_entries)
+                rendered.append({
+                    "page": page_number,
+                    "path": str(out_path),
+                    "bubble_count": bubble_count,
+                })
             except Exception as exc:  # noqa: BLE001
                 log.warning("render_page failed for page %s: %s", page_number, exc)
         return rendered
@@ -511,7 +638,7 @@ def _default_hooks_for_project(
         ),
         generate_panels=_make_generate_panels(app, project_id, storage_root),
         qa_panels=_make_qa_panels(app, project_id, storage_root),
-        lettering=lambda run: str(ensure_project_paths(storage_root, project_id).root / "bubbles.json"),
+        lettering=_make_lettering(app, project_id, storage_root),
         render_pages=_make_render_page(app, project_id, storage_root),
         export=_make_export(app, project_id, storage_root),
         finalize=_make_finalize(app, project_id, storage_root),

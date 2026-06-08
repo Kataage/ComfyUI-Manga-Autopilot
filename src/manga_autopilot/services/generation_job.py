@@ -135,6 +135,20 @@ class GenerationLoop:
         image.save(dest, format="PNG")
         return dest
 
+    def _set_status(self, job: GenerationJob, status: JobStatus) -> None:
+        """Transition ``job`` to ``status`` and bump ``updated_at``.
+
+        The job is not persisted to disk here; :meth:`run` writes the
+        final state via :func:`write_job` once the loop exits.  This
+        keeps status transitions cheap and avoids partial writes when
+        the loop aborts partway through.
+        """
+
+        if job.status == status:
+            return
+        job.status = status
+        job.touch()
+
     # ------------------------------------------------------------------ build
     def _build_candidates(
         self,
@@ -205,7 +219,9 @@ class GenerationLoop:
             },
             max_retries=self.config.max_retries,
         )
-        job.status = JobStatus.RUNNING
+        # PENDING is the implicit default; advance to VALIDATING while we
+        # build the candidate list so callers can observe a real transition.
+        self._set_status(job, JobStatus.VALIDATING)
         job.started_at = _utc_now_iso()
 
         try:
@@ -219,22 +235,26 @@ class GenerationLoop:
                 job = self._apply_fallback(panel, job, prompt)
                 candidates = []
 
+            self._set_status(job, JobStatus.QUEUED)
             current_prompt = prompt
 
             for attempt in range(self.config.max_retries + 1):
                 if cancel_check is not None and cancel_check():
                     job.status = JobStatus.CANCELLED
                     job.error = "cancelled"
+                    job.touch()
                     break
 
                 if not candidates:
                     # No candidates to render -> nothing more we can do here.
                     break
 
+                self._set_status(job, JobStatus.RUNNING)
                 job.retry_count = attempt
                 round_records: list[CandidateImageMeta] = []
                 round_results: list[QualityResult] = []
                 for cand in candidates:
+                    self._set_status(job, JobStatus.FETCHING_RESULT)
                     result = await executor.submit(
                         prompt=current_prompt,
                         workflow_id=workflow_id,
@@ -244,8 +264,10 @@ class GenerationLoop:
                     if cancel_check is not None and cancel_check():
                         job.status = JobStatus.CANCELLED
                         job.error = "cancelled"
+                        job.touch()
                         break
                     image_path = self._save_image(result.image, cand.candidate_id)
+                    self._set_status(job, JobStatus.QA_CHECKING)
                     scored = self._score(panel, cand, current_prompt, self.config.threshold)
                     meta = CandidateImageMeta(
                         candidate_id=cand.candidate_id,
@@ -275,7 +297,7 @@ class GenerationLoop:
                 job.select_candidate(best.candidate_id)
 
                 if best.passed:
-                    job.status = JobStatus.COMPLETED
+                    self._set_status(job, JobStatus.COMPLETED)
                     break
 
                 # Decide whether to retry or fall back.  Pass the failing
@@ -298,14 +320,22 @@ class GenerationLoop:
                 # CHANGE_SEED / CHANGE_WORKFLOW / RETRY_SAME: re-render with the
                 # existing prompt but a new base seed; the candidate generator
                 # already varies seeds so we simply loop again.
+                self._set_status(job, JobStatus.RETRYING)
 
-            if job.status == JobStatus.RUNNING:
-                # Retries exhausted without passing the threshold -> fallback.
+            # Any non-terminal status means we exited the loop without
+            # completing the panel (e.g. zero candidates produced) -- fall
+            # back to the safe image so the pipeline never crashes.
+            if job.status not in (
+                JobStatus.COMPLETED,
+                JobStatus.FAILED,
+                JobStatus.CANCELLED,
+            ):
                 job = self._apply_fallback(panel, job, prompt)
 
         except Exception as exc:  # noqa: BLE001
             job.status = JobStatus.FAILED
             job.error = f"{type(exc).__name__}: {exc}"
+            job.touch()
             log.exception("generation loop failed for %s", job.panel_id)
 
         job.completed_at = _utc_now_iso()
