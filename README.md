@@ -301,6 +301,22 @@ See [`docs/quickstart.md`](docs/quickstart.md).
 - [`examples/workflows/README.md`](examples/workflows/README.md) —
   step-by-step guide to adapt and register your own workflow
 
+## Remote Executor Foundation
+
+The remote executor path allows panel generation to be delegated to an
+external HTTP GPU worker (e.g. Modal, RunPod, or a remote ComfyUI
+server).  In this release:
+
+- `RemoteHTTPExecutor` implements the `GenerationExecutor` protocol
+- A `FakeRemoteWorker` in-process server is used for CI testing
+- The real Modal / RunPod / external GPU integration is **not yet
+  implemented**
+- No external network service is required in standard CI
+
+Set the executor via `manga_panel_executor` or
+`manga_panel_executor_factory` on the aiohttp app.  See
+`tests/backend/test_remote_executor_e2e.py` for a complete example.
+
 ## Documentation
 
 - [`CHANGELOG.md`](CHANGELOG.md) — release history

@@ -73,7 +73,9 @@ def _executor(app: Application, project_id: str) -> Any:
 
     1. ``app["manga_panel_executor_factory"](project_id)`` (used by tests).
     2. ``app["manga_panel_executor"]`` (a single shared executor).
-    3. ``app["manga_comfy_client"]`` + ``app["manga_workflow_registry"]`` -
+    3. ``app["manga_remote_executor"]`` - a :class:`RemoteHTTPExecutor`
+       configured via ``app["manga_remote_executor_settings"]``.
+    4. ``app["manga_comfy_client"]`` + ``app["manga_workflow_registry"]`` -
        build a real :class:`ComfyExecutor` on the fly.
     """
 
@@ -83,11 +85,16 @@ def _executor(app: Application, project_id: str) -> Any:
     shared = app.get("manga_panel_executor")
     if shared is not None:
         return shared
+    remote = app.get("manga_remote_executor")
+    if remote is not None:
+        return remote
     client = app.get("manga_comfy_client")
     registry = app.get("manga_workflow_registry")
     if client is None or registry is None:
         raise web.HTTPServiceUnavailable(
-            text="no panel executor configured (set manga_panel_executor_factory or manga_comfy_client)"
+            text="no panel executor configured "
+            "(set manga_panel_executor_factory, manga_panel_executor, "
+            "manga_remote_executor, or manga_comfy_client)"
         )
     from manga_autopilot.services.generation_job import ComfyExecutor
 
