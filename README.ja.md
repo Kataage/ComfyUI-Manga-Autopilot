@@ -304,8 +304,11 @@ pytest -m release_gate -q
 現時点では:
 
 - `RemoteHTTPExecutor` が `GenerationExecutor` プロトコルを実装
+- **同期**（単一 POST）と**非同期**（POST → job_id → GET poll）の
+  両方のモードに対応
 - 型付き例外: `RemoteExecutorHTTPError`、`RemoteExecutorTimeoutError`、
-  `RemoteExecutorResponseError`、`RemoteExecutorImageError`
+  `RemoteExecutorResponseError`、`RemoteExecutorImageError`、
+  `RemoteExecutorPollingTimeoutError`、`RemoteExecutorJobError`
 - リモートワーカー失敗時に Autopilot が `FAILED` 状態になり、
   `generation_log.json` に失敗理由が記録される
 - CI テスト用の `FakeRemoteWorker` インプロセスサーバーを同梱

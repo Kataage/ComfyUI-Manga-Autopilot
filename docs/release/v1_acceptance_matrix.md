@@ -125,6 +125,19 @@ The following items are **out of scope** for v1.0 and remain in the Planned sect
 | API key Authorization header | Done | `test_remote_executor_sends_authorization_header` | Yes | `Bearer {api_key}` |
 | Autopilot FAILED on remote error | Done | `test_autopilot_records_failure_when_remote_executor_fails` | Yes | generation_log.json has FAILED state |
 
+### Remote Executor Async Polling
+
+| Area | Status | Test | CI | Notes |
+|------|--------|------|----|-------|
+| POST returns queued with job_id | Done | `test_remote_executor_polls_until_async_job_completed` | Yes | FakeRemoteWorker async_success mode |
+| GET /v1/jobs/{job_id} polling until completed | Done | `test_remote_executor_polls_until_async_job_completed` | Yes | Running → completed transition |
+| Job error → RemoteExecutorJobError | Done | `test_remote_executor_raises_when_async_job_errors` | Yes | Error status from poll response |
+| Polling timeout → RemoteExecutorPollingTimeoutError | Done | `test_remote_executor_raises_when_async_job_polling_times_out` | Yes | Always-running job |
+| max_poll_attempts limit | Done | `test_remote_executor_max_poll_attempts` | Yes | Limits number of GET requests |
+| Sync completed path still works | Done | `test_sync_completed_still_works` | Yes | No regression |
+| Autopilot E2E via async polling | Done | `test_autopilot_can_generate_panels_with_async_remote_executor` | Yes | 1-page / 1-panel; full pipeline |
+| Autopilot FAILED on async job error | Done | `test_autopilot_records_failure_when_async_remote_job_errors` | Yes | generation_log.json has FAILED state |
+
 ## How to Use
 
 ### Before every release
