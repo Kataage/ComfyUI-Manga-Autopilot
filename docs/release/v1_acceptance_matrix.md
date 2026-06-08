@@ -91,6 +91,15 @@ The following items are **out of scope** for v1.0 and remain in the Planned sect
 | Complex panel layout AI | Beyond grid/fallback layouts |
 | Real ComfyUI as required CI | Opt-in only, no GPU in standard CI |
 
+### Examples / Starter Kit
+
+| Area | Status | Test | CI | Notes |
+|------|--------|------|----|-------|
+| Example workflow registry payload valid | Done | `test_example_registry_payload_matches_workflow_definition` | Yes | `examples/workflows/anime_t2i_default.registry.json` |
+| Example workflow binds all required keys | Done | `test_example_registry_has_required_bindings` | Yes | `positive_prompt`, `negative_prompt`, `seed`, `width`, `height`, `filename_prefix` |
+| Example workflow registers in WorkflowRegistry | Done | `test_example_registry_can_be_registered` | Yes | `WorkflowRegistry.open()` round-trip |
+| Example workflow runs with FakeComfyClient | Done | `test_example_registry_comfy_executor_e2e` | Yes | `ComfyExecutor.submit()` → overrides applied → image returned |
+
 ## How to Use
 
 ### Before every release

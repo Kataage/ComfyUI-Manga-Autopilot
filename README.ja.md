@@ -286,6 +286,17 @@ pytest -m release_gate -q
 - `character_sheet_api.json`
 - `upscale_api.json`
 
+## サンプル / スターターキット
+
+`examples/` にすぐに使えるワークフロー例を同梱しています:
+
+- [`examples/workflows/anime_t2i_default.registry.json`](examples/workflows/anime_t2i_default.registry.json) —
+  WorkflowRegistry ペイロード（`/workflows` にコピーするか API 経由で登録）
+- [`examples/workflows/anime_t2i_default.workflow.json`](examples/workflows/anime_t2i_default.workflow.json) —
+  ComfyUI API 形式ワークフローグラフ
+- [`examples/workflows/README.md`](examples/workflows/README.md) —
+  ステップバイステップの適用手順
+
 ## ドキュメント
 
 - [`CHANGELOG.md`](CHANGELOG.md) — リリース履歴

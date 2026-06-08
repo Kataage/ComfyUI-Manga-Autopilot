@@ -290,6 +290,17 @@ See [`docs/quickstart.md`](docs/quickstart.md).
 - `character_sheet_api.json`
 - `upscale_api.json`
 
+## Examples / Starter Kit
+
+`examples/` contains ready-to-use workflow examples for new users:
+
+- [`examples/workflows/anime_t2i_default.registry.json`](examples/workflows/anime_t2i_default.registry.json) —
+  WorkflowRegistry payload (copy-paste into `/workflows` or use the API)
+- [`examples/workflows/anime_t2i_default.workflow.json`](examples/workflows/anime_t2i_default.workflow.json) —
+  ComfyUI API-format workflow graph
+- [`examples/workflows/README.md`](examples/workflows/README.md) —
+  step-by-step guide to adapt and register your own workflow
+
 ## Documentation
 
 - [`CHANGELOG.md`](CHANGELOG.md) — release history
