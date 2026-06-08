@@ -247,6 +247,7 @@ async def _wait_for_completion(cli, project_id: str, timeout: float = 180.0) -> 
 # ---------------------------------------------------------------------------
 
 @NeedsRealComfy
+@pytest.mark.real_comfy
 async def test_real_comfyui_executor_smoke_e2e(real_comfy_e2e) -> None:
     """1-page / 1-panel smoke test against a live ComfyUI server."""
     cli, tmp_path, llm, real_client, registry = real_comfy_e2e

@@ -244,6 +244,7 @@ async def _wait_for_completion(cli, project_id: str, timeout: float = 5.0) -> di
 
 
 # --------------------------------------------------------- the test
+@pytest.mark.release_gate
 async def test_one_page_autopilot_completes_end_to_end(e2e_client) -> None:
     cli, tmp_path, llm, executor = e2e_client
 
@@ -748,6 +749,7 @@ async def test_three_panel_per_page_autopilot_completes_end_to_end(e2e_client) -
 
 
 # --------------------------------------------------------- 4-page × 2-panel test
+@pytest.mark.release_gate
 async def test_four_page_two_panel_autopilot_completes_end_to_end(e2e_client) -> None:
     """4-page × 2-panel autopilot: 8 panels total, 4 page PNGs, 8 bubbles."""
     cli, tmp_path, llm, executor = e2e_client

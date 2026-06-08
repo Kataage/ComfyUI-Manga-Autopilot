@@ -46,6 +46,10 @@ where = ["src"]
 testpaths = ["tests/backend"]
 asyncio_mode = "auto"
 addopts = "-ra"
+markers = [
+    "release_gate: v1.0 release gate smoke tests",
+    "real_comfy: opt-in tests requiring a live ComfyUI server",
+]
 
 [tool.ruff]
 line-length = 100

@@ -189,6 +189,35 @@ pytest tests/backend/test_real_comfy_executor_e2e.py -q
 - GPU 搭載 PC / リモート環境: `COMFY_BASE_URL` を ComfyUI インスタンスに
   向けて opt-in テストを実行。
 
+### v1.0 リリースゲート
+
+リリース前に必ず以下の品質ゲートを実行してください:
+
+```bash
+# リント
+ruff check .
+
+# フル バックエンドテストスイート
+pytest tests/backend/ -q
+
+# リリースゲート サブセット（主要 E2E のみ）
+pytest -m release_gate -q
+```
+
+`release_gate` マーカーは以下の主要 E2E パスを対象とします:
+
+| テスト | 検証内容 |
+|--------|----------|
+| `test_one_page_autopilot_completes_end_to_end` | 1ページ × 1コマ生成 |
+| `test_four_page_two_panel_autopilot_completes_end_to_end` | 4ページ × 2コマ + Webtoon/PDF |
+| `test_one_page_autopilot_uses_comfy_executor_path` | ComfyExecutor + FakeComfyClient |
+| `test_generated_project_can_be_reopened_edited_and_reexported` | プロジェクト再編集ラウンドトリップ |
+| `test_failed_autopilot_can_resume_missing_panels_only` | 失敗 → 再開 → 完了 |
+| `test_generated_project_bundle_can_be_imported_edited_and_reexported` | ZIP バンドル import ラウンドトリップ |
+
+詳細は [`docs/release/v1_acceptance_matrix.md`](docs/release/v1_acceptance_matrix.md)
+を参照してください。
+
 ## 特徴
 
 - **プロジェクト + ストーリー構成** (LLM 駆動、JSON 修復機能付き)

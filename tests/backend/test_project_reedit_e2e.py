@@ -246,6 +246,7 @@ def _assign_fallback_layouts(records: Sequence[Any], page_number: int) -> list[P
 
 
 # --------------------------------------------------------- test
+@pytest.mark.release_gate
 async def test_generated_project_can_be_reopened_edited_and_reexported(aiohttp_client, tmp_path: Path) -> None:
     """4p×2c → reopen → edit bubble → re-render pages → re-export webtoon/PDF → verify manifest."""
 

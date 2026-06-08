@@ -219,6 +219,7 @@ async def _wait_for_terminal(cli, project_id: str, timeout: float = 5.0) -> dict
 
 
 # --------------------------------------------------------- test
+@pytest.mark.release_gate
 async def test_failed_autopilot_can_resume_missing_panels_only(aiohttp_client, tmp_path: Path) -> None:
     """4p×2c → fail on panel 4 → resume → skip generated panels → complete."""
 
