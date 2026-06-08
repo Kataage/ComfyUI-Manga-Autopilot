@@ -111,12 +111,27 @@ ComfyUI のカスタムノード拡張で、1 つのアイデアから短い漫�
   `ManifestExports` には `webtoon`（PNG パスのリスト）と `pdf`
   （`manga.pdf` のパス）が含まれる。 E2E テストでディスク上の
   ファイルと manifest への反映を検証。
+- **プロジェクト再編集 E2E** — 生成済みプロジェクトを新しい app
+  インスタンスから再読み込みし、`PATCH /bubbles/{id}` で吹き出し
+  テキストを編集、ページ PNG / Webtoon / PDF を再レンダリング・
+  再出力できることを E2E 検証（`test_project_reedit_e2e.py`）。
+  HTTP API による台詞編集・Web UI 編集は未接続。
 
 ### Planned (未接続 / スタブ)
 
+- **Web UI 編集。** プロジェクト・パネル・吹き出し・台詞のブラウザ
+  上でのフル編集。現在は `PATCH /bubbles/{id}` HTTP API で吹き出し
+  テキストの編集が可能だが、ビジュアルエディタは未実装。
+- **履歴付き編集 UI。** Undo/Redo とパネル単位のリビジョン管理。
+- **差分プレビュー。** 編集後の再レンダリングで Before/After を並べて
+  比較。
+- **複雑なコマ割り AI。** 現在のグリッド/fallback レイアウトを超える
+  AI ベースのコマ構成。
 - **外部 GPU worker (Modal 風) のエンドツーエンド接続。** `GPUBridge` は
   ワークフローのシリアライズとローカル ComfyUI フォールバックを実装済み
   だが、デフォルト Orchestrator からはまだ使われていない。
+- **通常 CI での実 ComfyUI 必須化。** 標準 CI でライブ ComfyUI
+  サーバーを必須に（現在は opt-in のみ）。
 - **実画像 QA スコアリング。** 現在はヒューリスティック (プロンプト整合性、
   吹き出しスペース、パレット) を使っている。 CLIP / IP-Adapter / 顔
   類似度スコアリングはロードマップ上の作業。`GenerationLoop` は既に
