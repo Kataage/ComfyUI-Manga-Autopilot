@@ -122,6 +122,14 @@ ComfyUI のカスタムノード拡張で、1 つのアイデアから短い漫�
   冪等な `generate_panels` hook は既生成パネルをスキップし未生成分のみ
   生成する。`test_autopilot_resume_e2e.py` で fail → resume → complete
   のラウンドトリップとアーティファクト検証を E2E 検証。
+- **プロジェクトバンドル import E2E** — 生成済みプロジェクトを
+  `ExportService.zip()` で ZIP エクスポートし、別の `storage_root` に
+  `ExportService.import_zip()` でインポートしても、再読み込み・
+  編集・再出力できることを E2E 検証（`test_project_bundle_import_e2e.py`）。
+  generate → ZIP export → 別 storage への import → 新 app での
+  取得 → bubble テキスト編集 → テキスト変更後の再レンダリング
+  （ハッシュ変化検証） → Webtoon/PDF 再出力 → manifest 再構築 →
+  全アーティファクト整合性確認。
 
 ### Planned (未接続 / スタブ)
 
@@ -133,6 +141,8 @@ ComfyUI のカスタムノード拡張で、1 つのアイデアから短い漫�
   比較。
 - **複雑なコマ割り AI。** 現在のグリッド/fallback レイアウトを超える
   AI ベースのコマ構成。
+- **ZIP import 競合解決 UI。** 既存プロジェクトと重複するバンドルを
+  インポート時のマージ・上書き・スキップ UI。
 - **外部 GPU worker (Modal 風) のエンドツーエンド接続。** `GPUBridge` は
   ワークフローのシリアライズとローカル ComfyUI フォールバックを実装済み
   だが、デフォルト Orchestrator からはまだ使われていない。
