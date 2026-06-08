@@ -115,6 +115,14 @@ later issue, not yet wired up).
   generate → reopen → edit → re-render → re-export → manifest update.
   HTTP API-based dialogue editing and Web UI editing are planned but not
   yet wired up.
+- **Autopilot failure-resume E2E** — when panel generation fails mid-run
+  (e.g. executor error), the pipeline transitions to
+  `FAILED_PANEL_GENERATION` and writes `generation_log.json`.  On resume
+  (`POST .../autopilot/start` on the failed project), the idempotent
+  `generate_panels` hook skips already-generated panels and generates
+  only the missing ones.  The `test_autopilot_resume_e2e.py` test
+  verifies the full fail → resume → complete round-trip with artefact
+  checks.
 
 ### Planned (spec-described, not yet wired up)
 

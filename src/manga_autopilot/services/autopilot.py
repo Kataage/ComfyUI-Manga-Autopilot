@@ -757,62 +757,68 @@ class Orchestrator:
         log.info("autopilot pipeline start project=%s", run.project_id)
         run.log_event("pipeline_started")
 
-        await self._step(run, AutopilotState.INPUT_VALIDATED, "validate_input")
-        if _is_cancelled(run):
+        try:
+            await self._step(run, AutopilotState.INPUT_VALIDATED, "validate_input")
+            if _is_cancelled(run):
+                return self._finalize(run)
+
+            await self._step(run, AutopilotState.STORY_PLANNED, "plan_story")
+            if _is_cancelled(run):
+                return self._finalize(run)
+
+            await self._step(run, AutopilotState.CHARACTERS_DEFINED, "define_characters")
+            if _is_cancelled(run):
+                return self._finalize(run)
+
+            await self._step(run, AutopilotState.CHARACTER_SHEETS_GENERATED, "generate_character_sheets")
+            if _is_cancelled(run):
+                return self._finalize(run)
+
+            await self._step(run, AutopilotState.PAGES_PLANNED, "plan_pages")
+            if _is_cancelled(run):
+                return self._finalize(run)
+
+            await self._step(run, AutopilotState.PANELS_PLANNED, "plan_panels")
+            if _is_cancelled(run):
+                return self._finalize(run)
+
+            await self._step(run, AutopilotState.PROMPTS_GENERATED, "build_prompts")
+            if _is_cancelled(run):
+                return self._finalize(run)
+
+            await self._step(run, AutopilotState.WORKFLOWS_BUILT, "validate_workflow")
+            if _is_cancelled(run):
+                return self._finalize(run)
+
+            await self._step(run, AutopilotState.PANELS_GENERATING, "generate_panels")
+            if _is_cancelled(run):
+                return self._finalize(run)
+
+            await self._step(run, AutopilotState.PANELS_QA_CHECKING, "qa_panels")
+            if _is_cancelled(run):
+                return self._finalize(run)
+
+            await self._step(run, AutopilotState.LETTERING, "lettering")
+            if _is_cancelled(run):
+                return self._finalize(run)
+
+            await self._step(run, AutopilotState.PAGE_RENDERING, "render_pages")
+            if _is_cancelled(run):
+                return self._finalize(run)
+
+            await self._step(run, AutopilotState.EXPORTING, "export")
+            if _is_cancelled(run):
+                return self._finalize(run)
+
+            if not run.machine.state.value.startswith("FAILED"):
+                await self._step(run, AutopilotState.COMPLETED, "finalize")
+
             return self._finalize(run)
-
-        await self._step(run, AutopilotState.STORY_PLANNED, "plan_story")
-        if _is_cancelled(run):
+        except Exception as exc:  # noqa: BLE001
+            log.exception("autopilot pipeline failed: %s", exc)
+            if not run.machine.state.value.startswith("FAILED"):
+                run.machine.fail(AutopilotState.FAILED_PANEL_GENERATION, reason=str(exc))
             return self._finalize(run)
-
-        await self._step(run, AutopilotState.CHARACTERS_DEFINED, "define_characters")
-        if _is_cancelled(run):
-            return self._finalize(run)
-
-        await self._step(run, AutopilotState.CHARACTER_SHEETS_GENERATED, "generate_character_sheets")
-        if _is_cancelled(run):
-            return self._finalize(run)
-
-        await self._step(run, AutopilotState.PAGES_PLANNED, "plan_pages")
-        if _is_cancelled(run):
-            return self._finalize(run)
-
-        await self._step(run, AutopilotState.PANELS_PLANNED, "plan_panels")
-        if _is_cancelled(run):
-            return self._finalize(run)
-
-        await self._step(run, AutopilotState.PROMPTS_GENERATED, "build_prompts")
-        if _is_cancelled(run):
-            return self._finalize(run)
-
-        await self._step(run, AutopilotState.WORKFLOWS_BUILT, "validate_workflow")
-        if _is_cancelled(run):
-            return self._finalize(run)
-
-        await self._step(run, AutopilotState.PANELS_GENERATING, "generate_panels")
-        if _is_cancelled(run):
-            return self._finalize(run)
-
-        await self._step(run, AutopilotState.PANELS_QA_CHECKING, "qa_panels")
-        if _is_cancelled(run):
-            return self._finalize(run)
-
-        await self._step(run, AutopilotState.LETTERING, "lettering")
-        if _is_cancelled(run):
-            return self._finalize(run)
-
-        await self._step(run, AutopilotState.PAGE_RENDERING, "render_pages")
-        if _is_cancelled(run):
-            return self._finalize(run)
-
-        await self._step(run, AutopilotState.EXPORTING, "export")
-        if _is_cancelled(run):
-            return self._finalize(run)
-
-        if not run.machine.state.value.startswith("FAILED"):
-            await self._step(run, AutopilotState.COMPLETED, "finalize")
-
-        return self._finalize(run)
 
     def _finalize(self, run: AutopilotRun) -> AutopilotRun:
         if self.project_root is not None:

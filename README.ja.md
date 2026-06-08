@@ -116,6 +116,12 @@ ComfyUI のカスタムノード拡張で、1 つのアイデアから短い漫�
   テキストを編集、ページ PNG / Webtoon / PDF を再レンダリング・
   再出力できることを E2E 検証（`test_project_reedit_e2e.py`）。
   HTTP API による台詞編集・Web UI 編集は未接続。
+- **Autopilot 失敗→再開 E2E** — パネル生成中にエクゼキュータ障害が
+  発生した場合、パイプラインは `FAILED_PANEL_GENERATION` に遷移し
+  `generation_log.json` を書き出す。再開時（`POST .../autopilot/start`）、
+  冪等な `generate_panels` hook は既生成パネルをスキップし未生成分のみ
+  生成する。`test_autopilot_resume_e2e.py` で fail → resume → complete
+  のラウンドトリップとアーティファクト検証を E2E 検証。
 
 ### Planned (未接続 / スタブ)
 
