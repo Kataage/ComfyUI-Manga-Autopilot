@@ -605,6 +605,7 @@ def _make_render_page(
                 rendered.append({
                     "page": page_number,
                     "path": str(out_path),
+                    "panel_count": len(panel_entries),
                     "bubble_count": bubble_count,
                 })
             except Exception as exc:  # noqa: BLE001
