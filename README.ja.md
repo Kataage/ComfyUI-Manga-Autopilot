@@ -297,6 +297,21 @@ pytest -m release_gate -q
 - [`examples/workflows/README.md`](examples/workflows/README.md) —
   ステップバイステップの適用手順
 
+## リモートエグゼキュータ基盤
+
+リモートエグゼキュータパスにより、パネル生成を外部の HTTP GPU ワーカー
+（Modal、RunPod、リモート ComfyUI サーバーなど）に委任できます。
+現時点では:
+
+- `RemoteHTTPExecutor` が `GenerationExecutor` プロトコルを実装
+- CI テスト用の `FakeRemoteWorker` インプロセスサーバーを同梱
+- Modal / RunPod / 外部 GPU との本番連携は**まだ未実装**
+- 標準 CI で外部ネットワークサービスは不要
+
+エグゼキュータの切り替えは aiohttp app 上の `manga_panel_executor` または
+`manga_panel_executor_factory` で設定します。
+詳細は `tests/backend/test_remote_executor_e2e.py` を参照してください。
+
 ## ドキュメント
 
 - [`CHANGELOG.md`](CHANGELOG.md) — リリース履歴

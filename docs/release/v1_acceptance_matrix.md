@@ -100,6 +100,17 @@ The following items are **out of scope** for v1.0 and remain in the Planned sect
 | Example workflow registers in WorkflowRegistry | Done | `test_example_registry_can_be_registered` | Yes | `WorkflowRegistry.open()` round-trip |
 | Example workflow runs with FakeComfyClient | Done | `test_example_registry_comfy_executor_e2e` | Yes | `ComfyExecutor.submit()` → overrides applied → image returned |
 
+### Remote Executor Foundation
+
+| Area | Status | Test | CI | Notes |
+|------|--------|------|----|-------|
+| RemoteHTTPExecutor implements GenerationExecutor | Done | `test_autopilot_can_generate_panels_with_fake_remote_executor` | Yes | HTTP POST → base64 PNG → PIL Image |
+| FakeRemoteWorker serves /v1/generate-panel | Done | `test_autopilot_can_generate_panels_with_fake_remote_executor` | Yes | In-process aiohttp server; deterministic PNG |
+| Autopilot E2E completes via remote path | Done | `test_autopilot_can_generate_panels_with_fake_remote_executor` | Yes | 1-page / 1-panel; panels.json + jobs + generation_log.json + manifest |
+| Request payload includes prompt/seed/width/height | Done | `test_autopilot_can_generate_panels_with_fake_remote_executor` | Yes | Verified in worker.requests[0] |
+| Existing ComfyExecutor tests remain green | Done | `test_one_page_autopilot_uses_comfy_executor_path` | Yes | No regression |
+| No external network service required | Done | — | Yes | FakeRemoteWorker is in-process |
+
 ## How to Use
 
 ### Before every release
