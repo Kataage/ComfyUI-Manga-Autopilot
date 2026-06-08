@@ -172,7 +172,10 @@ async def remote_e2e_client(aiohttp_client, tmp_path: Path):
     app = web.Application()
     app["manga_llm_provider"] = llm
     app["manga_default_workflow_id"] = "anime_t2i_default"
-    app["manga_panel_executor_factory"] = lambda project_id: executor
+    app["manga_panel_executor_factory"] = lambda project_id: RemoteHTTPExecutor(
+        settings=settings,
+        project_id=project_id,
+    )
 
     register_all(app, storage_root=str(tmp_path))
     cli = await aiohttp_client(app)
@@ -246,16 +249,18 @@ async def test_autopilot_can_generate_panels_with_fake_remote_executor(
     req = worker.requests[0]
 
     # 5. Request payload contains expected fields.
-    assert "project_id" in req
-    assert "panel_id" in req
-    assert "prompt" in req
-    assert "seed" in req
-    assert "width" in req
-    assert "height" in req
+    assert req["project_id"] == project_id, (
+        f"expected project_id={project_id!r}, got {req['project_id']!r}"
+    )
+    assert req["panel_id"]
+    assert isinstance(req["panel_id"], str) and len(req["panel_id"]) > 0
+    assert req["prompt"]
     assert isinstance(req["prompt"], str) and len(req["prompt"]) > 0
+    assert req["seed"] is not None
     assert isinstance(req["seed"], int)
-    assert isinstance(req["width"], int)
-    assert isinstance(req["height"], int)
+    assert req["width"] > 0
+    assert req["height"] > 0
+    assert req["workflow_id"] == "anime_t2i_default"
 
     # 6. Panel image was saved under assets/panels.
     panels_path = project_root / "panels.json"

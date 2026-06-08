@@ -114,9 +114,11 @@ class RemoteHTTPExecutor(GenerationExecutor):
         self,
         *,
         settings: RemoteWorkerSettings | None = None,
+        project_id: str = "",
         session_factory: Any = None,
     ) -> None:
         self.settings = settings or RemoteWorkerSettings()
+        self.project_id = project_id
         self._session_factory = session_factory
 
     def _open(self) -> aiohttp.ClientSession:
@@ -133,7 +135,7 @@ class RemoteHTTPExecutor(GenerationExecutor):
         candidate_id: str,
     ) -> GenerationExecutorResult:
         request = RemoteGenerateRequest(
-            project_id="",
+            project_id=self.project_id,
             page_id="",
             panel_id=candidate_id,
             prompt=prompt.positive,
