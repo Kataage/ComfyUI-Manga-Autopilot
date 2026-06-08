@@ -123,6 +123,14 @@ later issue, not yet wired up).
   only the missing ones.  The `test_autopilot_resume_e2e.py` test
   verifies the full fail → resume → complete round-trip with artefact
   checks.
+- **Project bundle import E2E** — a generated project can be exported as
+  a ZIP via `ExportService.zip()`, imported to a different `storage_root`
+  via `ExportService.import_zip()`, and fully re-used from the new
+  location.  The `test_project_bundle_import_e2e.py` test verifies:
+  generate → ZIP export → import to different storage → new app instance
+  fetches project → edit bubble text → re-render pages with updated text
+  (hash change verified) → re-export webtoon/PDF → rebuild manifest →
+  all artefacts intact with correct stats.
 
 ### Planned (spec-described, not yet wired up)
 
@@ -135,6 +143,9 @@ later issue, not yet wired up).
   re-rendering after edits.
 - **Complex panel layout AI.**  AI-driven panel composition that
   goes beyond the current grid/fallback layouts.
+- **ZIP import conflict resolution UI.**  When importing a bundle that
+  overlaps with an existing project, provide a UI to merge, overwrite,
+  or skip conflicting files.
 - **External GPU worker (Modal-style) end-to-end.**  `GPUBridge` knows
   how to serialise a workflow and fall back to local ComfyUI on
   timeout, but it is not yet used by the default orchestrator.
