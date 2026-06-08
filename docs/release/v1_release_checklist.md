@@ -21,10 +21,39 @@ Use this checklist before creating a GitHub Release.
 - [ ] Manual generated project re-edit smoke test
 - [ ] `pip install -e .` succeeds from clean venv
 
-## GitHub Release
+## Tag and release creation
 
-- [ ] Create git tag (e.g. `v0.1.0-rc1`)
-- [ ] Push tag: `git push origin v0.1.0-rc1`
-- [ ] Create GitHub Release with release notes
+### 1. Final verification on main
+
+```bash
+git checkout main
+git pull
+ruff check .
+pytest tests/backend/ -q
+pytest -m release_gate -q
+```
+
+### 2. Create and push tag
+
+```bash
+git tag v0.1.0-rc1
+git push origin v0.1.0-rc1
+```
+
+### 3. Create GitHub Release (draft)
+
+```bash
+gh release create v0.1.0-rc1 \
+  --title "v0.1.0-rc1 — Autopilot pipeline release candidate" \
+  --notes-file docs/release/github_release_v0_1_0_rc1.md \
+  --draft \
+  --prerelease
+```
+
+### 4. Verify
+
+- [ ] Tag appears on the correct commit on `main`
+- [ ] CI passes on the tagged commit
+- [ ] GitHub Release draft is created with correct body
+- [ ] Release is marked as pre-release
 - [ ] Attach sample workflow files if relevant
-- [ ] Verify CI passes on the tagged commit
