@@ -113,6 +113,14 @@ class FakeLLMProvider(LLMProvider):
                             "characters": ["char_hero"],
                             "background": "open field",
                             "visualPriority": "character",
+                            "dialogue": [
+                                {
+                                    "speaker": "Hero",
+                                    "text": "行くぞ",
+                                    "type": "speech",
+                                    "characterId": "char_hero",
+                                }
+                            ],
                         }
                     ]
                 }
@@ -271,3 +279,19 @@ async def test_one_page_autopilot_completes_end_to_end(e2e_client) -> None:
     # 9. The project document was left in a "generated" state when fetched.
     get_resp = await cli.get(f"/manga_autopilot/api/projects/{project_id}")
     assert get_resp.status == 200
+
+    # 10. Bubbles were generated and persisted to bubbles.json.
+    bubbles_path = project_root / "bubbles.json"
+    assert bubbles_path.exists()
+    bubbles = json.loads(bubbles_path.read_text(encoding="utf-8"))
+    assert len(bubbles) >= 1
+    first_bubble = bubbles[0]
+    assert first_bubble["text"]  # text must not be empty
+    assert first_bubble["panel_id"]  # panel_id must be set
+    assert first_bubble["type"] in ("normal", "shout", "thought", "narration", "whisper", "radio")
+
+    # 11. The rendered page PNG has bubble overlay (size increased vs bare page).
+    rendered_path = exports_dir / "page_0001.png"
+    assert rendered_path.exists()
+    page_size = rendered_path.stat().st_size
+    assert page_size > 0

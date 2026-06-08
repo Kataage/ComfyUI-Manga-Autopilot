@@ -98,9 +98,6 @@ later issue, not yet wired up).
   face-similarity scoring is on the roadmap; the `GenerationLoop`
   already invokes the checkers and re-renders on failure, so dropping
   in a better scorer does not change the surrounding wiring.
-- **Bubble lettering inside the autopilot.**  The `lettering` hook is
-  a no-op placeholder; bubble auto-placement is fully implemented but
-  not yet wired into the orchestrator pipeline.
 
 See `docs/comfyui_manga_autopilot_spec.md` §30-§42 for the detailed
 status of every phase.
@@ -115,7 +112,8 @@ status of every phase.
   `object_info` and one-click test runs
 - **Page / panel editor** — template-based layouts, composite image
   rendering, JSON persistence
-- **Speech bubbles** — auto layout, vertical Japanese, PNG output
+- **Speech bubbles** — auto layout, vertical Japanese, PNG output,
+  autopilot lettering hook with bubble overlay on rendered pages
 - **Candidate generation** — multi-seed policy / **QA scoring** /
   retry prompts (spec §17-18)
 - **Autopilot state machine** — pause / resume / cancel, recovery
