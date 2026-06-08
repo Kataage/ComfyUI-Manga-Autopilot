@@ -261,6 +261,16 @@ pip install -e .
 
 ComfyUI を再起動すると、UI に「Manga Autopilot」タブが表示されます。
 
+## ローカルスモークテスト
+
+インストール後、以下のコマンドで動作を確認できます:
+
+```bash
+python -m pip install -e .
+ruff check .
+pytest -m release_gate -q
+```
+
 ## クイックスタート
 
 詳細は [`docs/quickstart.ja.md`](docs/quickstart.ja.md) を参照してください。
@@ -278,6 +288,11 @@ ComfyUI を再起動すると、UI に「Manga Autopilot」タブが表示され
 
 ## ドキュメント
 
+- [`CHANGELOG.md`](CHANGELOG.md) — リリース履歴
+- [`docs/release/v1_acceptance_matrix.md`](docs/release/v1_acceptance_matrix.md) —
+  v1.0 受入基準マトリクス
+- [`docs/release/v1_release_checklist.md`](docs/release/v1_release_checklist.md) —
+  リリース前チェックリスト
 - [`docs/quickstart.ja.md`](docs/quickstart.ja.md) - 最短手順
 - [`docs/install.ja.md`](docs/install.ja.md) - インストール
 - [`docs/workflow_binding.ja.md`](docs/workflow_binding.ja.md) - ワークフロー登録

@@ -266,6 +266,16 @@ pip install -e .
 
 Restart ComfyUI; a "Manga Autopilot" sidebar tab appears in the UI.
 
+## Local smoke test
+
+After installing, verify the installation works:
+
+```bash
+python -m pip install -e .
+ruff check .
+pytest -m release_gate -q
+```
+
 ## Quick start
 
 See [`docs/quickstart.md`](docs/quickstart.md).
@@ -282,6 +292,11 @@ See [`docs/quickstart.md`](docs/quickstart.md).
 
 ## Documentation
 
+- [`CHANGELOG.md`](CHANGELOG.md) — release history
+- [`docs/release/v1_acceptance_matrix.md`](docs/release/v1_acceptance_matrix.md) —
+  v1.0 acceptance matrix
+- [`docs/release/v1_release_checklist.md`](docs/release/v1_release_checklist.md) —
+  pre-release checklist
 - [`docs/install.md`](docs/install.md) — install
 - [`docs/quickstart.md`](docs/quickstart.md) — 6-step happy path
 - [`docs/workflow_binding.md`](docs/workflow_binding.md) — workflow
