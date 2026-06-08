@@ -626,15 +626,37 @@ def _make_export(
     project_root = paths.root
     service = ExportService(storage_root=storage_root)
 
-    def _hook(_run: AutopilotRun) -> dict[str, list[str]]:
+    def _hook(_run: AutopilotRun) -> dict[str, Any]:
+        result: dict[str, Any] = {
+            "pages": [],
+            "webtoon": [],
+            "pdf": None,
+            "project_root": str(project_root),
+        }
         try:
-            return {
-                "pages": [str(p) for p in service.all_exports(project_id)],
-                "project_root": str(project_root),
-            }
+            # Collect page PNGs in sorted order.
+            pages_dir = paths.export("pages")
+            page_pngs = sorted(p for p in pages_dir.glob("page_*.png") if p.is_file())
+            result["pages"] = [str(p) for p in page_pngs]
+
+            # Generate webtoon if we have page PNGs.
+            if page_pngs:
+                try:
+                    webtoon_paths = service.webtoon(project_id, page_pngs)
+                    result["webtoon"] = [str(p) for p in webtoon_paths]
+                except Exception as exc:  # noqa: BLE001
+                    log.warning("webtoon export failed: %s", exc)
+
+                # Generate PDF.
+                try:
+                    pdf_path = service.pdf(project_id, page_pngs)
+                    result["pdf"] = str(pdf_path)
+                except Exception as exc:  # noqa: BLE001
+                    log.warning("pdf export failed: %s", exc)
         except Exception as exc:  # noqa: BLE001
             log.warning("export failed: %s", exc)
-            return {"pages": [], "project_root": str(project_root)}
+
+        return result
 
     return _hook
 
@@ -657,6 +679,8 @@ def _make_finalize(
     def _hook(run: AutopilotRun) -> str:
         exports_info = service_for_exports(run)
         pages: list[str] = exports_info.get("pages", [])  # type: ignore[arg-type]
+        webtoon: list[str] = exports_info.get("webtoon", [])  # type: ignore[arg-type]
+        pdf: str | None = exports_info.get("pdf")  # type: ignore[assignment]
         records = _read_panel_records(project_root)
         generated_images = sum(1 for r in records if r.image_path)
         try:
@@ -667,7 +691,7 @@ def _make_finalize(
                 status="completed",
                 created_at=run.started_at.isoformat(),
                 completed_at=(run.finished_at or datetime.now(timezone.utc)).isoformat(),
-                exports=ManifestExports(pages=pages, webtoon=[], pdf=None),
+                exports=ManifestExports(pages=pages, webtoon=webtoon, pdf=pdf),
                 stats=ManifestStats(
                     page_count=int(run.input.get("page_count") or 1),
                     panel_count=len(records),

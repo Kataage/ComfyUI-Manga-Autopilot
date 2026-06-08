@@ -103,6 +103,11 @@ later issue, not yet wired up).
   `MANGA_AUTOPILOT_COMFY_BASE_URL`, and
   `MANGA_AUTOPILOT_TEST_WORKFLOW_JSON` to enable.  Works with
   localhost, LAN, or cloud-GPU ComfyUI instances.
+- **Webtoon + PDF autopilot export** — the autopilot export hook now
+  generates a webtoon (full + per-page slices) and a PDF after page
+  rendering.  `ManifestExports` includes `webtoon` (list of PNG
+  paths) and `pdf` (path to `manga.pdf`).  E2E tests verify both
+  outputs exist on disk and appear in the manifest.
 
 ### Planned (spec-described, not yet wired up)
 

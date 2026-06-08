@@ -348,6 +348,19 @@ async def test_one_page_autopilot_completes_end_to_end(e2e_client) -> None:
     page_size = rendered_path.stat().st_size
     assert page_size > 0
 
+    # 12. Webtoon and PDF exports exist.
+    webtoon_dir = project_root / "exports" / "webtoon"
+    assert webtoon_dir.exists()
+    assert any(p.suffix == ".png" for p in webtoon_dir.iterdir())
+    pdf_path = project_root / "exports" / "pdf" / "manga.pdf"
+    assert pdf_path.exists()
+    assert pdf_path.stat().st_size > 0
+
+    # 13. Manifest includes webtoon and pdf.
+    assert len(manifest["exports"]["webtoon"]) >= 1
+    assert manifest["exports"]["pdf"] is not None
+    assert "manga.pdf" in manifest["exports"]["pdf"]
+
 
 # --------------------------------------------------------- 2-page test
 async def test_two_page_autopilot_completes_end_to_end(e2e_client) -> None:
@@ -861,3 +874,31 @@ async def test_four_page_two_panel_autopilot_completes_end_to_end(e2e_client) ->
     assert dialogue_texts["panel_003_02"] == "まだ終わらない"
     assert dialogue_texts["panel_004_01"] == "決める"
     assert dialogue_texts["panel_004_02"] == "終わらせる"
+
+    # 13. Webtoon export exists.
+    webtoon_dir = project_root / "exports" / "webtoon"
+    assert webtoon_dir.exists()
+    webtoon_files = sorted(p.name for p in webtoon_dir.iterdir() if p.suffix == ".png")
+    assert len(webtoon_files) >= 1
+    # At least one webtoon file is non-empty.
+    for wf in webtoon_files:
+        assert (webtoon_dir / wf).stat().st_size > 0
+
+    # 14. PDF export exists.
+    pdf_path = project_root / "exports" / "pdf" / "manga.pdf"
+    assert pdf_path.exists()
+    assert pdf_path.stat().st_size > 0
+
+    # 15. Manifest includes webtoon and pdf exports.
+    assert len(manifest["exports"]["webtoon"]) >= 1
+    assert manifest["exports"]["pdf"] is not None
+    assert "manga.pdf" in manifest["exports"]["pdf"]
+
+    # 16. ExportService.all_exports covers pages, webtoon, pdf.
+    from manga_autopilot.services.export import ExportService
+    svc = ExportService(storage_root=tmp_path)
+    all_ex = svc.all_exports(project_id)
+    ex_names = [p.name for p in all_ex]
+    assert any(n.startswith("page_") for n in ex_names)
+    assert any("webtoon" in n for n in ex_names)
+    assert any("manga.pdf" in n for n in ex_names)
