@@ -108,12 +108,30 @@ later issue, not yet wired up).
   rendering.  `ManifestExports` includes `webtoon` (list of PNG
   paths) and `pdf` (path to `manga.pdf`).  E2E tests verify both
   outputs exist on disk and appear in the manifest.
+- **Project re-edit E2E** — a generated project can be reopened from a
+  new app instance, bubble text edited via `PATCH /bubbles/{id}`, and
+  page PNGs / webtoon / PDF re-rendered and re-exported.  The
+  `test_project_reedit_e2e.py` test verifies the full round-trip:
+  generate → reopen → edit → re-render → re-export → manifest update.
+  HTTP API-based dialogue editing and Web UI editing are planned but not
+  yet wired up.
 
 ### Planned (spec-described, not yet wired up)
 
+- **Web UI editing.**  Full in-browser editing of projects, panels,
+  bubbles, and dialogue.  Currently bubble text can be edited via
+  `PATCH /bubbles/{id}` HTTP API, but a visual editor is planned.
+- **History-aware editing UI.**  Edit history with undo/redo and
+  per-panel revision tracking.
+- **Diff preview.**  Side-by-side before/after comparison when
+  re-rendering after edits.
+- **Complex panel layout AI.**  AI-driven panel composition that
+  goes beyond the current grid/fallback layouts.
 - **External GPU worker (Modal-style) end-to-end.**  `GPUBridge` knows
   how to serialise a workflow and fall back to local ComfyUI on
   timeout, but it is not yet used by the default orchestrator.
+- **Real ComfyUI in normal CI.**  Making a live ComfyUI server
+  required for standard CI runs (currently opt-in only).
 - **Real-image QA scoring.**  Today the QA loop runs the heuristics
   (prompt alignment, bubble space, palette).  Real CLIP / IP-Adapter /
   face-similarity scoring is on the roadmap; the `GenerationLoop`
