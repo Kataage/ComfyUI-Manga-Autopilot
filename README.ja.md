@@ -101,6 +101,11 @@ ComfyUI のカスタムノード拡張で、1 つのアイデアから短い漫�
   `/prompt` → `/history` → `/view` のフローを E2E 検証。
   ワークフロー binding override（positive/negative/seed/width/height）が
   送信グラフに反映されることを確認（`test_comfy_executor_e2e.py`）。
+- **実 ComfyUI E2E（opt-in）** — 環境変数で有効化するスモークテスト
+  （`test_real_comfy_executor_e2e.py`）。デフォルトでは skip。
+  `MANGA_AUTOPILOT_REAL_COMFY_E2E=1`、`MANGA_AUTOPILOT_COMFY_BASE_URL`、
+  `MANGA_AUTOPILOT_TEST_WORKFLOW_JSON` を設定すると実行。
+  ローカル/LAN/クラウド GPU の ComfyUI インスタンスに対応。
 
 ### Planned (未接続 / スタブ)
 
@@ -115,6 +120,38 @@ ComfyUI のカスタムノード拡張で、1 つのアイデアから短い漫�
 
 各フェーズの詳細ステータスは `docs/comfyui_manga_autopilot_spec.md`
 §30-§42 を参照。
+
+### Opt-in 実 ComfyUI E2E
+
+`test_real_comfy_executor_e2e.py` は**デフォルトで skip** され、
+3 つの環境変数が設定されている場合だけ実行されます。これにより、
+標準の `pytest tests/backend/ -q` は GPU 不要で高速に保ちつつ、
+実 ComfyUI サーバーを持つ開発者は full executor パスを検証できます。
+
+```bash
+# 標準テストスイート（GPU 不要）:
+pytest tests/backend/ -q
+
+# Opt-in 実 ComfyUI E2E（実 ComfyUI サーバーが必要）:
+MANGA_AUTOPILOT_REAL_COMFY_E2E=1 \
+MANGA_AUTOPILOT_COMFY_BASE_URL=http://192.168.1.50:8188 \
+MANGA_AUTOPILOT_TEST_WORKFLOW_JSON=/path/to/workflow_api.json \
+pytest tests/backend/test_real_comfy_executor_e2e.py -q
+```
+
+| 環境変数 | 必須 | デフォルト | 説明 |
+|---|---|---|---|
+| `MANGA_AUTOPILOT_REAL_COMFY_E2E` | Yes | `0` | `1` でテスト有効化 |
+| `MANGA_AUTOPILOT_COMFY_BASE_URL` | Yes | — | ComfyUI サーバー URL（ローカル/LAN/クラウド） |
+| `MANGA_AUTOPILOT_TEST_WORKFLOW_JSON` | Yes | — | `api_graph` + `bindings` を持つ workflow JSON のパス |
+| `MANGA_AUTOPILOT_REAL_COMFY_TIMEOUT` | No | `180` | autopilot 完了待ちの最大秒数 |
+
+**注意:**
+- workflow JSON は対象 ComfyUI サーバーに存在するモデル/ノードを
+  参照している必要があります。
+- 低スペック開発PC: 標準テストスイートのみ実行（GPU 不要）。
+- GPU 搭載 PC / リモート環境: `COMFY_BASE_URL` を ComfyUI インスタンスに
+  向けて opt-in テストを実行。
 
 ## 特徴
 

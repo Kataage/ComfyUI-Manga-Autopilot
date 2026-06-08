@@ -96,6 +96,13 @@ later issue, not yet wired up).
   end-to-end without a live ComfyUI server.  Workflow binding overrides
   (positive/negative/seed/width/height) are verified on the submitted
   graph (`test_comfy_executor_e2e.py`).
+- **Real ComfyUI E2E (opt-in).**  An environment-variable-gated smoke
+  test (`test_real_comfy_executor_e2e.py`) exercises the full
+  autopilot → `ComfyExecutor` → live ComfyUI path.  Skipped by
+  default; set `MANGA_AUTOPILOT_REAL_COMFY_E2E=1`,
+  `MANGA_AUTOPILOT_COMFY_BASE_URL`, and
+  `MANGA_AUTOPILOT_TEST_WORKFLOW_JSON` to enable.  Works with
+  localhost, LAN, or cloud-GPU ComfyUI instances.
 
 ### Planned (spec-described, not yet wired up)
 
@@ -110,6 +117,40 @@ later issue, not yet wired up).
 
 See `docs/comfyui_manga_autopilot_spec.md` §30-§42 for the detailed
 status of every phase.
+
+### Opt-in Real ComfyUI E2E
+
+The `test_real_comfy_executor_e2e.py` test is **skipped by default**
+and only runs when three environment variables are set.  This keeps
+the standard `pytest tests/backend/ -q` fast and GPU-free while
+letting developers with a live ComfyUI server validate the full
+executor path.
+
+```bash
+# Standard test suite (no GPU required):
+pytest tests/backend/ -q
+
+# Opt-in real ComfyUI E2E (requires a running ComfyUI server):
+MANGA_AUTOPILOT_REAL_COMFY_E2E=1 \
+MANGA_AUTOPILOT_COMFY_BASE_URL=http://192.168.1.50:8188 \
+MANGA_AUTOPILOT_TEST_WORKFLOW_JSON=/path/to/workflow_api.json \
+pytest tests/backend/test_real_comfy_executor_e2e.py -q
+```
+
+| Variable | Required | Default | Description |
+|---|---|---|---|
+| `MANGA_AUTOPILOT_REAL_COMFY_E2E` | Yes | `0` | Set to `1` to enable the test |
+| `MANGA_AUTOPILOT_COMFY_BASE_URL` | Yes | — | ComfyUI server URL (localhost, LAN, or cloud) |
+| `MANGA_AUTOPILOT_TEST_WORKFLOW_JSON` | Yes | — | Path to a workflow JSON with `api_graph` + `bindings` |
+| `MANGA_AUTOPILOT_REAL_COMFY_TIMEOUT` | No | `180` | Max seconds to wait for autopilot completion |
+
+**Notes:**
+- The workflow JSON must reference models/nodes that exist on the
+  target ComfyUI server.
+- Low-spec dev machines: run only the standard test suite — no GPU
+  needed.
+- GPU-equipped or remote machines: point `COMFY_BASE_URL` at the
+  ComfyUI instance and run the opt-in test.
 
 ---
 
