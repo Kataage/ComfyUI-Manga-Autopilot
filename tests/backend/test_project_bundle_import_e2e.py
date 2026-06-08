@@ -293,6 +293,7 @@ def _render_all_pages(
 
 
 # --------------------------------------------------------- test
+@pytest.mark.release_gate
 async def test_generated_project_bundle_can_be_imported_edited_and_reexported(
     aiohttp_client, tmp_path: Path
 ) -> None:

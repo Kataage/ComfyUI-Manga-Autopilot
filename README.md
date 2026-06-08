@@ -194,6 +194,35 @@ pytest tests/backend/test_real_comfy_executor_e2e.py -q
 - GPU-equipped or remote machines: point `COMFY_BASE_URL` at the
   ComfyUI instance and run the opt-in test.
 
+### v1.0 Release Gate
+
+Before every release, run the following quality gate:
+
+```bash
+# Lint
+ruff check .
+
+# Full backend test suite
+pytest tests/backend/ -q
+
+# Release gate subset (key E2E only)
+pytest -m release_gate -q
+```
+
+The `release_gate` marker targets the critical E2E paths:
+
+| Test | What it covers |
+|------|----------------|
+| `test_one_page_autopilot_completes_end_to_end` | 1-page × 1-panel generation |
+| `test_four_page_two_panel_autopilot_completes_end_to_end` | 4-page × 2-panel + webtoon/PDF |
+| `test_one_page_autopilot_uses_comfy_executor_path` | ComfyExecutor + FakeComfyClient |
+| `test_generated_project_can_be_reopened_edited_and_reexported` | Project re-edit round-trip |
+| `test_failed_autopilot_can_resume_missing_panels_only` | Failure → resume → complete |
+| `test_generated_project_bundle_can_be_imported_edited_and_reexported` | ZIP bundle import round-trip |
+
+See [`docs/release/v1_acceptance_matrix.md`](docs/release/v1_acceptance_matrix.md)
+for the full acceptance matrix.
+
 ---
 
 ## Features

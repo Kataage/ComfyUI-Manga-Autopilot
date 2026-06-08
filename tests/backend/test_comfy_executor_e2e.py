@@ -308,6 +308,7 @@ async def _wait_for_completion(cli, project_id: str, timeout: float = 15.0) -> d
 
 # ---- Test ----
 
+@pytest.mark.release_gate
 async def test_one_page_autopilot_uses_comfy_executor_path(comfy_e2e_client) -> None:
     """1-page / 1-panel autopilot through ComfyExecutor → FakeComfyClient."""
     cli, tmp_path, llm, fake_client, registry = comfy_e2e_client
