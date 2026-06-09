@@ -240,6 +240,11 @@ pytest -m release_gate -q
 - **キャンセル後プロジェクト再開** - `POST /autopilot/restart` で
   キャンセルマーカーを削除し、`project.json` から入力を復元して
   新しい実行を開始; リクエストボディで上書き可能
+- **実行履歴基盤** - autopilot実行ごとに一意な `run_id` を生成;
+  `runs/{run_id}/run.json` メタデータ; `latest_run_id.txt` ポインタ;
+  `generation_log.json`、`manifest.json`、リモートworkerペイロードに
+  `run_id` を含む; restart時は `source.restart_of_run_id` で
+  前回実行をリンク
 - **書き出し** - PNG ページ、Webtoon スライス、PDF (A4/B5/Kindle/カスタム)、
   Zip 形式のプロジェクトバンドル
 - **外部 GPU ブリッジ** (Modal スタイル worker) - タイムアウトでローカル

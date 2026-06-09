@@ -246,6 +246,11 @@ for the full acceptance matrix.
 - **Cancelled project restart** — `POST /autopilot/restart` clears
   cancel marker, restores input from `project.json`, starts fresh run;
   request body overrides supported
+- **Run history foundation** — unique `run_id` per autopilot execution;
+  `runs/{run_id}/run.json` metadata; `latest_run_id.txt` pointer;
+  `run_id` in `generation_log.json`, `manifest.json`, and remote
+  worker payload metadata; restart links previous run via
+  `source.restart_of_run_id`
 - **Export** — PNG pages, webtoon slices, PDF (A4/B5/Kindle/custom),
   zip-based project bundles
 - **External GPU bridge** (Modal-style worker) — local ComfyUI fallback

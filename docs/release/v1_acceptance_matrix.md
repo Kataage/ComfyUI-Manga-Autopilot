@@ -191,6 +191,17 @@ The following items are **out of scope** for v1.0 and remain in the Planned sect
 | Restart applies request body overrides | Done | `test_restart_applies_overrides` | Yes | Explicit values take precedence |
 | Cancelled → restart → completed E2E | Done | `test_cancelled_project_can_restart_and_complete` | Yes | Full round-trip with SlowFakeExecutor |
 
+### Run History Foundation
+
+| Area | Status | Test | CI | Notes |
+|------|--------|------|----|-------|
+| run_id generation format | Done | `test_generate_run_id_format`, `test_generate_run_id_unique` | Yes | run_YYYYMMDD_HHMMSS_<8hex> |
+| run metadata persistence | Done | `test_save_run_metadata_creates_files`, `test_save_run_metadata_updates_status` | Yes | runs/{run_id}/run.json + latest_run_id.txt |
+| run_id in generation_log.json | Done | `test_generation_log_contains_run_id` | Yes | run_id present after completion |
+| run_id in manifest.json | Done | `test_manifest_contains_run_id_after_completion` | Yes | run_id present after completion |
+| run_id in remote payload metadata | Done | `test_remote_executor_payload_contains_run_id_metadata` | Yes | metadata.run_id in PanelExecutionRequest |
+| restart source link | Done | `test_cancelled_restart_creates_new_run_and_links_previous_run` | Yes | source.restart_of_run_id in run.json |
+
 ## How to Use
 
 ### Before every release

@@ -36,6 +36,7 @@ POST /v1/generate-panel
   "height": 1024,
   "workflow_id": "anime_t2i_default",
   "metadata": {
+    "run_id": "run_20260609_123456_aabbccdd",
     "attempt_index": 0
   }
 }
@@ -53,7 +54,7 @@ POST /v1/generate-panel
 | `width` | integer | yes | Image width in pixels |
 | `height` | integer | yes | Image height in pixels |
 | `workflow_id` | string | no | Workflow registry identifier |
-| `metadata` | object | no | Arbitrary metadata (includes `attempt_index`) |
+| `metadata` | object | no | Arbitrary metadata (includes `run_id`, `attempt_index`) |
 
 ## Sync Response
 

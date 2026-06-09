@@ -93,6 +93,20 @@ class ProjectPaths:
         return self.root / "cancel.json"
 
     @property
+    def latest_run_id_txt(self) -> Path:
+        return self.root / "latest_run_id.txt"
+
+    @property
+    def runs(self) -> Path:
+        return self.root / "runs"
+
+    def run_dir(self, run_id: str) -> Path:
+        return self.runs / run_id
+
+    def run_json(self, run_id: str) -> Path:
+        return self.run_dir(run_id) / "run.json"
+
+    @property
     def assets(self) -> Path:
         return self.root / "assets"
 
