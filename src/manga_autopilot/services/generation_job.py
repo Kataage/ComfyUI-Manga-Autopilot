@@ -224,6 +224,7 @@ class GenerationLoop:
         executor: GenerationExecutor,
         project_id: str,
         cancel_check: Callable[[], bool] | None = None,
+        run_id: str = "",
     ) -> GenerationOutcome:
         """Run the loop for a single panel and return the outcome.
 
@@ -295,6 +296,7 @@ class GenerationLoop:
                         attempt_index=attempt,
                         width=cand.width,
                         height=cand.height,
+                        metadata={"run_id": run_id, "attempt_index": attempt} if run_id else {"attempt_index": attempt},
                     )
                     result = await executor.submit(request)
                     if cancel_check is not None and cancel_check():

@@ -23,6 +23,7 @@ from manga_autopilot.services.autopilot import (
     AutopilotRun,
     InvalidTransitionError,
     OrchestratorHooks,
+    save_run_metadata,
     start_orchestrator,
 )
 from manga_autopilot.services.llm_provider import (
@@ -355,6 +356,7 @@ def _make_generate_panels(
                     executor=executor,
                     project_id=project_id,
                     cancel_check=_cancel_check,
+                    run_id=run.run_id,
                 )
                 if outcome.selected_image_path is not None:
                     record.image_path = str(outcome.selected_image_path)
@@ -717,6 +719,7 @@ def _make_finalize(
             writer = ManifestWriter(project_root)
             writer.write(
                 project_id=project_id,
+                run_id=run.run_id,
                 title=str(run.input.get("title") or project_id),
                 status="completed",
                 created_at=run.started_at.isoformat(),
@@ -811,6 +814,7 @@ async def start(request: web.Request) -> web.Response:
         project_root=ensure_project_paths(storage_root, project_id).root,
         input_payload=input_payload,
     )
+    save_run_metadata(ensure_project_paths(storage_root, project_id).root, run)
     return web.json_response(run.to_status(), status=202)
 
 
@@ -869,6 +873,10 @@ async def cancel(request: web.Request) -> web.Response:
             "reason": reason,
         }
         paths.cancel_json.write_text(_json.dumps(cancel_marker, indent=2))
+        try:
+            save_run_metadata(paths.root, run)
+        except Exception:  # noqa: BLE001
+            pass
 
     status_data = run.to_status()
     status_data["cancel_marker"] = {"requested": True, "reason": reason}
@@ -925,6 +933,12 @@ async def restart(request: web.Request) -> web.Response:
     # Apply overrides
     restored_input.update(overrides)
 
+    # Read previous run_id from latest_run_id.txt
+    previous_run_id: str | None = None
+    latest_run_id_path = paths.latest_run_id_txt
+    if latest_run_id_path.exists():
+        previous_run_id = latest_run_id_path.read_text(encoding="utf-8").strip() or None
+
     # Clear cancel marker
     if paths.cancel_json.exists():
         paths.cancel_json.unlink()
@@ -939,8 +953,12 @@ async def restart(request: web.Request) -> web.Response:
         project_root=paths.root,
         input_payload=restored_input,
     )
+    # Link to previous run
+    run.source["restart_of_run_id"] = previous_run_id
+    save_run_metadata(paths.root, run)
     return web.json_response({
         "project_id": project_id,
+        "run_id": run.run_id,
         "status": "started",
         "restarted": True,
     }, status=202)

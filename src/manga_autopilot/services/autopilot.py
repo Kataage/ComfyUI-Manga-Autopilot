@@ -22,6 +22,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import secrets
 import threading
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
@@ -33,6 +34,50 @@ from typing import Any
 from pydantic import BaseModel, Field
 
 log = logging.getLogger(__name__)
+
+
+# --------------------------------------------------------------- run_id
+def generate_run_id() -> str:
+    """Generate a unique run identifier: run_YYYYMMDD_HHMMSS_<8hex>."""
+    now = datetime.now(timezone.utc)
+    short = secrets.token_hex(4)
+    return f"run_{now.strftime('%Y%m%d_%H%M%S')}_{short}"
+
+
+def save_run_metadata(project_root: Path, run: AutopilotRun) -> None:
+    """Persist run.json and latest_run_id.txt for a run.
+
+    Call this after starting a run and again when it finishes to update
+    the status fields.
+    """
+    project_root = Path(project_root)
+    runs_dir = project_root / "runs"
+    run_dir = runs_dir / run.run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    status_value = run.machine.state.value
+    payload = {
+        "run_id": run.run_id,
+        "project_id": run.project_id,
+        "kind": run.source.get("restart_of_run_id") and "restart" or "start",
+        "status": status_value,
+        "started_at": run.started_at.isoformat(),
+        "completed_at": run.finished_at.isoformat() if run.finished_at else None,
+        "cancelled_at": None,
+        "failed_at": None,
+        "input": run.input,
+        "source": run.source,
+    }
+    if status_value == "CANCELLED":
+        payload["cancelled_at"] = (run.finished_at or run._now()).isoformat()
+    elif status_value.startswith("FAILED"):
+        payload["failed_at"] = (run.finished_at or run._now()).isoformat()
+
+    run_file = run_dir / "run.json"
+    run_file.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    latest_file = project_root / "latest_run_id.txt"
+    latest_file.write_text(run.run_id, encoding="utf-8")
 
 
 # ----------------------------------------------------------------- states
@@ -301,6 +346,7 @@ class AutopilotRun:
 
     project_id: str
     machine: AutopilotStateMachine
+    run_id: str = field(default_factory=generate_run_id)
     steps: list[PipelineStep] = field(default_factory=list)
     started_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     finished_at: datetime | None = None
@@ -318,6 +364,7 @@ class AutopilotRun:
     to ``PANELS_GENERATING``).
     """
     input: dict[str, Any] = field(default_factory=dict)
+    source: dict[str, str | None] = field(default_factory=lambda: {"restart_of_run_id": None, "resume_of_run_id": None})
 
     def _now(self) -> datetime:
         return datetime.now(timezone.utc)
@@ -346,6 +393,7 @@ class AutopilotRun:
     def to_status(self) -> dict[str, Any]:
         return {
             "project_id": self.project_id,
+            "run_id": self.run_id,
             "state": self.machine.state.value,
             "started_at": self.started_at.isoformat(),
             "finished_at": self.finished_at.isoformat() if self.finished_at else None,
@@ -353,6 +401,7 @@ class AutopilotRun:
             "steps": [s.to_dict() for s in self.steps],
             "log": self.log,
             "artefacts": self.artefacts,
+            "source": self.source,
         }
 
 
@@ -368,6 +417,7 @@ class QAReportEntry(BaseModel):
 
 class CompletionReport(BaseModel):
     project_id: str
+    run_id: str = ""
     title: str = ""
     started_at: str
     finished_at: str
@@ -385,6 +435,7 @@ class CompletionReport(BaseModel):
     def to_generation_log(self) -> dict[str, Any]:
         return {
             "project_id": self.project_id,
+            "run_id": self.run_id,
             "title": self.title,
             "started_at": self.started_at,
             "finished_at": self.finished_at,
@@ -446,6 +497,7 @@ class ManifestWriter:
         self,
         *,
         project_id: str,
+        run_id: str = "",
         title: str,
         status: str,
         created_at: str,
@@ -455,6 +507,7 @@ class ManifestWriter:
     ) -> Path:
         payload = {
             "project_id": project_id,
+            "run_id": run_id,
             "title": title,
             "status": status,
             "created_at": created_at,
@@ -825,6 +878,7 @@ class Orchestrator:
             try:
                 report = CompletionReport(
                     project_id=run.project_id,
+                    run_id=run.run_id,
                     title=str(run.input.get("title", run.project_id)),
                     started_at=run.started_at.isoformat(),
                     finished_at=run.finished_at.isoformat() if run.finished_at else run._now().isoformat(),
@@ -835,6 +889,10 @@ class Orchestrator:
                 run.store("completion_report", report.model_dump())
             except Exception as exc:  # pragma: no cover - best-effort
                 log.warning("could not write completion report: %s", exc)
+            try:
+                save_run_metadata(self.project_root, run)
+            except Exception as exc:  # pragma: no cover - best-effort
+                log.warning("could not save run metadata: %s", exc)
         if not run.finished_at:
             run.finish()
         run.log_event("pipeline_finished", {"state": run.machine.state.value})
