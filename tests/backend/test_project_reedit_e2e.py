@@ -29,7 +29,10 @@ from manga_autopilot.routes import register_all
 from manga_autopilot.services.autopilot import ManifestExports, ManifestStats, ManifestWriter
 from manga_autopilot.services.bubble_service import BubbleService
 from manga_autopilot.services.export import ExportService, export_page_png
-from manga_autopilot.services.generation_job import GenerationExecutorResult
+from manga_autopilot.services.generation_job import (
+    GenerationExecutorResult,
+    PanelExecutionRequest,
+)
 from manga_autopilot.services.llm_provider import LLMProvider, LLMSettings
 
 # --------------------------------------------------------- fakes (duplicated to avoid cross-test coupling)
@@ -177,16 +180,16 @@ class FakeLLMProvider(LLMProvider):
 
 class FakeExecutor:
     def __init__(self) -> None:
-        self.calls: list[dict[str, Any]] = []
+        self.calls: list[Any] = []
 
-    async def submit(self, *, prompt, workflow_id, seed, candidate_id):
-        self.calls.append({"candidate_id": candidate_id, "seed": seed, "workflow_id": workflow_id})
-        image = Image.new("RGB", (prompt.width, prompt.height), (seed % 256, 64, 200))
+    async def submit(self, request: PanelExecutionRequest):
+        self.calls.append(request)
+        image = Image.new("RGB", (request.effective_width, request.effective_height), (request.seed % 256, 64, 200))
         return GenerationExecutorResult(
-            candidate_id=candidate_id,
-            prompt_id=f"prompt_{candidate_id}",
+            candidate_id=request.candidate_id,
+            prompt_id=f"prompt_{request.candidate_id}",
             image=image,
-            workflow_id=workflow_id,
+            workflow_id=request.workflow_id,
         )
 
 

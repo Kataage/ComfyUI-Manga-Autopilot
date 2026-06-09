@@ -35,8 +35,8 @@ from PIL import Image
 from manga_autopilot.services.generation_job import (
     GenerationExecutor,
     GenerationExecutorResult,
+    PanelExecutionRequest,
 )
-from manga_autopilot.services.prompt_builder import PromptSpec
 
 log = logging.getLogger(__name__)
 
@@ -125,6 +125,7 @@ class RemoteGenerateRequest:
     width: int = 512
     height: int = 512
     workflow_id: str | None = None
+    candidate_id: str | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -143,6 +144,8 @@ class RemoteGenerateRequest:
             d["seed"] = self.seed
         if self.workflow_id is not None:
             d["workflow_id"] = self.workflow_id
+        if self.candidate_id is not None:
+            d["candidate_id"] = self.candidate_id
         return d
 
 
@@ -385,22 +388,20 @@ class RemoteHTTPExecutor(GenerationExecutor):
 
     async def submit(
         self,
-        *,
-        prompt: PromptSpec,
-        workflow_id: str,
-        seed: int,
-        candidate_id: str,
+        request: PanelExecutionRequest,
     ) -> GenerationExecutorResult:
-        request = RemoteGenerateRequest(
-            project_id=self.project_id,
-            page_id="",
-            panel_id=candidate_id,
-            prompt=prompt.positive,
-            negative_prompt=prompt.negative or None,
-            seed=seed,
-            width=prompt.width,
-            height=prompt.height,
-            workflow_id=workflow_id or None,
+        req = RemoteGenerateRequest(
+            project_id=request.project_id,
+            page_id=request.page_id,
+            panel_id=request.panel_id,
+            candidate_id=request.candidate_id,
+            prompt=request.prompt.positive,
+            negative_prompt=request.prompt.negative or None,
+            seed=request.seed,
+            width=request.effective_width,
+            height=request.effective_height,
+            workflow_id=request.workflow_id or None,
+            metadata={"attempt_index": request.attempt_index, **request.metadata},
         )
         url = self.settings.base_url.rstrip("/") + "/v1/generate-panel"
         timeout = aiohttp.ClientTimeout(total=self.settings.timeout_sec)
@@ -408,7 +409,7 @@ class RemoteHTTPExecutor(GenerationExecutor):
         try:
             try:
                 async with session.post(
-                    url, json=request.to_dict(), headers=self._auth_headers(), timeout=timeout,
+                    url, json=req.to_dict(), headers=self._auth_headers(), timeout=timeout,
                 ) as resp:
                     if resp.status != 200:
                         body = await resp.text()
@@ -433,12 +434,12 @@ class RemoteHTTPExecutor(GenerationExecutor):
         if response.status == "completed":
             # Priority: image_base64 > artifact_url > artifact_path
             if response.image_base64:
-                image = self._decode_image(response.image_base64, candidate_id)
+                image = self._decode_image(response.image_base64, request.candidate_id)
             elif response.artifact_url:
                 dl_session = self._open()
                 try:
                     image = await self._resolve_artifact_url(
-                        dl_session, response.artifact_url, candidate_id,
+                        dl_session, response.artifact_url, request.candidate_id,
                     )
                 finally:
                     if self._session_factory is None:
@@ -451,10 +452,10 @@ class RemoteHTTPExecutor(GenerationExecutor):
                 )
 
             return GenerationExecutorResult(
-                candidate_id=candidate_id,
-                prompt_id=response.metadata.get("prompt_id", f"remote_{candidate_id}"),
+                candidate_id=request.candidate_id,
+                prompt_id=response.metadata.get("prompt_id", f"remote_{request.candidate_id}"),
                 image=image,
-                workflow_id=workflow_id,
+                workflow_id=request.workflow_id,
             )
 
         # --- async: queued / accepted / running with job_id ---
@@ -462,7 +463,7 @@ class RemoteHTTPExecutor(GenerationExecutor):
             session_for_poll = self._open()
             try:
                 return await self._poll_job(
-                    session_for_poll, response.job_id, candidate_id, workflow_id,
+                    session_for_poll, response.job_id, request.candidate_id, request.workflow_id,
                 )
             finally:
                 if self._session_factory is None:

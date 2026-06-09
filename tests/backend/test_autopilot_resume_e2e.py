@@ -27,7 +27,10 @@ from aiohttp import web
 from PIL import Image
 
 from manga_autopilot.routes import register_all
-from manga_autopilot.services.generation_job import GenerationExecutorResult
+from manga_autopilot.services.generation_job import (
+    GenerationExecutorResult,
+    PanelExecutionRequest,
+)
 from manga_autopilot.services.llm_provider import LLMProvider, LLMSettings  # noqa: I001
 
 # --------------------------------------------------------- fakes
@@ -169,19 +172,19 @@ class FailingAfterNExecutor:
     """Executor that raises RuntimeError on the Nth submit call."""
 
     def __init__(self, fail_on_call: int) -> None:
-        self.calls: list[dict[str, Any]] = []
+        self.calls: list[Any] = []
         self.fail_on_call = fail_on_call
 
-    async def submit(self, *, prompt, workflow_id, seed, candidate_id):
-        self.calls.append({"candidate_id": candidate_id, "seed": seed, "workflow_id": workflow_id})
+    async def submit(self, request: PanelExecutionRequest):
+        self.calls.append(request)
         if len(self.calls) == self.fail_on_call:
             raise RuntimeError("intentional executor failure")
-        image = Image.new("RGB", (prompt.width, prompt.height), (seed % 256, 64, 200))
+        image = Image.new("RGB", (request.effective_width, request.effective_height), (request.seed % 256, 64, 200))
         return GenerationExecutorResult(
-            candidate_id=candidate_id,
-            prompt_id=f"prompt_{candidate_id}",
+            candidate_id=request.candidate_id,
+            prompt_id=f"prompt_{request.candidate_id}",
             image=image,
-            workflow_id=workflow_id,
+            workflow_id=request.workflow_id,
         )
 
 
@@ -189,16 +192,16 @@ class SucceedingExecutor:
     """Executor that always succeeds."""
 
     def __init__(self) -> None:
-        self.calls: list[dict[str, Any]] = []
+        self.calls: list[Any] = []
 
-    async def submit(self, *, prompt, workflow_id, seed, candidate_id):
-        self.calls.append({"candidate_id": candidate_id, "seed": seed, "workflow_id": workflow_id})
-        image = Image.new("RGB", (prompt.width, prompt.height), (seed % 256, 64, 200))
+    async def submit(self, request: PanelExecutionRequest):
+        self.calls.append(request)
+        image = Image.new("RGB", (request.effective_width, request.effective_height), (request.seed % 256, 64, 200))
         return GenerationExecutorResult(
-            candidate_id=candidate_id,
-            prompt_id=f"prompt_{candidate_id}",
+            candidate_id=request.candidate_id,
+            prompt_id=f"prompt_{request.candidate_id}",
             image=image,
-            workflow_id=workflow_id,
+            workflow_id=request.workflow_id,
         )
 
 

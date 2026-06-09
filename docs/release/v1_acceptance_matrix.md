@@ -159,6 +159,17 @@ The following items are **out of scope** for v1.0 and remain in the Planned sect
 | Raises on missing artifact_path | Done | `test_remote_executor_raises_on_missing_artifact_path` | Yes | FileNotFoundError → RemoteExecutorImageError |
 | Autopilot E2E with artifact_url | Done | `test_autopilot_can_generate_panels_with_artifact_url_remote_executor` | Yes | Full pipeline via artifact_url |
 
+### PanelExecutionRequest Context
+
+| Area | Status | Test | CI | Notes |
+|------|--------|------|----|-------|
+| PanelExecutionRequest fields | Done | `test_panel_execution_request_fields` | Yes | All required fields present |
+| effective_width/height fallback | Done | `test_panel_execution_request_effective_dimensions` | Yes | Falls back to prompt dimensions |
+| Frozen (immutable) | Done | `test_panel_execution_request_frozen` | Yes | Cannot modify after creation |
+| GenerationLoop builds request | Done | `test_generation_loop_builds_panel_execution_request_context` | Yes | project/page/panel/candidate context |
+| Remote payload includes all IDs | Done | `test_remote_executor_payload_includes_project_page_panel_and_candidate_ids` | Yes | page_id is non-empty |
+| RemoteGenerateRequest includes candidate_id | Done | `test_remote_generate_request_includes_candidate_id` | Yes | candidate_id in to_dict() |
+
 ## How to Use
 
 ### Before every release

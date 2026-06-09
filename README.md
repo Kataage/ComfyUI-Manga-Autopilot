@@ -333,6 +333,18 @@ The executor supports three image delivery formats:
 
 CI uses `FakeRemoteWorker` with in-memory artifact storage.
 
+## Executor Interface
+
+The executor interface uses `PanelExecutionRequest` to pass structured
+panel execution context:
+
+- `project_id`, `page_id`, `panel_id`, `candidate_id`
+- `prompt`, `workflow_id`, `seed`, `attempt_index`
+- `width`, `height`, `output_filename`, `metadata`
+
+This enables robust artifact naming for Modal / S3 / R2 integrations.
+Remote workers receive full project/page/panel/candidate context.
+
 ## Modal Worker MVP
 
 An experimental Modal worker example is available at

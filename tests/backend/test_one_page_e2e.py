@@ -29,7 +29,10 @@ from aiohttp import web
 from PIL import Image
 
 from manga_autopilot.routes import register_all
-from manga_autopilot.services.generation_job import GenerationExecutorResult
+from manga_autopilot.services.generation_job import (
+    GenerationExecutorResult,
+    PanelExecutionRequest,
+)
 from manga_autopilot.services.llm_provider import LLMProvider, LLMSettings
 
 
@@ -194,16 +197,16 @@ class FakeLLMProvider(LLMProvider):
 
 class FakeExecutor:
     def __init__(self) -> None:
-        self.calls: list[dict[str, Any]] = []
+        self.calls: list[Any] = []
 
-    async def submit(self, *, prompt, workflow_id, seed, candidate_id):
-        self.calls.append({"candidate_id": candidate_id, "seed": seed, "workflow_id": workflow_id})
-        image = Image.new("RGB", (prompt.width, prompt.height), (seed % 256, 64, 200))
+    async def submit(self, request: PanelExecutionRequest):
+        self.calls.append(request)
+        image = Image.new("RGB", (request.effective_width, request.effective_height), (request.seed % 256, 64, 200))
         return GenerationExecutorResult(
-            candidate_id=candidate_id,
-            prompt_id=f"prompt_{candidate_id}",
+            candidate_id=request.candidate_id,
+            prompt_id=f"prompt_{request.candidate_id}",
             image=image,
-            workflow_id=workflow_id,
+            workflow_id=request.workflow_id,
         )
 
 
@@ -327,7 +330,7 @@ async def test_one_page_autopilot_completes_end_to_end(e2e_client) -> None:
     # 8. The LLM and the executor were exercised.
     assert len(llm.calls) >= 1
     assert len(executor.calls) == 1
-    assert executor.calls[0]["workflow_id"] == "anime_t2i_default"
+    assert executor.calls[0].workflow_id == "anime_t2i_default"
 
     # 9. The project document was left in a "generated" state when fetched.
     get_resp = await cli.get(f"/manga_autopilot/api/projects/{project_id}")

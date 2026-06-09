@@ -11,6 +11,7 @@ from typing import Any
 import pytest
 from aiohttp import web
 
+from manga_autopilot.services.generation_job import PanelExecutionRequest
 from manga_autopilot.services.prompt_builder import PromptSpec
 from manga_autopilot.services.remote_executor import (
     FakeRemoteWorker,
@@ -50,10 +51,24 @@ def _make_prompt(**overrides: Any) -> PromptSpec:
     return PromptSpec(**defaults)
 
 
+def _make_request(**overrides: Any) -> PanelExecutionRequest:
+    defaults = dict(
+        project_id="proj_001",
+        page_id="page_0001",
+        panel_id="panel_001",
+        candidate_id="panel_001_c00",
+        prompt=_make_prompt(),
+        workflow_id="anime_t2i_default",
+        seed=42,
+    )
+    defaults.update(overrides)
+    return PanelExecutionRequest(**defaults)
+
+
 # ---------------------------------------------------------------- tests
 
 async def test_remote_executor_polls_until_async_job_completed() -> None:
-    """Async job goes through queued → running → completed."""
+    """Async job goes through queued -> running -> completed."""
     worker = FakeRemoteWorker(mode="async_success", seed=77)
     runner, port = await _start_worker(worker)
     try:
@@ -62,20 +77,19 @@ async def test_remote_executor_polls_until_async_job_completed() -> None:
             poll_interval_sec=0.01,
             poll_timeout_sec=5.0,
         )
-        executor = RemoteHTTPExecutor(settings=settings, project_id="proj_001")
-        result = await executor.submit(
+        executor = RemoteHTTPExecutor(settings=settings)
+        result = await executor.submit(_make_request(
             prompt=_make_prompt(seed=77),
-            workflow_id="anime_t2i_default",
             seed=77,
             candidate_id="panel_001_c00",
-        )
+        ))
         assert result.image is not None
         assert result.image.size == (64, 64)
         assert result.candidate_id == "panel_001_c00"
 
         # POST was called once.
         assert len(worker.requests) == 1
-        # GET was polled at least twice (running → completed).
+        # GET was polled at least twice (running -> completed).
         assert len(worker.job_requests) >= 2
         assert worker.job_requests[0]["job_id"] == worker.job_requests[1]["job_id"]
     finally:
@@ -94,12 +108,7 @@ async def test_remote_executor_raises_when_async_job_errors() -> None:
         )
         executor = RemoteHTTPExecutor(settings=settings)
         with pytest.raises(RemoteExecutorJobError, match="model failed"):
-            await executor.submit(
-                prompt=_make_prompt(),
-                workflow_id="test_wf",
-                seed=1,
-                candidate_id="cand_001",
-            )
+            await executor.submit(_make_request())
         # POST + at least 2 polls.
         assert len(worker.requests) == 1
         assert len(worker.job_requests) >= 2
@@ -119,12 +128,7 @@ async def test_remote_executor_raises_when_async_job_polling_times_out() -> None
         )
         executor = RemoteHTTPExecutor(settings=settings)
         with pytest.raises(RemoteExecutorPollingTimeoutError) as exc_info:
-            await executor.submit(
-                prompt=_make_prompt(),
-                workflow_id="test_wf",
-                seed=1,
-                candidate_id="cand_001",
-            )
+            await executor.submit(_make_request())
         assert exc_info.value.job_id is not None
         assert exc_info.value.timeout_sec == 0.1
     finally:
@@ -144,12 +148,7 @@ async def test_remote_executor_max_poll_attempts() -> None:
         )
         executor = RemoteHTTPExecutor(settings=settings)
         with pytest.raises(RemoteExecutorPollingTimeoutError):
-            await executor.submit(
-                prompt=_make_prompt(),
-                workflow_id="test_wf",
-                seed=1,
-                candidate_id="cand_001",
-            )
+            await executor.submit(_make_request())
         # POST + 3 polls (max_poll_attempts + 1 because of the > check).
         assert len(worker.job_requests) == 3
     finally:
@@ -165,12 +164,7 @@ async def test_sync_completed_still_works() -> None:
             base_url=f"http://127.0.0.1:{port}",
         )
         executor = RemoteHTTPExecutor(settings=settings)
-        result = await executor.submit(
-            prompt=_make_prompt(),
-            workflow_id="test_wf",
-            seed=42,
-            candidate_id="cand_001",
-        )
+        result = await executor.submit(_make_request())
         assert result.image is not None
         assert len(worker.requests) == 1
         assert len(worker.job_requests) == 0  # no polling for sync path

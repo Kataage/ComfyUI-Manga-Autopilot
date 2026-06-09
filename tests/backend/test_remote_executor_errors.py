@@ -11,6 +11,7 @@ from typing import Any
 import pytest
 from aiohttp import web
 
+from manga_autopilot.services.generation_job import PanelExecutionRequest
 from manga_autopilot.services.prompt_builder import PromptSpec
 from manga_autopilot.services.remote_executor import (
     FakeRemoteWorker,
@@ -53,6 +54,20 @@ def _make_prompt(**overrides: Any) -> PromptSpec:
     return PromptSpec(**defaults)
 
 
+def _make_request(**overrides: Any) -> PanelExecutionRequest:
+    defaults = dict(
+        project_id="proj_001",
+        page_id="page_0001",
+        panel_id="panel_001",
+        candidate_id="panel_001_c00",
+        prompt=_make_prompt(),
+        workflow_id="anime_t2i_default",
+        seed=42,
+    )
+    defaults.update(overrides)
+    return PanelExecutionRequest(**defaults)
+
+
 # ---------------------------------------------------------------- tests
 
 async def test_remote_executor_sends_authorization_header() -> None:
@@ -65,12 +80,7 @@ async def test_remote_executor_sends_authorization_header() -> None:
             api_key="secret-token",
         )
         executor = RemoteHTTPExecutor(settings=settings)
-        result = await executor.submit(
-            prompt=_make_prompt(),
-            workflow_id="test_wf",
-            seed=1,
-            candidate_id="cand_001",
-        )
+        result = await executor.submit(_make_request())
         assert result.image is not None
         assert len(worker.headers) == 1
         assert worker.headers[0].get("Authorization") == "Bearer secret-token"
@@ -86,12 +96,7 @@ async def test_remote_executor_raises_on_http_500() -> None:
         settings = RemoteWorkerSettings(base_url=f"http://127.0.0.1:{port}")
         executor = RemoteHTTPExecutor(settings=settings)
         with pytest.raises(RemoteExecutorHTTPError) as exc_info:
-            await executor.submit(
-                prompt=_make_prompt(),
-                workflow_id="test_wf",
-                seed=1,
-                candidate_id="cand_001",
-            )
+            await executor.submit(_make_request())
         assert exc_info.value.status == 500
         assert "internal server error" in str(exc_info.value)
     finally:
@@ -106,12 +111,7 @@ async def test_remote_executor_raises_on_status_error() -> None:
         settings = RemoteWorkerSettings(base_url=f"http://127.0.0.1:{port}")
         executor = RemoteHTTPExecutor(settings=settings)
         with pytest.raises(RemoteExecutorResponseError, match="model not found"):
-            await executor.submit(
-                prompt=_make_prompt(),
-                workflow_id="test_wf",
-                seed=1,
-                candidate_id="cand_001",
-            )
+            await executor.submit(_make_request())
     finally:
         await runner.cleanup()
 
@@ -124,12 +124,7 @@ async def test_remote_executor_raises_on_invalid_json() -> None:
         settings = RemoteWorkerSettings(base_url=f"http://127.0.0.1:{port}")
         executor = RemoteHTTPExecutor(settings=settings)
         with pytest.raises(RemoteExecutorResponseError, match="invalid JSON"):
-            await executor.submit(
-                prompt=_make_prompt(),
-                workflow_id="test_wf",
-                seed=1,
-                candidate_id="cand_001",
-            )
+            await executor.submit(_make_request())
     finally:
         await runner.cleanup()
 
@@ -142,12 +137,7 @@ async def test_remote_executor_raises_on_missing_image_base64() -> None:
         settings = RemoteWorkerSettings(base_url=f"http://127.0.0.1:{port}")
         executor = RemoteHTTPExecutor(settings=settings)
         with pytest.raises(RemoteExecutorResponseError, match="no image_base64"):
-            await executor.submit(
-                prompt=_make_prompt(),
-                workflow_id="test_wf",
-                seed=1,
-                candidate_id="cand_001",
-            )
+            await executor.submit(_make_request())
     finally:
         await runner.cleanup()
 
@@ -160,12 +150,7 @@ async def test_remote_executor_raises_on_invalid_base64() -> None:
         settings = RemoteWorkerSettings(base_url=f"http://127.0.0.1:{port}")
         executor = RemoteHTTPExecutor(settings=settings)
         with pytest.raises(RemoteExecutorImageError, match="invalid base64"):
-            await executor.submit(
-                prompt=_make_prompt(),
-                workflow_id="test_wf",
-                seed=1,
-                candidate_id="cand_001",
-            )
+            await executor.submit(_make_request())
     finally:
         await runner.cleanup()
 
@@ -178,12 +163,7 @@ async def test_remote_executor_raises_on_invalid_image_bytes() -> None:
         settings = RemoteWorkerSettings(base_url=f"http://127.0.0.1:{port}")
         executor = RemoteHTTPExecutor(settings=settings)
         with pytest.raises(RemoteExecutorImageError, match="invalid image bytes"):
-            await executor.submit(
-                prompt=_make_prompt(),
-                workflow_id="test_wf",
-                seed=1,
-                candidate_id="cand_001",
-            )
+            await executor.submit(_make_request())
     finally:
         await runner.cleanup()
 
@@ -199,12 +179,7 @@ async def test_remote_executor_raises_on_timeout() -> None:
         )
         executor = RemoteHTTPExecutor(settings=settings)
         with pytest.raises(RemoteExecutorTimeoutError) as exc_info:
-            await executor.submit(
-                prompt=_make_prompt(),
-                workflow_id="test_wf",
-                seed=1,
-                candidate_id="cand_001",
-            )
+            await executor.submit(_make_request())
         assert exc_info.value.timeout_sec == 0.1
     finally:
         await runner.cleanup()
@@ -216,13 +191,11 @@ async def test_remote_executor_success_path() -> None:
     runner, port = await _start_worker(worker)
     try:
         settings = RemoteWorkerSettings(base_url=f"http://127.0.0.1:{port}")
-        executor = RemoteHTTPExecutor(settings=settings, project_id="proj_001")
-        result = await executor.submit(
+        executor = RemoteHTTPExecutor(settings=settings)
+        result = await executor.submit(_make_request(
             prompt=_make_prompt(seed=99),
-            workflow_id="anime_t2i_default",
             seed=99,
-            candidate_id="panel_001_c00",
-        )
+        ))
         assert result.image is not None
         assert result.image.size == (64, 64)
         assert result.candidate_id == "panel_001_c00"
@@ -231,7 +204,8 @@ async def test_remote_executor_success_path() -> None:
         assert len(worker.requests) == 1
         req = worker.requests[0]
         assert req["project_id"] == "proj_001"
-        assert req["panel_id"] == "panel_001_c00"
+        assert req["panel_id"] == "panel_001"
+        assert req["candidate_id"] == "panel_001_c00"
         assert req["seed"] == 99
     finally:
         await runner.cleanup()

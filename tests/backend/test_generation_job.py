@@ -19,6 +19,7 @@ from manga_autopilot.services.generation_job import (
     GenerationExecutorResult,
     GenerationLoop,
     GenerationLoopConfig,
+    PanelExecutionRequest,
 )
 from manga_autopilot.services.prompt_builder import PromptSpec
 from manga_autopilot.services.qa import RetryAction
@@ -39,37 +40,26 @@ class FakeExecutor:
         fail_on: set[str] | None = None,
         image_factory=None,
     ) -> None:
-        self.calls: list[dict[str, object]] = []
+        self.calls: list[PanelExecutionRequest] = []
         self._fail_on = fail_on or set()
         self._image_factory = image_factory
 
     async def submit(
         self,
-        *,
-        prompt: PromptSpec,
-        workflow_id: str,
-        seed: int,
-        candidate_id: str,
+        request: PanelExecutionRequest,
     ) -> GenerationExecutorResult:
-        if candidate_id in self._fail_on:
+        if request.candidate_id in self._fail_on:
             raise RuntimeError("fake executor failure")
-        self.calls.append(
-            {
-                "prompt": prompt,
-                "workflow_id": workflow_id,
-                "seed": seed,
-                "candidate_id": candidate_id,
-            }
-        )
+        self.calls.append(request)
         if self._image_factory is not None:
-            image = self._image_factory(seed, prompt.width, prompt.height)
+            image = self._image_factory(request.seed, request.effective_width, request.effective_height)
         else:
-            image = Image.new("RGB", (prompt.width, prompt.height), (seed % 256, 64, 200))
+            image = Image.new("RGB", (request.effective_width, request.effective_height), (request.seed % 256, 64, 200))
         return GenerationExecutorResult(
-            candidate_id=candidate_id,
-            prompt_id=f"prompt_{candidate_id}",
+            candidate_id=request.candidate_id,
+            prompt_id=f"prompt_{request.candidate_id}",
             image=image,
-            workflow_id=workflow_id,
+            workflow_id=request.workflow_id,
         )
 
 
