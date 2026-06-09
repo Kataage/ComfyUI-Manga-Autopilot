@@ -89,6 +89,10 @@ class ProjectPaths:
         return self.root / "manifest.json"
 
     @property
+    def cancel_json(self) -> Path:
+        return self.root / "cancel.json"
+
+    @property
     def assets(self) -> Path:
         return self.root / "assets"
 

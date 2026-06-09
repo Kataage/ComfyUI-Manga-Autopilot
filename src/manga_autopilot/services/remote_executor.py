@@ -26,6 +26,7 @@ import base64
 import io
 import logging
 import os
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -96,6 +97,14 @@ class RemoteExecutorJobError(RemoteExecutorResponseError):
         self.job_id = job_id
         self.job_error = error
         super().__init__(f"job {job_id!r} failed: {error}")
+
+
+class RemoteExecutorCancelledError(RemoteExecutorError):
+    """Remote worker job was cancelled."""
+
+    def __init__(self, job_id: str) -> None:
+        self.job_id = job_id
+        super().__init__(f"job {job_id!r} was cancelled")
 
 
 # --------------------------------------------------------------------- types
@@ -378,6 +387,9 @@ class RemoteHTTPExecutor(GenerationExecutor):
                     job_id, data.get("error", "unknown error")
                 )
 
+            if status == "cancelled":
+                raise RemoteExecutorCancelledError(job_id)
+
             # queued / running — check timeout and retry
             if asyncio.get_event_loop().time() >= deadline:
                 raise RemoteExecutorPollingTimeoutError(
@@ -475,6 +487,121 @@ class RemoteHTTPExecutor(GenerationExecutor):
             f"{response.error or 'unknown error'}"
         )
 
+    async def cancel(self, job_id: str) -> None:
+        """Send a cancel request to the remote worker for ``job_id``.
+
+        ``POST /v1/jobs/{job_id}/cancel`` tells the worker to stop
+        processing the given job.  The worker should transition the job
+        to ``cancelled`` status.
+        """
+        base = self.settings.base_url.rstrip("/")
+        url = f"{base}/v1/jobs/{job_id}/cancel"
+        timeout = aiohttp.ClientTimeout(total=self.settings.timeout_sec)
+        session = self._open()
+        try:
+            try:
+                async with session.post(url, headers=self._auth_headers(), timeout=timeout) as resp:
+                    if resp.status != 200:
+                        body = await resp.text()
+                        raise RemoteExecutorHTTPError(resp.status, body, url)
+                    try:
+                        await resp.json()
+                    except (aiohttp.ContentTypeError, ValueError) as exc:
+                        raise RemoteExecutorResponseError(
+                            f"remote worker returned invalid JSON from {url}: {exc}"
+                        ) from exc
+            except asyncio.TimeoutError as exc:
+                raise RemoteExecutorTimeoutError(self.settings.timeout_sec, url) from exc
+        finally:
+            if self._session_factory is None:
+                await session.close()
+
+    async def _poll_job_with_cancel(
+        self,
+        session: aiohttp.ClientSession,
+        job_id: str,
+        candidate_id: str,
+        workflow_id: str,
+        cancel_checker: Callable[[], bool] | None = None,
+    ) -> GenerationExecutorResult:
+        """Poll ``GET /v1/jobs/{job_id}`` until completed, error, or cancelled.
+
+        If ``cancel_checker`` returns ``True``, the executor sends a cancel
+        request to the remote worker and raises
+        :class:`RemoteExecutorCancelledError`.
+        """
+        base = self.settings.base_url.rstrip("/")
+        job_url = f"{base}/v1/jobs/{job_id}"
+        cancel_url = f"{base}/v1/jobs/{job_id}/cancel"
+        deadline = asyncio.get_event_loop().time() + self.settings.poll_timeout_sec
+        attempts = 0
+
+        while True:
+            attempts += 1
+            if self.settings.max_poll_attempts is not None:
+                if attempts > self.settings.max_poll_attempts:
+                    raise RemoteExecutorPollingTimeoutError(
+                        job_id, self.settings.poll_timeout_sec, job_url,
+                    )
+
+            data = await self._fetch_json(session, job_url)
+            status = data.get("status", "error")
+
+            if status == "completed":
+                resp = RemoteGenerateResponse.from_dict(data)
+
+                if resp.image_base64:
+                    image = self._decode_image(resp.image_base64, candidate_id)
+                elif resp.artifact_url:
+                    image = await self._resolve_artifact_url(
+                        session, resp.artifact_url, candidate_id,
+                    )
+                elif resp.artifact_path:
+                    image = self._load_image_from_path(resp.artifact_path)
+                else:
+                    raise RemoteExecutorResponseError(
+                        f"job {job_id!r} completed but no image_base64, "
+                        f"artifact_url, or artifact_path"
+                    )
+
+                return GenerationExecutorResult(
+                    candidate_id=candidate_id,
+                    prompt_id=data.get("metadata", {}).get(
+                        "prompt_id", f"remote_{candidate_id}"
+                    ),
+                    image=image,
+                    workflow_id=workflow_id,
+                )
+
+            if status == "cancelled":
+                raise RemoteExecutorCancelledError(job_id)
+
+            if status == "error":
+                raise RemoteExecutorJobError(
+                    job_id, data.get("error", "unknown error")
+                )
+
+            # Check cancel before sleeping
+            if cancel_checker is not None and cancel_checker():
+                # Send cancel to remote worker
+                timeout = aiohttp.ClientTimeout(total=self.settings.timeout_sec)
+                try:
+                    async with session.post(
+                        cancel_url, headers=self._auth_headers(), timeout=timeout,
+                    ) as resp:
+                        pass  # best-effort; worker may already be done
+                except Exception:  # noqa: BLE001
+                    pass  # best-effort cancel
+                raise RemoteExecutorCancelledError(job_id)
+
+            # queued / running — check timeout and retry
+            if asyncio.get_event_loop().time() >= deadline:
+                raise RemoteExecutorPollingTimeoutError(
+                    job_id, self.settings.poll_timeout_sec, job_url,
+                )
+
+            await asyncio.sleep(self.settings.poll_interval_sec)
+
 
 # --------------------------------------------------------------- fake worker
 
@@ -502,6 +629,10 @@ class FakeRemoteWorker:
     - ``"async_error"`` — queued → error
     - ``"async_timeout"`` — always returns running (never completes)
 
+    **Cancel mode:**
+
+    - ``"async_cancel"`` — queued → running → cancelled (via POST /v1/jobs/{job_id}/cancel)
+
     **Artifact modes:**
 
     - ``"artifact_url"`` — completed with artifact_url
@@ -528,6 +659,8 @@ class FakeRemoteWorker:
         self.poll_count: dict[str, int] = {}
         self.job_requests: list[dict[str, Any]] = []
         self.artifacts: dict[str, bytes] = {}
+        self.cancel_requests: list[dict[str, Any]] = []
+        self.cancelled_jobs: set[str] = set()
         self._artifact_tmp_dir: str | None = None
         self._server_port: int = 0
 
@@ -604,6 +737,7 @@ class FakeRemoteWorker:
         if self.mode in (
             "async_success", "async_error", "async_timeout",
             "async_artifact_url", "async_artifact_path",
+            "async_cancel",
         ):
             import uuid
             job_id = f"fake_job_{uuid.uuid4().hex[:8]}"
@@ -770,6 +904,18 @@ class FakeRemoteWorker:
                 },
             })
 
+        if self.mode == "async_cancel":
+            # Returns cancelled if cancel was requested, otherwise running.
+            if job_id in self.cancelled_jobs:
+                return aiohttp.web.json_response({
+                    "status": "cancelled",
+                    "job_id": job_id,
+                })
+            return aiohttp.web.json_response({
+                "status": "running",
+                "job_id": job_id,
+            })
+
         if self.mode == "async_artifact_url":
             # First poll returns running, second returns completed with artifact_url.
             if poll_n < 2:
@@ -842,10 +988,31 @@ class FakeRemoteWorker:
             content_type="image/png",
         )
 
+    # ---- POST /v1/jobs/{job_id}/cancel ----
+
+    async def handle_cancel_job(self, request: aiohttp.web.Request) -> aiohttp.web.Response:
+        job_id = request.match_info["job_id"]
+        body = await request.json() if request.content_length else {}
+        self.cancel_requests.append({"job_id": job_id, **(body or {})})
+
+        job = self.jobs.get(job_id)
+        if job is None:
+            return aiohttp.web.json_response(
+                {"status": "error", "error": f"job {job_id!r} not found"},
+                status=404,
+            )
+
+        self.cancelled_jobs.add(job_id)
+        return aiohttp.web.json_response({
+            "status": "cancelled",
+            "job_id": job_id,
+        })
+
     def app(self) -> aiohttp.web.Application:
         app = aiohttp.web.Application()
         app.router.add_post("/v1/generate-panel", self.handle_generate)
         app.router.add_get("/v1/jobs/{job_id}", self.handle_get_job)
+        app.router.add_post("/v1/jobs/{job_id}/cancel", self.handle_cancel_job)
         app.router.add_get("/artifacts/{filename}", self.handle_get_artifact)
         return app
 
@@ -862,6 +1029,7 @@ __all__ = [
     "RemoteExecutorImageError",
     "RemoteExecutorPollingTimeoutError",
     "RemoteExecutorJobError",
+    "RemoteExecutorCancelledError",
     "RemoteWorkerSettings",
     "RemoteGenerateRequest",
     "RemoteGenerateResponse",

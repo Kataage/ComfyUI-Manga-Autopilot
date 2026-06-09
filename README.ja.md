@@ -233,6 +233,10 @@ pytest -m release_gate -q
   リトライプロンプト (spec 17-18)
 - **Autopilot ステートマシン** - 一時停止 / 再開 / キャンセル、
   リカバリ戦略 (spec 7)
+- **キャンセル API 基盤** - `POST /autopilot/cancel` で `cancel.json`
+  マーカーを保存; `GenerationLoop` が候補間でマーカーを確認;
+  `RemoteHTTPExecutor.cancel()` でリモートジョブにキャンセル送信;
+  キャンセルされたジョブは `RemoteExecutorCancelledError` を送出
 - **書き出し** - PNG ページ、Webtoon スライス、PDF (A4/B5/Kindle/カスタム)、
   Zip 形式のプロジェクトバンドル
 - **外部 GPU ブリッジ** (Modal スタイル worker) - タイムアウトでローカル
