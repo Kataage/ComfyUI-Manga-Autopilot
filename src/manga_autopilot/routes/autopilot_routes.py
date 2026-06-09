@@ -978,6 +978,75 @@ async def restart(request: web.Request) -> web.Response:
     }, status=202)
 
 
+CLEANUP_ROUTE = "/manga_autopilot/api/projects/{project_id}/runs/cleanup"
+
+
+async def cleanup_runs(request: web.Request) -> web.Response:
+    """Dry-run or execute cleanup of old per-run artifact directories.
+
+    Default is dry_run=true.  Only deletes when dry_run=false.
+    Latest run and running runs are protected by default.
+    """
+    project_id = request.match_info["project_id"]
+    storage_root = _storage_root(request.app)
+    if storage_root is None:
+        raise web.HTTPInternalServerError(text="manga_storage_root is not configured")
+
+    paths = ensure_project_paths(storage_root, project_id)
+    if not paths.project_json.exists():
+        raise web.HTTPNotFound(text=f"project {project_id!r} not found")
+
+    try:
+        body = await _payload(request)
+    except web.HTTPBadRequest:
+        body = {}
+
+    from manga_autopilot.services.run_cleanup import (
+        RunCleanupPlan,
+        RunCleanupPolicy,
+        build_run_cleanup_plan,
+        execute_run_cleanup_plan,
+    )
+
+    policy = RunCleanupPolicy(
+        keep_latest=True,
+        keep_last=int(body.get("keep_last", 5)),
+        delete_completed=bool(body.get("delete_completed", True)),
+        delete_failed=bool(body.get("delete_failed", True)),
+        delete_cancelled=bool(body.get("delete_cancelled", True)),
+        delete_running=bool(body.get("delete_running", False)),
+        dry_run=bool(body.get("dry_run", True)),
+    )
+
+    plan = build_run_cleanup_plan(paths.root, policy)
+    plan = RunCleanupPlan(
+        project_id=project_id,
+        dry_run=plan.dry_run,
+        protected_run_ids=plan.protected_run_ids,
+        candidates=plan.candidates,
+    )
+
+    result = execute_run_cleanup_plan(plan)
+
+    return web.json_response({
+        "project_id": project_id,
+        "dry_run": result.dry_run,
+        "protected_run_ids": plan.protected_run_ids,
+        "candidates": [
+            {
+                "run_id": c.run_id,
+                "status": c.status,
+                "path": str(Path(c.path).relative_to(paths.root)) if Path(c.path).is_relative_to(paths.root) else c.path,
+                "reason": c.reason,
+            }
+            for c in plan.candidates
+        ],
+        "deleted_run_ids": result.deleted_run_ids,
+        "skipped_run_ids": result.skipped_run_ids,
+        "errors": result.errors,
+    })
+
+
 def register(router: Any) -> None:
     if hasattr(router, "router"):
         router = router.router
@@ -987,6 +1056,7 @@ def register(router: Any) -> None:
     router.add_post(ROUTE_PREFIX + "/cancel", cancel)
     router.add_post(ROUTE_PREFIX + "/restart", restart)
     router.add_get(ROUTE_PREFIX + "/status", status)
+    router.add_post(CLEANUP_ROUTE, cleanup_runs)
 
 
 __all__ = ["register", "ROUTE_PREFIX"]

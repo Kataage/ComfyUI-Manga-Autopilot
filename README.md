@@ -256,6 +256,9 @@ for the full acceptance matrix.
   jobs, assets, exports); `run.json` includes `artifacts` summary;
   `manifest.json` includes `artifacts_root`; project-root latest layout
   preserved for API compatibility
+- **Run cleanup foundation** — explicit cleanup API for old per-run
+  artifacts; dry-run by default; protects latest and running runs;
+  configurable retention (keep_last); no automatic background cleanup
 - **Export** — PNG pages, webtoon slices, PDF (A4/B5/Kindle/custom),
   zip-based project bundles
 - **External GPU bridge** (Modal-style worker) — local ComfyUI fallback

@@ -202,6 +202,7 @@ The following items are **out of scope** for v1.0 and remain in the Planned sect
 | run_id in remote payload metadata | Done | `test_remote_executor_payload_contains_run_id_metadata` | Yes | metadata.run_id in PanelExecutionRequest |
 | restart source link | Done | `test_cancelled_restart_creates_new_run_and_links_previous_run` | Yes | source.restart_of_run_id in run.json |
 | Per-run artifact directories | Done | `test_completed_run_artifacts_are_mirrored_to_run_directory`, `test_restart_creates_separate_run_artifact_directories` | Yes | Root latest layout preserved |
+| Run cleanup foundation | Done | `test_cleanup_api_returns_dry_run_plan`, `test_cleanup_api_never_deletes_latest_run` | Yes | Explicit cleanup only; no background auto-cleanup |
 
 ## How to Use
 
