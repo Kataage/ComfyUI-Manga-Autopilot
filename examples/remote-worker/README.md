@@ -199,6 +199,45 @@ The executor will raise `RemoteExecutorResponseError`.
 Alternatively, return HTTP 500 for server-side errors.  The executor
 will raise `RemoteExecutorHTTPError`.
 
+## Cancel Endpoint
+
+```
+POST /v1/jobs/{job_id}/cancel
+```
+
+Tells the worker to stop processing the given job.  The worker should
+transition the job to `cancelled` status.
+
+### Cancel Request
+
+```json
+{
+  "reason": "user requested cancellation"
+}
+```
+
+### Cancel Response
+
+```json
+{
+  "status": "cancelled",
+  "job_id": "job_abc123"
+}
+```
+
+### Polling after cancel
+
+When a job has been cancelled, the polling endpoint returns:
+
+```json
+{
+  "status": "cancelled",
+  "job_id": "job_abc123"
+}
+```
+
+The executor will raise `RemoteExecutorCancelledError`.
+
 ## Authentication
 
 If `api_key` is set in `RemoteWorkerSettings`, the executor sends:
@@ -220,14 +259,15 @@ Validate this header in your worker if needed.
 
 ## Notes
 
-- `page_id` is empty string in v0.1 — the `GenerationExecutor` protocol
-  does not carry page context.  Future versions will add formal `page_id`.
+- `page_id` is non-empty in the request payload (e.g. `page_0001`).
 - `image_base64` is the MVP format.  For large images, prefer
   `artifact_url` (S3 / R2 / Modal Volume / HTTP file server).
 - `artifact_path` is for local/test workers only; not recommended for
   production remote workers.
 - No Modal SDK or RunPod integration is required for this contract.
 - Real S3 / R2 / Modal Volume integration is not yet implemented.
+- Cancel is a foundation; real Modal/RunPod cancel is not yet implemented.
+- Partial assets may remain after cancellation.
 
 ## See also
 

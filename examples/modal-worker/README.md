@@ -53,3 +53,4 @@ See `examples/remote-worker/README.md` for the full contract.
 - Set appropriate timeouts and GPU type
 - Test with real ComfyUI workflow on Modal GPU
 - Use `artifact_url` or Modal Volume path for image delivery
+- Implement Modal Function call cancel / queue cancel for long-running jobs

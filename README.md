@@ -239,6 +239,10 @@ for the full acceptance matrix.
   retry prompts (spec §17-18)
 - **Autopilot state machine** — pause / resume / cancel, recovery
   strategies (spec §7)
+- **Cancel API foundation** — `POST /autopilot/cancel` writes
+  `cancel.json` marker; `GenerationLoop` checks marker between
+  candidates; `RemoteHTTPExecutor.cancel()` sends cancel to remote
+  worker; `RemoteExecutorCancelledError` on cancelled jobs
 - **Export** — PNG pages, webtoon slices, PDF (A4/B5/Kindle/custom),
   zip-based project bundles
 - **External GPU bridge** (Modal-style worker) — local ComfyUI fallback

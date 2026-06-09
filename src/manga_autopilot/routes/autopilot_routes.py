@@ -294,7 +294,18 @@ def _make_generate_panels(
     paths = ensure_project_paths(storage_root, project_id)
     project_root = paths.root
     workflow_id = _default_workflow_id(app)
-    cancel_check: Callable[[], bool] | None = None
+    cancel_json_path = paths.cancel_json
+
+    def _cancel_check() -> bool:
+        """Check if a cancel marker exists on disk."""
+        if cancel_json_path.exists():
+            return True
+        # Also check in-memory cancel event from controller
+        ctrl = _controller(app)
+        run_data = ctrl.runs.get(project_id)
+        if run_data is not None and run_data.cancel_event is not None:
+            return run_data.cancel_event.is_set()
+        return False
 
     async def _hook(run: AutopilotRun) -> list[dict[str, Any]]:
         records = _read_panel_records(project_root)
@@ -343,7 +354,7 @@ def _make_generate_panels(
                     workflow_id=str(run.input.get("workflow_id") or workflow_id),
                     executor=executor,
                     project_id=project_id,
-                    cancel_check=cancel_check,
+                    cancel_check=_cancel_check,
                 )
                 if outcome.selected_image_path is not None:
                     record.image_path = str(outcome.selected_image_path)
@@ -830,13 +841,38 @@ async def resume(request: web.Request) -> web.Response:
 async def cancel(request: web.Request) -> web.Response:
     project_id = request.match_info["project_id"]
     ctrl = _controller(request.app)
+    storage_root = _storage_root(request.app)
     try:
-        run = ctrl.cancel(project_id)
+        body = await _payload(request)
+    except web.HTTPBadRequest:
+        body = {}
+    reason = body.get("reason", "user_cancelled") if isinstance(body, dict) else "user_cancelled"
+
+    try:
+        run = ctrl.cancel(project_id, reason=reason)
     except InvalidTransitionError as exc:
         raise web.HTTPConflict(text=str(exc)) from exc
     except KeyError as exc:
         raise web.HTTPNotFound(text=str(exc)) from exc
-    return web.json_response(run.to_status())
+
+    # Write cancel marker to disk so GenerationLoop can detect it
+    if storage_root is not None:
+        import json as _json
+        from datetime import datetime, timezone
+
+        from manga_autopilot.storage.paths import ensure_project_paths
+
+        paths = ensure_project_paths(storage_root, project_id)
+        cancel_marker = {
+            "requested": True,
+            "requested_at": datetime.now(timezone.utc).isoformat(),
+            "reason": reason,
+        }
+        paths.cancel_json.write_text(_json.dumps(cancel_marker, indent=2))
+
+    status_data = run.to_status()
+    status_data["cancel_marker"] = {"requested": True, "reason": reason}
+    return web.json_response(status_data)
 
 
 async def status(request: web.Request) -> web.Response:

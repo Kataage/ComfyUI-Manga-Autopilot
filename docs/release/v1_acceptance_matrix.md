@@ -170,6 +170,17 @@ The following items are **out of scope** for v1.0 and remain in the Planned sect
 | Remote payload includes all IDs | Done | `test_remote_executor_payload_includes_project_page_panel_and_candidate_ids` | Yes | page_id is non-empty |
 | RemoteGenerateRequest includes candidate_id | Done | `test_remote_generate_request_includes_candidate_id` | Yes | candidate_id in to_dict() |
 
+### Cancel API Foundation
+
+| Area | Status | Test | CI | Notes |
+|------|--------|------|----|-------|
+| Cancel endpoint writes cancel.json marker | Done | `test_cancel_endpoint_writes_cancel_marker` | Yes | cancel.json saved to project root |
+| GenerationLoop stops when cancel marker exists | Done | `test_cancel_marker_detected_by_generation_loop` | Yes | Job status = CANCELLED |
+| GenerationLoop completes without cancel marker | Done | `test_generation_loop_completes_without_cancel_marker` | Yes | No regression |
+| RemoteHTTPExecutor.cancel calls POST /v1/jobs/{job_id}/cancel | Done | `test_remote_executor_cancel_calls_endpoint` | Yes | FakeRemoteWorker records cancel request |
+| RemoteHTTPExecutor raises RemoteExecutorCancelledError | Done | `test_remote_executor_raises_when_polled_job_is_cancelled` | Yes | Polling detects cancelled status |
+| Autopilot cancel during remote polling | Done | `test_autopilot_cancel_during_remote_polling` | Yes | Fake remote worker only; real Modal/RunPod cancel not implemented |
+
 ## How to Use
 
 ### Before every release
