@@ -327,6 +327,18 @@ pytest -m release_gate -q
 
 CI ではインメモリストレージを持つ `FakeRemoteWorker` を使用しています。
 
+## エグゼキュータ インターフェース
+
+エグゼキュータ インターフェースは `PanelExecutionRequest` を使用して、
+構造化されたパネル実行コンテキストを渡します:
+
+- `project_id`, `page_id`, `panel_id`, `candidate_id`
+- `prompt`, `workflow_id`, `seed`, `attempt_index`
+- `width`, `height`, `output_filename`, `metadata`
+
+これにより、Modal / S3 / R2 連携のための堅牢なアーティファクト命名が可能になります。
+リモートワーカーは project/page/panel/candidate のコンテキストを受け取ります。
+
 ## Modal ワーカー MVP
 
 実験的な Modal ワーカーの例を `examples/modal-worker/` に用意しています。

@@ -17,7 +17,10 @@ from manga_autopilot.models.panel import (
     write_panel_records,
 )
 from manga_autopilot.routes import register_all
-from manga_autopilot.services.generation_job import GenerationExecutorResult
+from manga_autopilot.services.generation_job import (
+    GenerationExecutorResult,
+    PanelExecutionRequest,
+)
 
 
 # --------------------------------------------------------- helpers
@@ -50,22 +53,16 @@ def _seed_panel(tmp_path: Path, project_id: str = "proj_test_001") -> PanelRecor
 
 class FakeExecutor:
     def __init__(self) -> None:
-        self.calls: list[dict[str, Any]] = []
+        self.calls: list[Any] = []
 
-    async def submit(self, *, prompt, workflow_id, seed, candidate_id):
-        self.calls.append(
-            {
-                "candidate_id": candidate_id,
-                "workflow_id": workflow_id,
-                "seed": seed,
-            }
-        )
-        image = Image.new("RGB", (prompt.width, prompt.height), (seed % 256, 64, 200))
+    async def submit(self, request: PanelExecutionRequest):
+        self.calls.append(request)
+        image = Image.new("RGB", (request.effective_width, request.effective_height), (request.seed % 256, 64, 200))
         return GenerationExecutorResult(
-            candidate_id=candidate_id,
-            prompt_id=f"prompt_{candidate_id}",
+            candidate_id=request.candidate_id,
+            prompt_id=f"prompt_{request.candidate_id}",
             image=image,
-            workflow_id=workflow_id,
+            workflow_id=request.workflow_id,
         )
 
 
@@ -100,7 +97,7 @@ async def test_generate_panel_persists_image_and_job(client) -> None:
 
     # The executor was called exactly once for a single candidate.
     assert len(executor.calls) == 1
-    assert executor.calls[0]["workflow_id"] == "anime_t2i_default"
+    assert executor.calls[0].workflow_id == "anime_t2i_default"
 
     # The job was persisted to the jobs/ dir.
     project_root = tmp_path / "projects" / "proj_test_001"
@@ -155,7 +152,7 @@ async def test_regenerate_panel_reuses_overrides(client) -> None:
     body = await resp.json()
     assert body["job"]["status"] in {"completed", "failed"}
     # The executor was called with the requested seed.
-    assert executor.calls and executor.calls[0]["seed"] == 999
+    assert executor.calls and executor.calls[0].seed == 999
 
 
 async def test_repair_panel_uses_more_retries(client) -> None:

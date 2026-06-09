@@ -13,6 +13,7 @@ from typing import Any
 import pytest
 from aiohttp import web
 
+from manga_autopilot.services.generation_job import PanelExecutionRequest
 from manga_autopilot.services.llm_provider import LLMProvider, LLMSettings
 from manga_autopilot.services.prompt_builder import PromptSpec
 from manga_autopilot.services.remote_executor import (
@@ -160,6 +161,20 @@ def _make_prompt(**overrides: Any) -> PromptSpec:
     return PromptSpec(**defaults)
 
 
+def _make_request(**overrides: Any) -> PanelExecutionRequest:
+    defaults = dict(
+        project_id="proj_001",
+        page_id="page_0001",
+        panel_id="panel_001",
+        candidate_id="panel_001_c00",
+        prompt=_make_prompt(),
+        workflow_id="anime_t2i_default",
+        seed=42,
+    )
+    defaults.update(overrides)
+    return PanelExecutionRequest(**defaults)
+
+
 # ---------------------------------------------------------------- artifact_url tests
 
 async def test_remote_executor_downloads_artifact_url() -> None:
@@ -168,13 +183,12 @@ async def test_remote_executor_downloads_artifact_url() -> None:
     runner, port = await _start_worker(worker)
     try:
         settings = RemoteWorkerSettings(base_url=f"http://127.0.0.1:{port}")
-        executor = RemoteHTTPExecutor(settings=settings, project_id="proj_001")
-        result = await executor.submit(
+        executor = RemoteHTTPExecutor(settings=settings)
+        result = await executor.submit(_make_request(
             prompt=_make_prompt(seed=55),
-            workflow_id="anime_t2i_default",
             seed=55,
             candidate_id="panel_001_c00",
-        )
+        ))
         assert result.image is not None
         assert result.image.size == (64, 64)
         assert result.candidate_id == "panel_001_c00"
@@ -190,13 +204,12 @@ async def test_remote_executor_reads_artifact_path() -> None:
     runner, port = await _start_worker(worker)
     try:
         settings = RemoteWorkerSettings(base_url=f"http://127.0.0.1:{port}")
-        executor = RemoteHTTPExecutor(settings=settings, project_id="proj_001")
-        result = await executor.submit(
+        executor = RemoteHTTPExecutor(settings=settings)
+        result = await executor.submit(_make_request(
             prompt=_make_prompt(seed=66),
-            workflow_id="anime_t2i_default",
             seed=66,
             candidate_id="panel_002_c00",
-        )
+        ))
         assert result.image is not None
         assert result.image.size == (64, 64)
         assert result.candidate_id == "panel_002_c00"
@@ -215,13 +228,12 @@ async def test_remote_executor_polls_until_async_artifact_url_completed() -> Non
             poll_interval_sec=0.01,
             poll_timeout_sec=5.0,
         )
-        executor = RemoteHTTPExecutor(settings=settings, project_id="proj_001")
-        result = await executor.submit(
+        executor = RemoteHTTPExecutor(settings=settings)
+        result = await executor.submit(_make_request(
             prompt=_make_prompt(seed=77),
-            workflow_id="anime_t2i_default",
             seed=77,
             candidate_id="panel_003_c00",
-        )
+        ))
         assert result.image is not None
         assert result.image.size == (64, 64)
         assert result.candidate_id == "panel_003_c00"
@@ -238,14 +250,13 @@ async def test_remote_executor_raises_on_artifact_url_404() -> None:
     runner, port = await _start_worker(worker)
     try:
         settings = RemoteWorkerSettings(base_url=f"http://127.0.0.1:{port}")
-        executor = RemoteHTTPExecutor(settings=settings, project_id="proj_001")
+        executor = RemoteHTTPExecutor(settings=settings)
         with pytest.raises(Exception, match="HTTP 404"):
-            await executor.submit(
+            await executor.submit(_make_request(
                 prompt=_make_prompt(seed=88),
-                workflow_id="anime_t2i_default",
                 seed=88,
                 candidate_id="panel_004_c00",
-            )
+            ))
         assert len(worker.requests) == 1
     finally:
         await runner.cleanup()
@@ -257,14 +268,13 @@ async def test_remote_executor_raises_on_missing_artifact_path() -> None:
     runner, port = await _start_worker(worker)
     try:
         settings = RemoteWorkerSettings(base_url=f"http://127.0.0.1:{port}")
-        executor = RemoteHTTPExecutor(settings=settings, project_id="proj_001")
+        executor = RemoteHTTPExecutor(settings=settings)
         with pytest.raises(RemoteExecutorImageError, match="does not exist"):
-            await executor.submit(
+            await executor.submit(_make_request(
                 prompt=_make_prompt(seed=99),
-                workflow_id="anime_t2i_default",
                 seed=99,
                 candidate_id="panel_005_c00",
-            )
+            ))
         assert len(worker.requests) == 1
     finally:
         await runner.cleanup()

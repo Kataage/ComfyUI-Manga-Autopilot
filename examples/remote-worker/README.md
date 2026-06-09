@@ -26,30 +26,34 @@ POST /v1/generate-panel
 ```json
 {
   "project_id": "project-xxx",
-  "page_id": "",
-  "panel_id": "panel_001_c00",
+  "page_id": "page_0001",
+  "panel_id": "panel_001",
+  "candidate_id": "panel_001_c00",
   "prompt": "hero standing in a city",
   "negative_prompt": "low quality, blurry",
   "seed": 12345,
   "width": 1024,
   "height": 1024,
   "workflow_id": "anime_t2i_default",
-  "metadata": {}
+  "metadata": {
+    "attempt_index": 0
+  }
 }
 ```
 
 | Field | Type | Required | Notes |
 |-------|------|----------|-------|
 | `project_id` | string | yes | Project identifier |
-| `page_id` | string | no | Page identifier (empty in v0.1) |
-| `panel_id` | string | yes | Panel + candidate identifier |
+| `page_id` | string | yes | Page identifier (e.g. `page_0001`) |
+| `panel_id` | string | yes | Panel identifier (e.g. `panel_001`) |
+| `candidate_id` | string | yes | Candidate identifier (e.g. `panel_001_c00`) |
 | `prompt` | string | yes | Positive prompt text |
 | `negative_prompt` | string | no | Negative prompt text |
 | `seed` | integer | yes | RNG seed |
 | `width` | integer | yes | Image width in pixels |
 | `height` | integer | yes | Image height in pixels |
 | `workflow_id` | string | no | Workflow registry identifier |
-| `metadata` | object | no | Arbitrary metadata |
+| `metadata` | object | no | Arbitrary metadata (includes `attempt_index`) |
 
 ## Sync Response
 

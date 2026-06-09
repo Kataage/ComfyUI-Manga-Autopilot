@@ -16,7 +16,11 @@ from typing import Any
 from PIL import Image
 
 from manga_autopilot.models.workflow import validate_workflow_payload
-from manga_autopilot.services.generation_job import ComfyExecutor, GenerationExecutorResult
+from manga_autopilot.services.generation_job import (
+    ComfyExecutor,
+    GenerationExecutorResult,
+    PanelExecutionRequest,
+)
 from manga_autopilot.services.prompt_builder import PromptSpec
 from manga_autopilot.services.workflow_registry import WorkflowRegistry
 
@@ -135,12 +139,15 @@ async def test_example_registry_comfy_executor_e2e(tmp_path: Path) -> None:
         cfg=7.0,
     )
 
-    outcome = await executor.submit(
+    outcome = await executor.submit(PanelExecutionRequest(
+        project_id="proj_001",
+        page_id="page_0001",
+        panel_id="panel_001",
+        candidate_id="cand_001",
         prompt=prompt,
         workflow_id="anime_t2i_default",
         seed=42,
-        candidate_id="cand_001",
-    )
+    ))
     assert isinstance(outcome, GenerationExecutorResult)
     assert outcome.candidate_id == "cand_001"
     assert outcome.image is not None

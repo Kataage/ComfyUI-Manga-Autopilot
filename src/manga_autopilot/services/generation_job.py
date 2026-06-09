@@ -55,6 +55,37 @@ JOBS_SUBDIR = "jobs"
 PANELS_SUBDIR = "panels"
 
 
+@dataclass(frozen=True)
+class PanelExecutionRequest:
+    """Structured context passed to a :class:`GenerationExecutor`.
+
+    Replaces the individual ``prompt``, ``workflow_id``, ``seed``,
+    ``candidate_id`` parameters with a single request object that
+    carries project / page / panel / candidate context.
+    """
+
+    project_id: str
+    page_id: str
+    panel_id: str
+    candidate_id: str
+    prompt: PromptSpec
+    workflow_id: str
+    seed: int
+    attempt_index: int = 0
+    width: int | None = None
+    height: int | None = None
+    output_filename: str | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def effective_width(self) -> int:
+        return self.width or self.prompt.width
+
+    @property
+    def effective_height(self) -> int:
+        return self.height or self.prompt.height
+
+
 class GenerationExecutor(Protocol):
     """Pluggable executor for ``GenerationLoop``.
 
@@ -65,11 +96,7 @@ class GenerationExecutor(Protocol):
 
     async def submit(
         self,
-        *,
-        prompt: PromptSpec,
-        workflow_id: str,
-        seed: int,
-        candidate_id: str,
+        request: PanelExecutionRequest,
     ) -> GenerationExecutorResult:
         """Render one candidate.  Raise to signal a hard failure."""
 
@@ -219,6 +246,8 @@ class GenerationLoop:
             },
             max_retries=self.config.max_retries,
         )
+        page_id = f"page_{page_number:04d}"
+        panel_id = f"panel_{panel.panel_number:03d}"
         # PENDING is the implicit default; advance to VALIDATING while we
         # build the candidate list so callers can observe a real transition.
         self._set_status(job, JobStatus.VALIDATING)
@@ -255,12 +284,19 @@ class GenerationLoop:
                 round_results: list[QualityResult] = []
                 for cand in candidates:
                     self._set_status(job, JobStatus.FETCHING_RESULT)
-                    result = await executor.submit(
+                    request = PanelExecutionRequest(
+                        project_id=project_id,
+                        page_id=page_id,
+                        panel_id=panel_id,
+                        candidate_id=cand.candidate_id,
                         prompt=current_prompt,
                         workflow_id=workflow_id,
                         seed=cand.seed,
-                        candidate_id=cand.candidate_id,
+                        attempt_index=attempt,
+                        width=cand.width,
+                        height=cand.height,
                     )
+                    result = await executor.submit(request)
                     if cancel_check is not None and cancel_check():
                         job.status = JobStatus.CANCELLED
                         job.error = "cancelled"
@@ -403,11 +439,7 @@ class ComfyExecutor:
 
     async def submit(
         self,
-        *,
-        prompt: PromptSpec,
-        workflow_id: str,
-        seed: int,
-        candidate_id: str,
+        request: PanelExecutionRequest,
     ) -> GenerationExecutorResult:
         import asyncio
         import io
@@ -415,7 +447,7 @@ class ComfyExecutor:
         from manga_autopilot.services.comfy_client import ComfyClient
         from manga_autopilot.services.workflow_executor import apply_overrides
 
-        wf_id = workflow_id or self.workflow_id
+        wf_id = request.workflow_id or self.workflow_id
         workflow = self.registry.get(wf_id)
         if workflow.api_graph is None:
             raise RuntimeError(
@@ -425,13 +457,13 @@ class ComfyExecutor:
             workflow.api_graph,
             workflow.bindings,
             {
-                "positive_prompt": prompt.positive,
-                "negative_prompt": prompt.negative or "",
-                "seed": seed,
-                "width": prompt.width,
-                "height": prompt.height,
-                "steps": prompt.steps,
-                "cfg": prompt.cfg,
+                "positive_prompt": request.prompt.positive,
+                "negative_prompt": request.prompt.negative or "",
+                "seed": request.seed,
+                "width": request.effective_width,
+                "height": request.effective_height,
+                "steps": request.prompt.steps,
+                "cfg": request.prompt.cfg,
             },
         )
         prompt_id = await self.client.submit_workflow(graph)
@@ -460,7 +492,7 @@ class ComfyExecutor:
         image = Image.open(io.BytesIO(raw))
         image.load()
         return GenerationExecutorResult(
-            candidate_id=candidate_id,
+            candidate_id=request.candidate_id,
             prompt_id=prompt_id,
             image=image,
             workflow_id=workflow.workflow_id,
@@ -476,4 +508,5 @@ __all__ = [
     "GenerationOutcome",
     "JOBS_SUBDIR",
     "PANELS_SUBDIR",
+    "PanelExecutionRequest",
 ]
