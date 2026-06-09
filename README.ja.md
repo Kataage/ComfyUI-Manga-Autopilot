@@ -249,7 +249,10 @@ pytest -m release_gate -q
   プロジェクトルート出力を `runs/{run_id}/` にミラー (JSON、jobs、
   assets、exports); `run.json` に `artifacts` サマリー;
   `manifest.json` に `artifacts_root`; API互換性のため
-  プロジェクトルート最新レイアウトを維持
+   プロジェクトルート最新レイアウトを維持
+- **ランクリーンアップ基盤** - 古いper-run artifactsの明示的な
+  cleanup API; デフォルトでdry-run; latestとrunning runを保護;
+  保持件数設定 (keep_last); 自動バックグラウンド削除は未実装
 - **書き出し** - PNG ページ、Webtoon スライス、PDF (A4/B5/Kindle/カスタム)、
   Zip 形式のプロジェクトバンドル
 - **外部 GPU ブリッジ** (Modal スタイル worker) - タイムアウトでローカル
