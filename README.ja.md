@@ -245,6 +245,11 @@ pytest -m release_gate -q
   `generation_log.json`、`manifest.json`、リモートworkerペイロードに
   `run_id` を含む; restart時は `source.restart_of_run_id` で
   前回実行をリンク
+- **ランごとの成果物ディレクトリ** - 完了/失敗/キャンセル時に
+  プロジェクトルート出力を `runs/{run_id}/` にミラー (JSON、jobs、
+  assets、exports); `run.json` に `artifacts` サマリー;
+  `manifest.json` に `artifacts_root`; API互換性のため
+  プロジェクトルート最新レイアウトを維持
 - **書き出し** - PNG ページ、Webtoon スライス、PDF (A4/B5/Kindle/カスタム)、
   Zip 形式のプロジェクトバンドル
 - **外部 GPU ブリッジ** (Modal スタイル worker) - タイムアウトでローカル

@@ -251,6 +251,11 @@ for the full acceptance matrix.
   `run_id` in `generation_log.json`, `manifest.json`, and remote
   worker payload metadata; restart links previous run via
   `source.restart_of_run_id`
+- **Per-run artifact directories** — on completion/failure/cancel,
+  project-root outputs are mirrored into `runs/{run_id}/` (JSON files,
+  jobs, assets, exports); `run.json` includes `artifacts` summary;
+  `manifest.json` includes `artifacts_root`; project-root latest layout
+  preserved for API compatibility
 - **Export** — PNG pages, webtoon slices, PDF (A4/B5/Kindle/custom),
   zip-based project bundles
 - **External GPU bridge** (Modal-style worker) — local ComfyUI fallback

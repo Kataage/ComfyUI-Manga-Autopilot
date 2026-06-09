@@ -864,6 +864,11 @@ async def cancel(request: web.Request) -> web.Response:
         import json as _json
         from datetime import datetime, timezone
 
+        from manga_autopilot.services.run_artifacts import (
+            inject_artifacts_root_to_manifest,
+            mirror_latest_artifacts_to_run,
+            read_run_artifacts_summary,
+        )
         from manga_autopilot.storage.paths import ensure_project_paths
 
         paths = ensure_project_paths(storage_root, project_id)
@@ -874,7 +879,16 @@ async def cancel(request: web.Request) -> web.Response:
         }
         paths.cancel_json.write_text(_json.dumps(cancel_marker, indent=2))
         try:
-            save_run_metadata(paths.root, run)
+            save_run_metadata(paths.root, run, update_latest=False)
+        except Exception:  # noqa: BLE001
+            pass
+
+        # Mirror partial artifacts into run directory on cancel.
+        try:
+            mirror_latest_artifacts_to_run(paths.root, run.run_id)
+            artifacts_summary = read_run_artifacts_summary(paths.root, run.run_id)
+            save_run_metadata(paths.root, run, artifacts=artifacts_summary, update_latest=False)
+            inject_artifacts_root_to_manifest(paths.root, run.run_id)
         except Exception:  # noqa: BLE001
             pass
 

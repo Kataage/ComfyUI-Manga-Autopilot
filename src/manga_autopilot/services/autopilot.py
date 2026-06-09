@@ -44,11 +44,27 @@ def generate_run_id() -> str:
     return f"run_{now.strftime('%Y%m%d_%H%M%S')}_{short}"
 
 
-def save_run_metadata(project_root: Path, run: AutopilotRun) -> None:
+def save_run_metadata(
+    project_root: Path,
+    run: AutopilotRun,
+    *,
+    artifacts: dict[str, str | None] | None = None,
+    update_latest: bool = True,
+) -> None:
     """Persist run.json and latest_run_id.txt for a run.
 
     Call this after starting a run and again when it finishes to update
     the status fields.
+
+    Parameters
+    ----------
+    artifacts:
+        Optional artefact summary (logical name → relative path) to
+        include in run.json under the ``artifacts`` key.
+    update_latest:
+        When ``True`` (default), write the run id to ``latest_run_id.txt``.
+        Set to ``False`` when calling from ``_finalize`` to avoid
+        overwriting a newer run's pointer after restart.
     """
     project_root = Path(project_root)
     runs_dir = project_root / "runs"
@@ -56,7 +72,7 @@ def save_run_metadata(project_root: Path, run: AutopilotRun) -> None:
     run_dir.mkdir(parents=True, exist_ok=True)
 
     status_value = run.machine.state.value
-    payload = {
+    payload: dict[str, Any] = {
         "run_id": run.run_id,
         "project_id": run.project_id,
         "kind": run.source.get("restart_of_run_id") and "restart" or "start",
@@ -72,12 +88,15 @@ def save_run_metadata(project_root: Path, run: AutopilotRun) -> None:
         payload["cancelled_at"] = (run.finished_at or run._now()).isoformat()
     elif status_value.startswith("FAILED"):
         payload["failed_at"] = (run.finished_at or run._now()).isoformat()
+    if artifacts is not None:
+        payload["artifacts"] = artifacts
 
     run_file = run_dir / "run.json"
     run_file.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
-    latest_file = project_root / "latest_run_id.txt"
-    latest_file.write_text(run.run_id, encoding="utf-8")
+    if update_latest:
+        latest_file = project_root / "latest_run_id.txt"
+        latest_file.write_text(run.run_id, encoding="utf-8")
 
 
 # ----------------------------------------------------------------- states
@@ -890,9 +909,26 @@ class Orchestrator:
             except Exception as exc:  # pragma: no cover - best-effort
                 log.warning("could not write completion report: %s", exc)
             try:
-                save_run_metadata(self.project_root, run)
+                save_run_metadata(self.project_root, run, update_latest=False)
             except Exception as exc:  # pragma: no cover - best-effort
                 log.warning("could not save run metadata: %s", exc)
+
+            # Mirror project-root outputs into per-run directory.
+            try:
+                from manga_autopilot.services.run_artifacts import (
+                    inject_artifacts_root_to_manifest,
+                    mirror_latest_artifacts_to_run,
+                    read_run_artifacts_summary,
+                )
+
+                mirror_latest_artifacts_to_run(self.project_root, run.run_id)
+                artifacts_summary = read_run_artifacts_summary(self.project_root, run.run_id)
+                save_run_metadata(self.project_root, run, artifacts=artifacts_summary, update_latest=False)
+                inject_artifacts_root_to_manifest(self.project_root, run.run_id)
+                run.store("artifacts", artifacts_summary)
+            except Exception as exc:  # pragma: no cover - best-effort
+                log.warning("could not mirror artifacts to run directory: %s", exc)
+
         if not run.finished_at:
             run.finish()
         run.log_event("pipeline_finished", {"state": run.machine.state.value})

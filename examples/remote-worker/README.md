@@ -265,6 +265,8 @@ Validate this header in your worker if needed.
   `artifact_url` (S3 / R2 / Modal Volume / HTTP file server).
 - `artifact_path` is for local/test workers only; not recommended for
   production remote workers.
+- `run_id` can be used for artifact naming (e.g. `{run_id}/{page_id}/{candidate_id}.png`).
+- Per-run artifacts are mirrored under `runs/{run_id}/` after completion.
 - No Modal SDK or RunPod integration is required for this contract.
 - Real S3 / R2 / Modal Volume integration is not yet implemented.
 - Cancel is a foundation; real Modal/RunPod cancel is not yet implemented.

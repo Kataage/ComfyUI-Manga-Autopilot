@@ -201,6 +201,7 @@ The following items are **out of scope** for v1.0 and remain in the Planned sect
 | run_id in manifest.json | Done | `test_manifest_contains_run_id_after_completion` | Yes | run_id present after completion |
 | run_id in remote payload metadata | Done | `test_remote_executor_payload_contains_run_id_metadata` | Yes | metadata.run_id in PanelExecutionRequest |
 | restart source link | Done | `test_cancelled_restart_creates_new_run_and_links_previous_run` | Yes | source.restart_of_run_id in run.json |
+| Per-run artifact directories | Done | `test_completed_run_artifacts_are_mirrored_to_run_directory`, `test_restart_creates_separate_run_artifact_directories` | Yes | Root latest layout preserved |
 
 ## How to Use
 

@@ -106,6 +106,42 @@ class ProjectPaths:
     def run_json(self, run_id: str) -> Path:
         return self.run_dir(run_id) / "run.json"
 
+    def run_generation_log_json(self, run_id: str) -> Path:
+        return self.run_dir(run_id) / "generation_log.json"
+
+    def run_manifest_json(self, run_id: str) -> Path:
+        return self.run_dir(run_id) / "manifest.json"
+
+    def run_panels_json(self, run_id: str) -> Path:
+        return self.run_dir(run_id) / "panels.json"
+
+    def run_bubbles_json(self, run_id: str) -> Path:
+        return self.run_dir(run_id) / "bubbles.json"
+
+    def run_pages_json(self, run_id: str) -> Path:
+        return self.run_dir(run_id) / "pages.json"
+
+    def run_assets_dir(self, run_id: str) -> Path:
+        return self.run_dir(run_id) / "assets"
+
+    def run_panel_assets_dir(self, run_id: str) -> Path:
+        return self.run_dir(run_id) / "assets" / "panels"
+
+    def run_jobs_dir(self, run_id: str) -> Path:
+        return self.run_dir(run_id) / "jobs"
+
+    def run_exports_dir(self, run_id: str) -> Path:
+        return self.run_dir(run_id) / "exports"
+
+    def run_exports_pages_dir(self, run_id: str) -> Path:
+        return self.run_dir(run_id) / "exports" / "pages"
+
+    def run_exports_webtoon_dir(self, run_id: str) -> Path:
+        return self.run_dir(run_id) / "exports" / "webtoon"
+
+    def run_exports_pdf_dir(self, run_id: str) -> Path:
+        return self.run_dir(run_id) / "exports" / "pdf"
+
     @property
     def assets(self) -> Path:
         return self.root / "assets"
