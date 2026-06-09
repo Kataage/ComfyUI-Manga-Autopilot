@@ -25,6 +25,7 @@ import asyncio
 import base64
 import io
 import logging
+import os
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -153,6 +154,8 @@ class RemoteGenerateResponse:
     job_id: str | None = None
     filename: str | None = None
     image_base64: str | None = None
+    artifact_url: str | None = None
+    artifact_path: str | None = None
     seed: int | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
     error: str | None = None
@@ -164,6 +167,8 @@ class RemoteGenerateResponse:
             job_id=data.get("job_id"),
             filename=data.get("filename"),
             image_base64=data.get("image_base64"),
+            artifact_url=data.get("artifact_url"),
+            artifact_path=data.get("artifact_path"),
             seed=data.get("seed"),
             metadata=data.get("metadata", {}),
             error=data.get("error"),
@@ -241,6 +246,79 @@ class RemoteHTTPExecutor(GenerationExecutor):
             ) from exc
         return image
 
+    async def _fetch_image_bytes(
+        self,
+        session: aiohttp.ClientSession,
+        url: str,
+    ) -> bytes:
+        """HTTP GET an image URL and return raw bytes."""
+        timeout = aiohttp.ClientTimeout(total=self.settings.timeout_sec)
+        try:
+            async with session.get(url, headers=self._auth_headers(), timeout=timeout) as resp:
+                if resp.status != 200:
+                    body = await resp.text()
+                    raise RemoteExecutorHTTPError(resp.status, body, url)
+                return await resp.read()
+        except asyncio.TimeoutError as exc:
+            raise RemoteExecutorTimeoutError(self.settings.timeout_sec, url) from exc
+
+    def _load_image_from_path(self, path: str) -> Image.Image:
+        """Read a local image file into a PIL Image."""
+        from pathlib import Path
+
+        p = Path(path)
+        if not p.exists():
+            raise RemoteExecutorImageError(
+                f"artifact_path does not exist: {path}"
+            )
+        try:
+            image = Image.open(p)
+            image.load()
+        except Exception as exc:
+            raise RemoteExecutorImageError(
+                f"artifact_path is not a valid image: {path}: {exc}"
+            ) from exc
+        return image
+
+    def _resolve_image_from_response(
+        self,
+        response: RemoteGenerateResponse,
+        session: aiohttp.ClientSession,
+        candidate_id: str,
+    ) -> Image.Image:
+        """Resolve image from response using priority: base64 > artifact_url > artifact_path.
+
+        artifact_url requires an async session, so this is a sync fallback
+        for base64 and artifact_path only.  artifact_url fetching is done
+        in ``_resolve_artifact_url``.
+        """
+        if response.image_base64:
+            return self._decode_image(response.image_base64, candidate_id)
+
+        if response.artifact_path:
+            return self._load_image_from_path(response.artifact_path)
+
+        raise RemoteExecutorResponseError(
+            "remote worker returned no image_base64, artifact_url, or artifact_path"
+        )
+
+    async def _resolve_artifact_url(
+        self,
+        session: aiohttp.ClientSession,
+        artifact_url: str,
+        candidate_id: str,
+    ) -> Image.Image:
+        """Download image from artifact_url."""
+        raw = await self._fetch_image_bytes(session, artifact_url)
+        try:
+            image = Image.open(io.BytesIO(raw))
+            image.load()
+        except Exception as exc:
+            raise RemoteExecutorImageError(
+                f"artifact_url returned invalid image bytes: {exc}"
+            ) from exc
+        return image
+
     async def _poll_job(
         self,
         session: aiohttp.ClientSession,
@@ -266,12 +344,23 @@ class RemoteHTTPExecutor(GenerationExecutor):
             status = data.get("status", "error")
 
             if status == "completed":
-                image_b64 = data.get("image_base64")
-                if not image_b64:
-                    raise RemoteExecutorResponseError(
-                        f"job {job_id!r} completed but no image_base64"
+                resp = RemoteGenerateResponse.from_dict(data)
+
+                # Priority: image_base64 > artifact_url > artifact_path
+                if resp.image_base64:
+                    image = self._decode_image(resp.image_base64, candidate_id)
+                elif resp.artifact_url:
+                    image = await self._resolve_artifact_url(
+                        session, resp.artifact_url, candidate_id,
                     )
-                image = self._decode_image(image_b64, candidate_id)
+                elif resp.artifact_path:
+                    image = self._load_image_from_path(resp.artifact_path)
+                else:
+                    raise RemoteExecutorResponseError(
+                        f"job {job_id!r} completed but no image_base64, "
+                        f"artifact_url, or artifact_path"
+                    )
+
                 return GenerationExecutorResult(
                     candidate_id=candidate_id,
                     prompt_id=data.get("metadata", {}).get(
@@ -342,9 +431,25 @@ class RemoteHTTPExecutor(GenerationExecutor):
 
         # --- synchronous completed ---
         if response.status == "completed":
-            if not response.image_base64:
-                raise RemoteExecutorResponseError("remote worker returned no image_base64")
-            image = self._decode_image(response.image_base64, candidate_id)
+            # Priority: image_base64 > artifact_url > artifact_path
+            if response.image_base64:
+                image = self._decode_image(response.image_base64, candidate_id)
+            elif response.artifact_url:
+                dl_session = self._open()
+                try:
+                    image = await self._resolve_artifact_url(
+                        dl_session, response.artifact_url, candidate_id,
+                    )
+                finally:
+                    if self._session_factory is None:
+                        await dl_session.close()
+            elif response.artifact_path:
+                image = self._load_image_from_path(response.artifact_path)
+            else:
+                raise RemoteExecutorResponseError(
+                    "remote worker returned no image_base64, artifact_url, or artifact_path"
+                )
+
             return GenerationExecutorResult(
                 candidate_id=candidate_id,
                 prompt_id=response.metadata.get("prompt_id", f"remote_{candidate_id}"),
@@ -395,6 +500,15 @@ class FakeRemoteWorker:
     - ``"async_success"`` — queued → running → completed
     - ``"async_error"`` — queued → error
     - ``"async_timeout"`` — always returns running (never completes)
+
+    **Artifact modes:**
+
+    - ``"artifact_url"`` — completed with artifact_url
+    - ``"artifact_path"`` — completed with artifact_path
+    - ``"async_artifact_url"`` — queued → completed with artifact_url
+    - ``"async_artifact_path"`` — queued → completed with artifact_path
+    - ``"artifact_url_404"`` — completed with artifact_url that returns 404
+    - ``"artifact_path_missing"`` — completed with artifact_path to nonexistent file
     """
 
     def __init__(
@@ -412,6 +526,9 @@ class FakeRemoteWorker:
         self.jobs: dict[str, dict[str, Any]] = {}
         self.poll_count: dict[str, int] = {}
         self.job_requests: list[dict[str, Any]] = []
+        self.artifacts: dict[str, bytes] = {}
+        self._artifact_tmp_dir: str | None = None
+        self._server_port: int = 0
 
     def _make_image_b64(self, width: int, height: int, seed: int) -> str:
         r = (seed * 7) % 256
@@ -421,6 +538,24 @@ class FakeRemoteWorker:
         buf = io.BytesIO()
         img.save(buf, format="PNG")
         return base64.b64encode(buf.getvalue()).decode("ascii")
+
+    def _make_image_bytes(self, width: int, height: int, seed: int) -> bytes:
+        r = (seed * 7) % 256
+        g = (seed * 13) % 256
+        b = (seed * 23) % 256
+        img = Image.new("RGB", (width, height), (r, g, b))
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        return buf.getvalue()
+
+    def _store_artifact(self, filename: str, image_bytes: bytes) -> None:
+        self.artifacts[filename] = image_bytes
+
+    def _get_tmp_dir(self) -> str:
+        if self._artifact_tmp_dir is None:
+            import tempfile
+            self._artifact_tmp_dir = tempfile.mkdtemp(prefix="fake_worker_")
+        return self._artifact_tmp_dir
 
     # ---- POST /v1/generate-panel ----
 
@@ -465,7 +600,10 @@ class FakeRemoteWorker:
         panel_id = body.get("panel_id", "panel")
 
         # --- async modes: return queued ---
-        if self.mode in ("async_success", "async_error", "async_timeout"):
+        if self.mode in (
+            "async_success", "async_error", "async_timeout",
+            "async_artifact_url", "async_artifact_path",
+        ):
             import uuid
             job_id = f"fake_job_{uuid.uuid4().hex[:8]}"
             self.jobs[job_id] = {
@@ -508,6 +646,55 @@ class FakeRemoteWorker:
                 "status": "completed",
                 "filename": f"{panel_id}.png",
                 "image_base64": fake_bytes,
+                "seed": seed,
+                "metadata": {"executor": "fake-remote"},
+            })
+
+        # --- artifact_url: store image bytes and return URL ---
+        if self.mode == "artifact_url":
+            img_bytes = self._make_image_bytes(width, height, seed)
+            self._store_artifact(f"{panel_id}.png", img_bytes)
+            base = f"http://127.0.0.1:{self._server_port}"
+            return aiohttp.web.json_response({
+                "status": "completed",
+                "filename": f"{panel_id}.png",
+                "artifact_url": f"{base}/artifacts/{panel_id}.png",
+                "seed": seed,
+                "metadata": {"executor": "fake-remote"},
+            })
+
+        # --- artifact_url_404: return URL but don't store artifact ---
+        if self.mode == "artifact_url_404":
+            base = f"http://127.0.0.1:{self._server_port}"
+            return aiohttp.web.json_response({
+                "status": "completed",
+                "filename": f"{panel_id}.png",
+                "artifact_url": f"{base}/artifacts/{panel_id}.png",
+                "seed": seed,
+                "metadata": {"executor": "fake-remote"},
+            })
+
+        # --- artifact_path: save to tmp and return path ---
+        if self.mode == "artifact_path":
+            img_bytes = self._make_image_bytes(width, height, seed)
+            tmp_dir = self._get_tmp_dir()
+            file_path = os.path.join(tmp_dir, f"{panel_id}.png")
+            with open(file_path, "wb") as f:
+                f.write(img_bytes)
+            return aiohttp.web.json_response({
+                "status": "completed",
+                "filename": f"{panel_id}.png",
+                "artifact_path": file_path,
+                "seed": seed,
+                "metadata": {"executor": "fake-remote"},
+            })
+
+        # --- artifact_path_missing: return path but don't create file ---
+        if self.mode == "artifact_path_missing":
+            return aiohttp.web.json_response({
+                "status": "completed",
+                "filename": f"{panel_id}.png",
+                "artifact_path": "/nonexistent/path/fake.png",
                 "seed": seed,
                 "metadata": {"executor": "fake-remote"},
             })
@@ -582,17 +769,88 @@ class FakeRemoteWorker:
                 },
             })
 
+        if self.mode == "async_artifact_url":
+            # First poll returns running, second returns completed with artifact_url.
+            if poll_n < 2:
+                return aiohttp.web.json_response({
+                    "status": "running",
+                    "job_id": job_id,
+                })
+            img_bytes = self._make_image_bytes(
+                job["width"], job["height"], job["seed"],
+            )
+            self._store_artifact(f"{job['panel_id']}.png", img_bytes)
+            base = f"http://127.0.0.1:{self._server_port}"
+            return aiohttp.web.json_response({
+                "status": "completed",
+                "job_id": job_id,
+                "filename": f"{job['panel_id']}.png",
+                "artifact_url": f"{base}/artifacts/{job['panel_id']}.png",
+                "seed": job["seed"],
+                "metadata": {
+                    "executor": "fake-remote",
+                    "prompt_id": f"fake_{job_id}",
+                },
+            })
+
+        if self.mode == "async_artifact_path":
+            # First poll returns running, second returns completed with artifact_path.
+            if poll_n < 2:
+                return aiohttp.web.json_response({
+                    "status": "running",
+                    "job_id": job_id,
+                })
+            img_bytes = self._make_image_bytes(
+                job["width"], job["height"], job["seed"],
+            )
+            tmp_dir = self._get_tmp_dir()
+            file_path = os.path.join(tmp_dir, f"{job['panel_id']}.png")
+            with open(file_path, "wb") as f:
+                f.write(img_bytes)
+            return aiohttp.web.json_response({
+                "status": "completed",
+                "job_id": job_id,
+                "filename": f"{job['panel_id']}.png",
+                "artifact_path": file_path,
+                "seed": job["seed"],
+                "metadata": {
+                    "executor": "fake-remote",
+                    "prompt_id": f"fake_{job_id}",
+                },
+            })
+
         return aiohttp.web.json_response({
             "status": "error",
             "job_id": job_id,
             "error": f"unknown mode: {self.mode}",
         })
 
+    # ---- GET /artifacts/{filename} ----
+
+    async def handle_get_artifact(self, request: aiohttp.web.Request) -> aiohttp.web.Response:
+        filename = request.match_info["filename"]
+        image_bytes = self.artifacts.get(filename)
+        if image_bytes is None:
+            return aiohttp.web.Response(
+                status=404,
+                text=f"artifact not found: {filename}",
+                content_type="text/plain",
+            )
+        return aiohttp.web.Response(
+            body=image_bytes,
+            content_type="image/png",
+        )
+
     def app(self) -> aiohttp.web.Application:
         app = aiohttp.web.Application()
         app.router.add_post("/v1/generate-panel", self.handle_generate)
         app.router.add_get("/v1/jobs/{job_id}", self.handle_get_job)
+        app.router.add_get("/artifacts/{filename}", self.handle_get_artifact)
         return app
+
+    async def start(self, runner: Any) -> None:
+        """Store the server port after runner starts."""
+        self._server_port = 0  # will be set by test helper
 
 
 __all__ = [

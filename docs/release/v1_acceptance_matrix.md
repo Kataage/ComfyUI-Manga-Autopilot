@@ -148,6 +148,17 @@ The following items are **out of scope** for v1.0 and remain in the Planned sect
 | Builds error response contract | Done | `test_modal_worker_builds_error_response_contract` | Yes | status=error, error message |
 | Placeholder image is valid base64 | Done | `test_modal_worker_placeholder_image_is_valid_base64` | Yes | Decodes to PNG bytes |
 
+### Remote Artifact URL Support
+
+| Area | Status | Test | CI | Notes |
+|------|--------|------|----|-------|
+| Downloads image from artifact_url | Done | `test_remote_executor_downloads_artifact_url` | Yes | Sync artifact_url response |
+| Reads image from artifact_path | Done | `test_remote_executor_reads_artifact_path` | Yes | Sync artifact_path response |
+| Polls async artifact_url to completion | Done | `test_remote_executor_polls_until_async_artifact_url_completed` | Yes | Async queued → artifact_url |
+| Raises on artifact_url 404 | Done | `test_remote_executor_raises_on_artifact_url_404` | Yes | HTTP 404 from artifact endpoint |
+| Raises on missing artifact_path | Done | `test_remote_executor_raises_on_missing_artifact_path` | Yes | FileNotFoundError → RemoteExecutorImageError |
+| Autopilot E2E with artifact_url | Done | `test_autopilot_can_generate_panels_with_artifact_url_remote_executor` | Yes | Full pipeline via artifact_url |
+
 ## How to Use
 
 ### Before every release

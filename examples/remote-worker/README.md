@@ -9,6 +9,12 @@ The executor supports two modes:
 - **Synchronous**: single POST returns completed image
 - **Asynchronous**: POST returns job_id; executor polls GET until done
 
+The response can deliver images via three formats (in priority order):
+
+- **`image_base64`**: inline base64 (MVP default)
+- **`artifact_url`**: URL to download the image (recommended for large images)
+- **`artifact_path`**: local file path (for local/test workers)
+
 ## Endpoint
 
 ```
@@ -47,7 +53,9 @@ POST /v1/generate-panel
 
 ## Sync Response
 
-Return the image directly:
+Return the image directly.  Use one of three formats:
+
+### image_base64 (MVP default)
 
 ```json
 {
@@ -61,6 +69,40 @@ Return the image directly:
   }
 }
 ```
+
+### artifact_url (recommended for large images)
+
+```json
+{
+  "status": "completed",
+  "filename": "panel_001_c00.png",
+  "artifact_url": "http://127.0.0.1:9000/artifacts/panel_001_c00.png",
+  "seed": 12345,
+  "metadata": {
+    "executor": "your-worker-name"
+  }
+}
+```
+
+The executor will HTTP GET the `artifact_url` to download the image.
+Use this for S3 / R2 / Modal Volume / HTTP file server integrations.
+
+### artifact_path (local/test workers)
+
+```json
+{
+  "status": "completed",
+  "filename": "panel_001_c00.png",
+  "artifact_path": "/tmp/worker-output/panel_001_c00.png",
+  "seed": 12345,
+  "metadata": {
+    "executor": "your-worker-name"
+  }
+}
+```
+
+The executor reads the local file at `artifact_path`.
+Use this for local test workers or CI environments.
 
 ## Async Response
 
@@ -105,6 +147,21 @@ GET /v1/jobs/{job_id}
   "metadata": {
     "executor": "your-worker-name",
     "prompt_id": "optional-prompt-id"
+  }
+}
+```
+
+Or with `artifact_url`:
+
+```json
+{
+  "status": "completed",
+  "job_id": "job_abc123",
+  "filename": "panel_001_c00.png",
+  "artifact_url": "http://127.0.0.1:9000/artifacts/panel_001_c00.png",
+  "seed": 12345,
+  "metadata": {
+    "executor": "your-worker-name"
   }
 }
 ```
@@ -161,9 +218,12 @@ Validate this header in your worker if needed.
 
 - `page_id` is empty string in v0.1 — the `GenerationExecutor` protocol
   does not carry page context.  Future versions will add formal `page_id`.
-- `image_base64` is the MVP format.  Future versions may use artifact
-  URLs (S3 / R2 signed URLs) instead.
+- `image_base64` is the MVP format.  For large images, prefer
+  `artifact_url` (S3 / R2 / Modal Volume / HTTP file server).
+- `artifact_path` is for local/test workers only; not recommended for
+  production remote workers.
 - No Modal SDK or RunPod integration is required for this contract.
+- Real S3 / R2 / Modal Volume integration is not yet implemented.
 
 ## See also
 

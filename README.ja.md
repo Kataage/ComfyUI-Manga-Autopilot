@@ -319,6 +319,14 @@ pytest -m release_gate -q
 `manga_panel_executor_factory` で設定します。
 詳細は `tests/backend/test_remote_executor_e2e.py` を参照してください。
 
+エグゼキュータは3つの画像配信形式をサポートしています:
+
+- **`image_base64`**: インライン base64（MVP デフォルト）
+- **`artifact_url`**: 画像ダウンロード用 URL（大きな画像に推奨；将来の S3 / R2 / Modal Volume 連携向け）
+- **`artifact_path`**: ローカルファイルパス（ローカル/テスト用ワーカー向け）
+
+CI ではインメモリストレージを持つ `FakeRemoteWorker` を使用しています。
+
 ## Modal ワーカー MVP
 
 実験的な Modal ワーカーの例を `examples/modal-worker/` に用意しています。

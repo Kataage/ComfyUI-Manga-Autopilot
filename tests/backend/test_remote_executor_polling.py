@@ -32,6 +32,7 @@ async def _start_worker(worker: FakeRemoteWorker) -> tuple[web.AppRunner, int]:
     sockets = server.sockets
     assert sockets is not None
     port = sockets[0].getsockname()[1]
+    worker._server_port = port
     return runner, port
 
 

@@ -324,6 +324,15 @@ Set the executor via `manga_panel_executor` or
 `manga_panel_executor_factory` on the aiohttp app.  See
 `tests/backend/test_remote_executor_e2e.py` for a complete example.
 
+The executor supports three image delivery formats:
+
+- **`image_base64`**: inline base64 (MVP default)
+- **`artifact_url`**: URL to download the image (recommended for large
+  images; future S3 / R2 / Modal Volume integration)
+- **`artifact_path`**: local file path (for local/test workers)
+
+CI uses `FakeRemoteWorker` with in-memory artifact storage.
+
 ## Modal Worker MVP
 
 An experimental Modal worker example is available at
