@@ -181,6 +181,16 @@ The following items are **out of scope** for v1.0 and remain in the Planned sect
 | RemoteHTTPExecutor raises RemoteExecutorCancelledError | Done | `test_remote_executor_raises_when_polled_job_is_cancelled` | Yes | Polling detects cancelled status |
 | Autopilot cancel during remote polling | Done | `test_autopilot_cancel_during_remote_polling` | Yes | Fake remote worker only; real Modal/RunPod cancel not implemented |
 
+### Cancelled Project Restart Foundation
+
+| Area | Status | Test | CI | Notes |
+|------|--------|------|----|-------|
+| Restart endpoint clears cancel marker | Done | `test_restart_endpoint_clears_cancel_marker` | Yes | cancel.json deleted before restart |
+| Restart endpoint returns 404 for missing project | Done | `test_restart_endpoint_returns_404_for_missing_project` | Yes | No run → 404 |
+| Restart restores input from project.json | Done | `test_restart_restores_input_from_project_json` | Yes | page_count, candidate_count, max_retries, threshold, title |
+| Restart applies request body overrides | Done | `test_restart_applies_overrides` | Yes | Explicit values take precedence |
+| Cancelled → restart → completed E2E | Done | `test_cancelled_project_can_restart_and_complete` | Yes | Full round-trip with SlowFakeExecutor |
+
 ## How to Use
 
 ### Before every release

@@ -237,6 +237,9 @@ pytest -m release_gate -q
   マーカーを保存; `GenerationLoop` が候補間でマーカーを確認;
   `RemoteHTTPExecutor.cancel()` でリモートジョブにキャンセル送信;
   キャンセルされたジョブは `RemoteExecutorCancelledError` を送出
+- **キャンセル後プロジェクト再開** - `POST /autopilot/restart` で
+  キャンセルマーカーを削除し、`project.json` から入力を復元して
+  新しい実行を開始; リクエストボディで上書き可能
 - **書き出し** - PNG ページ、Webtoon スライス、PDF (A4/B5/Kindle/カスタム)、
   Zip 形式のプロジェクトバンドル
 - **外部 GPU ブリッジ** (Modal スタイル worker) - タイムアウトでローカル
