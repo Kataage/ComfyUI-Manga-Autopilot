@@ -243,6 +243,9 @@ for the full acceptance matrix.
   `cancel.json` marker; `GenerationLoop` checks marker between
   candidates; `RemoteHTTPExecutor.cancel()` sends cancel to remote
   worker; `RemoteExecutorCancelledError` on cancelled jobs
+- **Cancelled project restart** — `POST /autopilot/restart` clears
+  cancel marker, restores input from `project.json`, starts fresh run;
+  request body overrides supported
 - **Export** — PNG pages, webtoon slices, PDF (A4/B5/Kindle/custom),
   zip-based project bundles
 - **External GPU bridge** (Modal-style worker) — local ComfyUI fallback
