@@ -36,8 +36,12 @@ The worker is expected to handle `POST /v1/generate-panel` with the
 same request/response format as `RemoteHTTPExecutor`:
 
 - Request: `project_id`, `panel_id`, `prompt`, `seed`, `width`, `height`, etc.
-- Success response: `status=completed`, `image_base64`, `filename`, `metadata`
+- Success response: `status=completed`, `image_base64` (or `artifact_url`), `filename`, `metadata`
 - Error response: `status=error`, `error`
+
+For production Modal workers, prefer `artifact_url` over `image_base64`
+since large images should not be base64-encoded in JSON.  The executor
+supports `artifact_url` and `artifact_path` response formats.
 
 See `examples/remote-worker/README.md` for the full contract.
 
@@ -48,3 +52,4 @@ See `examples/remote-worker/README.md` for the full contract.
 - Configure Modal secrets (if needed)
 - Set appropriate timeouts and GPU type
 - Test with real ComfyUI workflow on Modal GPU
+- Use `artifact_url` or Modal Volume path for image delivery
