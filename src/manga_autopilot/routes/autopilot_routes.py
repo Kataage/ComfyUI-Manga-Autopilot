@@ -978,6 +978,82 @@ async def restart(request: web.Request) -> web.Response:
     }, status=202)
 
 
+RESUME_CANCELLED_ROUTE = "/manga_autopilot/api/projects/{project_id}/autopilot/resume-cancelled"
+
+
+async def resume_cancelled(request: web.Request) -> web.Response:
+    """Resume a cancelled or failed autopilot run, reusing existing panels.
+
+    Clears the cancel marker and starts a new Autopilot pipeline that
+    preserves already-generated panel images and only regenerates missing
+    or broken ones.
+    """
+    project_id = request.match_info["project_id"]
+    storage_root = _storage_root(request.app)
+    if storage_root is None:
+        raise web.HTTPInternalServerError(text="manga_storage_root is not configured")
+
+    paths = ensure_project_paths(storage_root, project_id)
+    if not paths.project_json.exists():
+        raise web.HTTPNotFound(text=f"project {project_id!r} not found")
+
+    # Read override inputs from request body
+    try:
+        body = await _payload(request)
+    except web.HTTPBadRequest:
+        body = {}
+    overrides = body if isinstance(body, dict) else {}
+
+    # Restore input from project.json
+    import json as _json
+    project_data = _json.loads(paths.project_json.read_text(encoding="utf-8"))
+    restored_input: dict[str, Any] = {}
+
+    # Restore from project settings
+    settings = project_data.get("settings", {})
+    gen_settings = settings.get("generation", {})
+    restored_input["page_count"] = settings.get("page_count", 4)
+    restored_input["candidate_count"] = gen_settings.get("candidate_count", 1)
+    restored_input["max_retries"] = gen_settings.get("max_retry_per_panel", 1)
+    restored_input["threshold"] = gen_settings.get("quality_threshold", 0.5)
+    restored_input["title"] = project_data.get("title", project_data.get("name", project_id))
+
+    # Apply overrides
+    restored_input.update(overrides)
+
+    # Read previous run_id from latest_run_id.txt
+    previous_run_id: str | None = None
+    latest_run_id_path = paths.latest_run_id_txt
+    if latest_run_id_path.exists():
+        previous_run_id = latest_run_id_path.read_text(encoding="utf-8").strip() or None
+
+    # Clear cancel marker
+    if paths.cancel_json.exists():
+        paths.cancel_json.unlink()
+
+    # Start new autopilot run (panels.json is preserved, so existing
+    # generated panels are reused and only missing ones are regenerated)
+    ctrl = _controller(request.app)
+    hooks = _default_hooks_for_project(request.app, project_id, storage_root)
+    run, _task, _cancel, _pause = start_orchestrator(
+        ctrl,
+        project_id,
+        hooks=hooks,
+        project_root=paths.root,
+        input_payload=restored_input,
+    )
+    # Link to previous run as resume
+    run.source["resume_of_run_id"] = previous_run_id
+    save_run_metadata(paths.root, run)
+    return web.json_response({
+        "project_id": project_id,
+        "run_id": run.run_id,
+        "status": "started",
+        "resumed": True,
+        "resume_of_run_id": previous_run_id,
+    }, status=202)
+
+
 CLEANUP_ROUTE = "/manga_autopilot/api/projects/{project_id}/runs/cleanup"
 
 
@@ -1055,6 +1131,7 @@ def register(router: Any) -> None:
     router.add_post(ROUTE_PREFIX + "/resume", resume)
     router.add_post(ROUTE_PREFIX + "/cancel", cancel)
     router.add_post(ROUTE_PREFIX + "/restart", restart)
+    router.add_post(RESUME_CANCELLED_ROUTE, resume_cancelled)
     router.add_get(ROUTE_PREFIX + "/status", status)
     router.add_post(CLEANUP_ROUTE, cleanup_runs)
 

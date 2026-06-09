@@ -252,7 +252,10 @@ pytest -m release_gate -q
    プロジェクトルート最新レイアウトを維持
 - **ランクリーンアップ基盤** - 古いper-run artifactsの明示的な
   cleanup API; デフォルトでdry-run; latestとrunning runを保護;
-  保持件数設定 (keep_last); 自動バックグラウンド削除は未実装
+   保持件数設定 (keep_last); 自動バックグラウンド削除は未実装
+- **キャンセル後部分再開** - キャンセル/失敗したrunを再開し、既存の
+  生成済みpanelを再利用; 未生成panelのみ再生成; 新しいrun_idを
+  前回runと `resume_of_run_id` でリンク
 - **書き出し** - PNG ページ、Webtoon スライス、PDF (A4/B5/Kindle/カスタム)、
   Zip 形式のプロジェクトバンドル
 - **外部 GPU ブリッジ** (Modal スタイル worker) - タイムアウトでローカル

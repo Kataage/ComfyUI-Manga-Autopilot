@@ -72,10 +72,17 @@ def save_run_metadata(
     run_dir.mkdir(parents=True, exist_ok=True)
 
     status_value = run.machine.state.value
+    source = run.source
+    if source.get("restart_of_run_id"):
+        kind = "restart"
+    elif source.get("resume_of_run_id"):
+        kind = "resume"
+    else:
+        kind = "start"
     payload: dict[str, Any] = {
         "run_id": run.run_id,
         "project_id": run.project_id,
-        "kind": run.source.get("restart_of_run_id") and "restart" or "start",
+        "kind": kind,
         "status": status_value,
         "started_at": run.started_at.isoformat(),
         "completed_at": run.finished_at.isoformat() if run.finished_at else None,

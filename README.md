@@ -259,6 +259,9 @@ for the full acceptance matrix.
 - **Run cleanup foundation** — explicit cleanup API for old per-run
   artifacts; dry-run by default; protects latest and running runs;
   configurable retention (keep_last); no automatic background cleanup
+- **Cancelled partial resume** — resume cancelled/failed runs reusing
+  existing generated panels; only missing panels are regenerated;
+  creates new run_id linked to previous run via `resume_of_run_id`
 - **Export** — PNG pages, webtoon slices, PDF (A4/B5/Kindle/custom),
   zip-based project bundles
 - **External GPU bridge** (Modal-style worker) — local ComfyUI fallback
