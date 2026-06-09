@@ -34,6 +34,9 @@ dev = [
     "pytest-aiohttp>=1.0",
     "ruff>=0.4",
 ]
+modal = [
+    "modal>=0.64.0",
+]
 
 [project.urls]
 Homepage = "https://github.com/Kataage/ComfyUI-Manga-Autopilot"

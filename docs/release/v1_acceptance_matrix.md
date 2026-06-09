@@ -205,6 +205,17 @@ The following items are **out of scope** for v1.0 and remain in the Planned sect
 | Run cleanup foundation | Done | `test_cleanup_api_returns_dry_run_plan`, `test_cleanup_api_never_deletes_latest_run` | Yes | Explicit cleanup only; no background auto-cleanup |
 | Cancelled partial resume | Done | `test_cancelled_project_can_resume_missing_panels_only` | Yes | Reuses existing panel images; generates missing panels only |
 
+### Real Modal Worker Opt-in MVP
+
+| Area | Status | Test | CI | Notes |
+|------|--------|------|----|-------|
+| Contract: payload validation | Done | `test_modal_worker_contract.py` (27 tests) | Yes | No Modal SDK required |
+| Contract: success response | Done | `test_modal_worker_contract.py` | Yes | status=completed, image_base64, metadata.executor |
+| Contract: error response | Done | `test_modal_worker_contract.py` | Yes | status=error, error message |
+| Contract: placeholder image | Done | `test_modal_worker_contract.py` | Yes | Base64 PNG, deterministic |
+| Real Modal GPU smoke test (opt-in) | Opt-in | `test_real_modal_worker_e2e.py` | No | Requires Modal account + env vars |
+| Optional Modal dependency | Done | `pyproject.toml` | Yes | `pip install -e ".[modal]"` only |
+
 ## How to Use
 
 ### Before every release

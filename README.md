@@ -379,6 +379,18 @@ execution and does not require a Modal account or GPU in CI.
 - No real ComfyUI or model execution yet
 - See `examples/modal-worker/README.md` for details
 
+### Real Modal GPU Worker (opt-in)
+
+A real Modal GPU worker example (`modal_gpu_worker.py`) exposes HTTP
+endpoints on Modal web.  It is skipped by default in CI and requires
+a Modal account + env vars to run.
+
+- Install: `pip install -e ".[modal]"`
+- Deploy: `modal deploy examples/modal-worker/modal_gpu_worker.py`
+- Opt-in test: `MANGA_AUTOPILOT_REAL_MODAL_E2E=1` +
+  `MANGA_AUTOPILOT_MODAL_WORKER_URL=https://your-app.modal.run`
+- Current MVP returns placeholder images (no real ComfyUI yet)
+
 ## Documentation
 
 - [`CHANGELOG.md`](CHANGELOG.md) — release history
