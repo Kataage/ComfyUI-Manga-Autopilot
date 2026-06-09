@@ -271,6 +271,8 @@ Validate this header in your worker if needed.
 - Real S3 / R2 / Modal Volume integration is not yet implemented.
 - Cancel is a foundation; real Modal/RunPod cancel is not yet implemented.
 - Partial assets may remain after cancellation.
+- Resume creates new remote generate-panel requests only for missing panels.
+- Old cancelled remote jobs are not reused.
 
 ## See also
 
