@@ -373,6 +373,18 @@ GPU は不要です。
 - 現時点では ComfyUI やモデル実行は未実装
 - 詳細は `examples/modal-worker/README.md` を参照
 
+### Real Modal GPU Worker（オプトイン）
+
+実際の Modal GPU ワーカー例（`modal_gpu_worker.py`）は Modal web 上に
+HTTP エンドポイントを公開します。CI ではデフォルトでスキップされ、
+Modal アカウント + 環境変数が必要です。
+
+- インストール: `pip install -e ".[modal]"`
+- デプロイ: `modal deploy examples/modal-worker/modal_gpu_worker.py`
+- オプトインテスト: `MANGA_AUTOPILOT_REAL_MODAL_E2E=1` +
+  `MANGA_AUTOPILOT_MODAL_WORKER_URL=https://your-app.modal.run`
+- 現在の MVP はプレースホルダー画像を返す（本物の ComfyUI はまだ未実装）
+
 ## ドキュメント
 
 - [`CHANGELOG.md`](CHANGELOG.md) — リリース履歴
