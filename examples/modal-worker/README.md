@@ -232,3 +232,102 @@ pytest tests/backend/test_modal_comfyui_worker_contract.py -q
 - No production-ready auth or artifact storage
 - In-memory ComfyUI subprocess (restarts each invocation)
 - No long-running ComfyUI server optimization
+
+---
+
+## Preflight Validation
+
+The `comfyui_preflight.py` module provides preflight checks for
+validating the Modal ComfyUI environment before generation.
+
+### Endpoints
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/v1/health` | GET | Basic health check (no ComfyUI required) |
+| `/v1/preflight` | POST | Run all preflight validation checks |
+
+### GET /v1/health
+
+```bash
+curl https://your-app.modal.run/v1/health
+```
+
+Response:
+```json
+{
+  "status": "ok",
+  "executor": "modal-comfyui",
+  "comfyui_root": "/root/ComfyUI",
+  "comfyui_root_exists": true,
+  "volume_name": "manga-autopilot-comfyui",
+  "volume_mounted": true,
+  "output_dir": "/outputs",
+  "comfyui_port": 8188
+}
+```
+
+### POST /v1/preflight
+
+```bash
+curl -X POST https://your-app.modal.run/v1/preflight \
+  -H "Content-Type: application/json" \
+  -d '{
+    "workflow_id": "anime_t2i_default",
+    "checkpoint_name": "example.safetensors"
+  }'
+```
+
+Response:
+```json
+{
+  "ok": true,
+  "executor": "modal-comfyui",
+  "checks": [
+    {"name": "env_MANGA_AUTOPILOT_MODAL_VOLUME_NAME", "ok": true, "message": "..."},
+    {"name": "env_MANGA_MODAL_COMFYUI_ROOT", "ok": true, "message": "..."},
+    {"name": "comfyui_root", "ok": true, "message": "..."},
+    {"name": "checkpoints_dir", "ok": true, "message": "..."},
+    {"name": "checkpoint_exists", "ok": true, "message": "..."},
+    {"name": "workflow_id", "ok": true, "message": "..."},
+    {"name": "workflow_bindings", "ok": true, "message": "..."},
+    {"name": "workflow_api_graph", "ok": true, "message": "..."},
+    {"name": "binding_positive_prompt", "ok": true, "message": "..."},
+    {"name": "binding_negative_prompt", "ok": true, "message": "..."},
+    {"name": "binding_seed", "ok": true, "message": "..."},
+    {"name": "binding_width", "ok": true, "message": "..."},
+    {"name": "binding_height", "ok": true, "message": "..."}
+  ],
+  "errors": []
+}
+```
+
+### Validation Checks
+
+| Check | Description |
+|-------|-------------|
+| `env_*` | Environment variable is set |
+| `comfyui_root` | ComfyUI root directory exists |
+| `checkpoints_dir` | Checkpoints directory exists |
+| `checkpoint_exists` | Checkpoint file exists with size |
+| `workflow_id` | Registry has workflow_id |
+| `workflow_bindings` | Registry has bindings |
+| `workflow_api_graph` | Registry has api_graph |
+| `binding_*` | Required binding is present |
+
+### Contract Tests (standard CI)
+
+```bash
+pytest tests/backend/test_modal_comfyui_preflight.py -q
+```
+
+### Common Preflight Errors
+
+| Error | Cause | Fix |
+|-------|-------|-----|
+| `MANGA_AUTOPILOT_MODAL_VOLUME_NAME is not set` | Env var missing | Set env var in Modal deploy |
+| `MANGA_MODAL_COMFYUI_ROOT is not set` | Env var missing | Set env var in Modal deploy |
+| `ComfyUI root not found` | Path doesn't exist | Check ComfyUI installation |
+| `Checkpoints directory not found` | No models dir | Create dir on Volume |
+| `checkpoint not found: X` | Checkpoint missing | Upload to Modal Volume |
+| `missing required binding: positive_prompt` | Registry incomplete | Add binding to registry JSON |

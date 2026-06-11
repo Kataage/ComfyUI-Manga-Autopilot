@@ -129,3 +129,23 @@ class TestRealModalComfyuiE2E:
             img = Image.open(BytesIO(raw))
             assert img.size[0] > 0
             assert img.size[1] > 0
+
+    async def test_preflight_returns_structured_result(self):
+        """POST /v1/preflight returns structured checks."""
+        import aiohttp
+
+        url = f"{_MODAL_COMFYUI_WORKER_URL.rstrip('/')}/v1/preflight"
+        payload = {
+            "workflow_id": "anime_t2i_default",
+            "checkpoint_name": "example.safetensors",
+        }
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=30)) as resp:
+                result = await resp.json()
+
+        assert "ok" in result
+        assert "checks" in result
+        assert "errors" in result
+        assert "executor" in result
+        assert isinstance(result["checks"], list)
+        assert isinstance(result["errors"], list)

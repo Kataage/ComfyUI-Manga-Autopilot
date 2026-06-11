@@ -327,6 +327,7 @@ if _HAS_MODAL:
     app = modal.App("manga-autopilot-comfyui-worker")
     image = modal.Image.debian_slim().pip_install("pillow", "aiohttp")
     volume = modal.Volume.from_name(VOLUME_NAME, create_if_missing=True)
+    web_app = modal.web_app()
 
     @app.function(
         image=image,
@@ -461,3 +462,94 @@ if _HAS_MODAL:
                     proc.kill()
 
         return asyncio.run(_run())
+
+    @web_app.get("/v1/health")
+    async def health() -> dict[str, Any]:
+        """GET /v1/health — basic health check.
+
+        Returns worker health status without requiring ComfyUI to be
+        running.  Useful for checking that the worker is deployed and
+        responding.
+        """
+        comfyui_root_path = Path(COMFYUI_ROOT)
+        volume_mount = Path("/comfyui-volume")
+        return {
+            "status": "ok",
+            "executor": "modal-comfyui",
+            "comfyui_root": COMFYUI_ROOT,
+            "comfyui_root_exists": comfyui_root_path.is_dir(),
+            "volume_name": VOLUME_NAME,
+            "volume_mounted": volume_mount.is_dir(),
+            "output_dir": OUTPUT_DIR,
+            "comfyui_port": COMFYUI_PORT,
+        }
+
+    @web_app.post("/v1/preflight")
+    async def preflight(request: Any) -> dict[str, Any]:
+        """POST /v1/preflight — run preflight validation checks.
+
+        Validates environment, paths, checkpoint, workflow registry,
+        and bindings before actual generation.
+
+        Request body::
+
+            {
+                "workflow_id": "anime_t2i_default",
+                "workflow_registry": { ... },
+                "checkpoint_name": "example.safetensors"
+            }
+
+        Response::
+
+            {
+                "ok": true,
+                "executor": "modal-comfyui",
+                "checks": [...],
+                "errors": []
+            }
+        """
+        import comfyui_preflight
+
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+
+        workflow_id = body.get("workflow_id")
+        workflow_registry = body.get("workflow_registry")
+        checkpoint_name = body.get("checkpoint_name")
+
+        # If workflow_id provided but no registry, try to load it.
+        if workflow_id and not workflow_registry:
+            registry_path = (
+                Path("/comfyui-volume") / "workflows" / f"{workflow_id}.registry.json"
+            )
+            if not registry_path.exists():
+                registry_path = (
+                    Path(__file__).resolve().parents[2]
+                    / "examples"
+                    / "workflows"
+                    / f"{workflow_id}.registry.json"
+                )
+            if registry_path.exists():
+                try:
+                    workflow_registry = load_workflow_registry(registry_path)
+                except Exception:
+                    pass
+
+        # Auto-detect checkpoint from registry if not provided.
+        if workflow_registry and not checkpoint_name:
+            detected = comfyui_preflight.detect_checkpoint_from_registry(
+                workflow_registry
+            )
+            if detected:
+                checkpoint_name = detected
+
+        result = comfyui_preflight.run_preflight(
+            env=os.environ,
+            comfyui_root=COMFYUI_ROOT,
+            checkpoints_dir=str(Path(COMFYUI_ROOT) / "models" / "checkpoints"),
+            checkpoint_name=checkpoint_name,
+            workflow_registry=workflow_registry,
+        )
+        return result
