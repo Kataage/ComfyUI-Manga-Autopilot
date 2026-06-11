@@ -408,6 +408,16 @@ Preflight 検証は生成前に volume、checkpoint、workflow、ComfyUI の準�
 
 contract tests は Modal/ComfyUI なしで標準 CI で実行できます。
 
+### Modal Volume セットアップヘルパー
+
+`modal_volume_setup.py` ヘルパーはモデル manifest を検証し、Modal Volume へ
+ファイルをアップロードする `modal volume put` コマンドを生成します。
+自動ダウンロードなし — ユーザーがライセンス済みモデルを手動配置する前提です。
+
+- Manifest: `examples/modal-worker/model_manifest.example.json`
+- ヘルパー: `examples/modal-worker/modal_volume_setup.py`
+- Contract tests: `tests/backend/test_modal_volume_setup.py`
+
 ## ドキュメント
 
 - [`CHANGELOG.md`](CHANGELOG.md) — リリース履歴

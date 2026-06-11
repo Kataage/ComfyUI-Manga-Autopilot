@@ -331,3 +331,134 @@ pytest tests/backend/test_modal_comfyui_preflight.py -q
 | `Checkpoints directory not found` | No models dir | Create dir on Volume |
 | `checkpoint not found: X` | Checkpoint missing | Upload to Modal Volume |
 | `missing required binding: positive_prompt` | Registry incomplete | Add binding to registry JSON |
+
+---
+
+## Modal Volume Setup
+
+The `modal_volume_setup.py` helper validates model manifests and
+generates `modal volume put` commands for uploading files.
+
+### Volume Layout
+
+Expected Modal Volume structure:
+
+```
+/
+├── checkpoints/
+│   └── example.safetensors
+├── vae/
+├── loras/
+├── controlnet/
+├── workflows/
+│   ├── anime_t2i_default.workflow.json
+│   └── anime_t2i_default.registry.json
+├── custom_nodes/
+└── outputs/
+```
+
+### Model Manifest
+
+Create a `model_manifest.json` to declare models and workflows:
+
+```json
+{
+  "version": 1,
+  "models": [
+    {
+      "id": "anima-main",
+      "type": "checkpoint",
+      "filename": "anima.safetensors",
+      "relative_path": "checkpoints/anima.safetensors",
+      "required": true,
+      "sha256": null,
+      "notes": "Place your licensed checkpoint here manually."
+    }
+  ],
+  "workflows": [
+    {
+      "workflow_id": "anime_t2i_default",
+      "workflow_path": "workflows/anime_t2i_default.workflow.json",
+      "registry_path": "workflows/anime_t2i_default.registry.json",
+      "required_models": ["anima-main"]
+    }
+  ]
+}
+```
+
+See `model_manifest.example.json` for a full example.
+
+### Setup Steps
+
+```bash
+# 1. Create Modal Volume
+modal volume create manga-autopilot-comfyui
+
+# 2. Create local directory structure
+mkdir -p modal-volume-local/{checkpoints,vae,loras,workflows,custom_nodes,outputs}
+
+# 3. Place your licensed checkpoint files
+cp /path/to/your/model.safetensors modal-volume-local/checkpoints/
+
+# 4. Copy workflow files
+cp examples/workflows/*.json modal-volume-local/workflows/
+
+# 5. Create model manifest (optional but recommended)
+cp examples/modal-worker/model_manifest.example.json modal-volume-local/model_manifest.json
+
+# 6. Validate manifest and volume layout
+python examples/modal-worker/modal_volume_setup.py \
+  --manifest modal-volume-local/model_manifest.json \
+  --local-root modal-volume-local \
+  --validate-only
+
+# 7. Generate and run upload commands
+python examples/modal-worker/modal_volume_setup.py \
+  --manifest modal-volume-local/model_manifest.json \
+  --local-root modal-volume-local \
+  --volume-name manga-autopilot-comfyui \
+  --print-commands
+
+# 8. Execute the generated commands
+modal volume put manga-autopilot-comfyui ./modal-volume-local/checkpoints/model.safetensors /checkpoints/model.safetensors
+
+# 9. Deploy worker
+modal deploy examples/modal-worker/modal_comfyui_worker.py
+
+# 10. Verify with preflight
+curl -X POST https://your-app.modal.run/v1/preflight \
+  -H "Content-Type: application/json" \
+  -d '{"workflow_id": "anime_t2i_default"}'
+```
+
+### CLI Options
+
+```bash
+python examples/modal-worker/modal_volume_setup.py \
+  --manifest examples/modal-worker/model_manifest.example.json \
+  --local-root ./modal-volume-local \
+  --volume-name manga-autopilot-comfyui \
+  --print-commands
+```
+
+| Option | Description |
+|--------|-------------|
+| `--manifest` | Path to model manifest JSON |
+| `--local-root` | Path to local volume directory |
+| `--volume-name` | Modal Volume name |
+| `--print-commands` | Print upload commands |
+| `--validate-only` | Only validate, don't generate commands |
+
+### Contract Tests (standard CI)
+
+```bash
+pytest tests/backend/test_modal_volume_setup.py -q
+```
+
+### Important Notes
+
+- **This project does not download checkpoints automatically.**
+- **Only use model files you are licensed or permitted to use.**
+- **Do not commit model files into this repository.**
+- SHA-256 checksums in manifest are optional but recommended for verification.
+- The helper generates commands but does not execute them.
