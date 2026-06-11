@@ -1,0 +1,38 @@
+{
+  "version": 1,
+  "models": [
+    {
+      "id": "anima-main",
+      "type": "checkpoint",
+      "filename": "anima.safetensors",
+      "relative_path": "checkpoints/anima.safetensors",
+      "required": true,
+      "sha256": null,
+      "notes": "Place your licensed checkpoint here manually."
+    },
+    {
+      "id": "default-vae",
+      "type": "vae",
+      "filename": "example_vae.safetensors",
+      "relative_path": "vae/example_vae.safetensors",
+      "required": false,
+      "sha256": null
+    },
+    {
+      "id": "character-lora",
+      "type": "lora",
+      "filename": "character_lora.safetensors",
+      "relative_path": "loras/character_lora.safetensors",
+      "required": false,
+      "sha256": null
+    }
+  ],
+  "workflows": [
+    {
+      "workflow_id": "anime_t2i_default",
+      "workflow_path": "workflows/anime_t2i_default.workflow.json",
+      "registry_path": "workflows/anime_t2i_default.registry.json",
+      "required_models": ["anima-main"]
+    }
+  ]
+}

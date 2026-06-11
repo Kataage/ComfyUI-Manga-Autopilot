@@ -241,6 +241,17 @@ The following items are **out of scope** for v1.0 and remain in the Planned sect
 | Preflight endpoint | Done | `modal_comfyui_worker.py` | Yes | POST /v1/preflight runs all checks |
 | Real Modal preflight (opt-in) | Opt-in | `test_real_modal_comfyui_e2e.py` | No | Requires Modal account and worker URL |
 
+### Modal Volume Setup Helper
+
+| Area | Status | Test | CI | Notes |
+|------|--------|------|----|-------|
+| Contract: manifest loading | Done | `test_modal_volume_setup.py` (25 tests) | Yes | No Modal SDK required |
+| Contract: manifest validation | Done | `test_modal_volume_setup.py` | Yes | Validates version, models, workflows |
+| Contract: volume layout validation | Done | `test_modal_volume_setup.py` | Yes | Checks required models, SHA-256 |
+| Contract: SHA-256 calculation | Done | `test_modal_volume_setup.py` | Yes | Deterministic hash computation |
+| Contract: modal volume put commands | Done | `test_modal_volume_setup.py` | Yes | Generates commands without executing |
+| CLI helper | Done | `modal_volume_setup.py` | Yes | --validate-only, --print-commands |
+
 ## How to Use
 
 ### Before every release

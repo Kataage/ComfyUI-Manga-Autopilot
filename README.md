@@ -414,6 +414,16 @@ ComfyUI readiness before generation.  Endpoints:
 
 Contract tests run in standard CI without Modal/ComfyUI.
 
+### Modal Volume Setup Helper
+
+The `modal_volume_setup.py` helper validates model manifests and
+generates `modal volume put` commands for uploading files to Modal
+Volume.  No auto-download — users place licensed models manually.
+
+- Manifest: `examples/modal-worker/model_manifest.example.json`
+- Helper: `examples/modal-worker/modal_volume_setup.py`
+- Contract tests: `tests/backend/test_modal_volume_setup.py`
+
 ## Documentation
 
 - [`CHANGELOG.md`](CHANGELOG.md) — release history
