@@ -398,6 +398,16 @@ API ワークフローを実行します。checkpoint はユーザーが Modal V
   `MANGA_AUTOPILOT_MODAL_COMFYUI_WORKER_URL` +
   `MANGA_AUTOPILOT_MODAL_COMFYUI_WORKFLOW_JSON`
 
+### Modal ComfyUI Preflight
+
+Preflight 検証は生成前に volume、checkpoint、workflow、ComfyUI の準備状態を
+チェックします。エンドポイント：
+
+- `GET /v1/health` — ワーカーのヘルスチェック
+- `POST /v1/preflight` — 全ての preflight チェックを実行
+
+contract tests は Modal/ComfyUI なしで標準 CI で実行できます。
+
 ## ドキュメント
 
 - [`CHANGELOG.md`](CHANGELOG.md) — リリース履歴

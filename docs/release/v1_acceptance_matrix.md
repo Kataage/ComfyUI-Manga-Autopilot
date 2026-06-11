@@ -228,6 +228,19 @@ The following items are **out of scope** for v1.0 and remain in the Planned sect
 | Contract: checkpoint resolution | Done | `test_modal_comfyui_worker_contract.py` | Yes | resolve_checkpoint_path raises on missing |
 | Real Modal ComfyUI smoke test (opt-in) | Opt-in | `test_real_modal_comfyui_e2e.py` | No | Requires Modal account, GPU, volume, and workflow JSON |
 
+### Modal ComfyUI Preflight
+
+| Area | Status | Test | CI | Notes |
+|------|--------|------|----|-------|
+| Contract: env validation | Done | `test_modal_comfyui_preflight.py` (32 tests) | Yes | No Modal SDK required |
+| Contract: path validation | Done | `test_modal_comfyui_preflight.py` | Yes | Validates comfyui_root, checkpoints_dir |
+| Contract: checkpoint validation | Done | `test_modal_comfyui_preflight.py` | Yes | Checks file exists, lists available |
+| Contract: workflow registry validation | Done | `test_modal_comfyui_preflight.py` | Yes | Validates structure and bindings |
+| Contract: checkpoint auto-detection | Done | `test_modal_comfyui_preflight.py` | Yes | Reads from CheckpointLoaderSimple node |
+| Health endpoint | Done | `modal_comfyui_worker.py` | Yes | GET /v1/health returns worker status |
+| Preflight endpoint | Done | `modal_comfyui_worker.py` | Yes | POST /v1/preflight runs all checks |
+| Real Modal preflight (opt-in) | Opt-in | `test_real_modal_comfyui_e2e.py` | No | Requires Modal account and worker URL |
+
 ## How to Use
 
 ### Before every release

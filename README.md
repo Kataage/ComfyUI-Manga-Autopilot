@@ -404,6 +404,16 @@ Volume by the user — no auto-download.
   `MANGA_AUTOPILOT_MODAL_COMFYUI_WORKER_URL` +
   `MANGA_AUTOPILOT_MODAL_COMFYUI_WORKFLOW_JSON`
 
+### Modal ComfyUI Preflight
+
+Preflight validation checks volume, checkpoint, workflow, and
+ComfyUI readiness before generation.  Endpoints:
+
+- `GET /v1/health` — worker health check
+- `POST /v1/preflight` — run all preflight checks
+
+Contract tests run in standard CI without Modal/ComfyUI.
+
 ## Documentation
 
 - [`CHANGELOG.md`](CHANGELOG.md) — release history
