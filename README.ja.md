@@ -385,6 +385,19 @@ Modal アカウント + 環境変数が必要です。
   `MANGA_AUTOPILOT_MODAL_WORKER_URL=https://your-app.modal.run`
 - 現在の MVP はプレースホルダー画像を返す（本物の ComfyUI はまだ未実装）
 
+### Modal ComfyUI 実行（オプトイン）
+
+実際の ComfyUI 実行ワーカー（`modal_comfyui_worker.py`）は Modal GPU 上で
+API ワークフローを実行します。checkpoint はユーザーが Modal Volume に配置する
+前提です（自動ダウンロードなし）。
+
+- インストール: `pip install -e ".[modal]"`
+- Volume: `modal volume create manga-autopilot-comfyui`
+- デプロイ: `modal deploy examples/modal-worker/modal_comfyui_worker.py`
+- オプトインテスト: `MANGA_AUTOPILOT_REAL_MODAL_COMFYUI_E2E=1` +
+  `MANGA_AUTOPILOT_MODAL_COMFYUI_WORKER_URL` +
+  `MANGA_AUTOPILOT_MODAL_COMFYUI_WORKFLOW_JSON`
+
 ## ドキュメント
 
 - [`CHANGELOG.md`](CHANGELOG.md) — リリース履歴

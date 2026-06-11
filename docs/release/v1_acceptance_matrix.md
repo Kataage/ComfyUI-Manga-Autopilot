@@ -216,6 +216,18 @@ The following items are **out of scope** for v1.0 and remain in the Planned sect
 | Real Modal GPU smoke test (opt-in) | Opt-in | `test_real_modal_worker_e2e.py` | No | Requires Modal account + env vars |
 | Optional Modal dependency | Done | `pyproject.toml` | Yes | `pip install -e ".[modal]"` only |
 
+### Modal ComfyUI Execution MVP
+
+| Area | Status | Test | CI | Notes |
+|------|--------|------|----|-------|
+| Contract: payload validation | Done | `test_modal_comfyui_worker_contract.py` (38 tests) | Yes | No Modal SDK required |
+| Contract: success response | Done | `test_modal_comfyui_worker_contract.py` | Yes | status=completed, image_base64, metadata.executor |
+| Contract: error response | Done | `test_modal_comfyui_worker_contract.py` | Yes | status=error, error message, metadata.executor |
+| Contract: workflow binding injection | Done | `test_modal_comfyui_worker_contract.py` | Yes | inject_bindings injects values into API graph |
+| Contract: workflow registry loading | Done | `test_modal_comfyui_worker_contract.py` | Yes | load_workflow_registry loads JSON |
+| Contract: checkpoint resolution | Done | `test_modal_comfyui_worker_contract.py` | Yes | resolve_checkpoint_path raises on missing |
+| Real Modal ComfyUI smoke test (opt-in) | Opt-in | `test_real_modal_comfyui_e2e.py` | No | Requires Modal account, GPU, volume, and workflow JSON |
+
 ## How to Use
 
 ### Before every release

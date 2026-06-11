@@ -135,3 +135,100 @@ pytest tests/backend/test_modal_worker_contract.py -q
 - run_id-based artifact naming
 - Timeout / cancel propagation to Modal functions
 - Production-ready GPU type configuration
+
+---
+
+## Modal ComfyUI Execution Worker
+
+The `modal_comfyui_worker.py` file provides a real ComfyUI execution
+path on Modal GPU.  It loads workflow registry JSON, injects bindings,
+and executes the ComfyUI API workflow.
+
+### Setup
+
+```bash
+# Install Modal optional dependency
+pip install -e ".[modal]"
+
+# Authenticate with Modal
+modal setup
+
+# Create volume for checkpoints and workflows
+modal volume create manga-autopilot-comfyui
+```
+
+### Volume Structure
+
+```
+/modal-volumes/comfyui/
+├── checkpoints/
+│   └── example.safetensors
+├── workflows/
+│   └── anime_t2i_default.registry.json
+└── outputs/
+```
+
+### Add Checkpoints
+
+```bash
+# Upload checkpoint to Modal Volume
+modal volume put manga-autopilot-comfyui \
+  /path/to/your/checkpoint.safetensors \
+  /checkpoints/checkpoint.safetensors
+
+# Upload workflow registry (optional, examples/workflows also works)
+modal volume put manga-autopilot-comfyui \
+  examples/workflows/anime_t2i_default.registry.json \
+  /workflows/anime_t2i_default.registry.json
+```
+
+### Deploy
+
+```bash
+modal deploy examples/modal-worker/modal_comfyui_worker.py
+```
+
+### Environment Variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `MANGA_AUTOPILOT_MODAL_VOLUME_NAME` | `manga-autopilot-comfyui` | Modal Volume name |
+| `MANGA_MODAL_COMFYUI_ROOT` | `/root/ComfyUI` | ComfyUI installation root |
+| `MANGA_MODAL_COMFYUI_PORT` | `8188` | ComfyUI server port |
+| `MANGA_MODAL_COMFYUI_STARTUP_TIMEOUT` | `120` | Seconds to wait for ComfyUI |
+| `MANGA_MODAL_COMFYUI_REQUEST_TIMEOUT` | `300` | Seconds for workflow execution |
+| `MANGA_MODAL_OUTPUT_DIR` | `/outputs` | Output directory |
+
+### Opt-in Test
+
+```bash
+MANGA_AUTOPILOT_REAL_MODAL_COMFYUI_E2E=1 \
+MANGA_AUTOPILOT_MODAL_COMFYUI_WORKER_URL=https://your-app.modal.run \
+MANGA_AUTOPILOT_MODAL_COMFYUI_WORKFLOW_JSON=examples/workflows/anime_t2i_default.registry.json \
+pytest tests/backend/test_real_modal_comfyui_e2e.py -q
+```
+
+### Common Errors
+
+| Error | Cause | Fix |
+|-------|-------|-----|
+| `checkpoint not found: X` | Checkpoint not on Volume | Upload checkpoint to Modal Volume |
+| `ComfyUI main.py not found` | ComfyUI not installed | Ensure ComfyUI is in the Modal image |
+| `workflow registry not found` | Missing registry JSON | Upload registry or use examples/workflows |
+| `ComfyUI server not ready` | Startup timeout | Increase `COMFYUI_STARTUP_TIMEOUT` |
+| `no output image found` | Workflow failed | Check workflow graph and node connections |
+
+### Contract Tests (standard CI)
+
+```bash
+pytest tests/backend/test_modal_comfyui_worker_contract.py -q
+```
+
+### Current Limitations (ComfyUI Worker)
+
+- ComfyUI must be pre-installed in the Modal image
+- Checkpoints must be manually placed on Modal Volume
+- No automatic model cache or warm starts
+- No production-ready auth or artifact storage
+- In-memory ComfyUI subprocess (restarts each invocation)
+- No long-running ComfyUI server optimization
