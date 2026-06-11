@@ -391,6 +391,19 @@ a Modal account + env vars to run.
   `MANGA_AUTOPILOT_MODAL_WORKER_URL=https://your-app.modal.run`
 - Current MVP returns placeholder images (no real ComfyUI yet)
 
+### Modal ComfyUI Execution (opt-in)
+
+A real ComfyUI execution worker (`modal_comfyui_worker.py`) runs
+API workflows on Modal GPU.  Checkpoints must be placed on a Modal
+Volume by the user — no auto-download.
+
+- Install: `pip install -e ".[modal]"`
+- Volume: `modal volume create manga-autopilot-comfyui`
+- Deploy: `modal deploy examples/modal-worker/modal_comfyui_worker.py`
+- Opt-in test: `MANGA_AUTOPILOT_REAL_MODAL_COMFYUI_E2E=1` +
+  `MANGA_AUTOPILOT_MODAL_COMFYUI_WORKER_URL` +
+  `MANGA_AUTOPILOT_MODAL_COMFYUI_WORKFLOW_JSON`
+
 ## Documentation
 
 - [`CHANGELOG.md`](CHANGELOG.md) — release history
