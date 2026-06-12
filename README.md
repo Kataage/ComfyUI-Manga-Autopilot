@@ -424,6 +424,16 @@ Volume.  No auto-download — users place licensed models manually.
 - Helper: `examples/modal-worker/modal_volume_setup.py`
 - Contract tests: `tests/backend/test_modal_volume_setup.py`
 
+### R2/S3 Artifact Store
+
+Optional artifact store for uploading generated images to S3-compatible
+storage (AWS S3, Cloudflare R2).  Standard CI uses local file storage.
+
+- Interface: `src/manga_autopilot/services/artifact_store.py`
+- Local store: `LocalArtifactStore` (default in CI)
+- S3 store: `S3CompatibleArtifactStore` (requires `pip install -e ".[s3]"`)
+- Contract tests: `tests/backend/test_artifact_store.py`
+
 ## Documentation
 
 - [`CHANGELOG.md`](CHANGELOG.md) — release history

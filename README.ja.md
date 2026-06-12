@@ -418,6 +418,16 @@ contract tests は Modal/ComfyUI なしで標準 CI で実行できます。
 - ヘルパー: `examples/modal-worker/modal_volume_setup.py`
 - Contract tests: `tests/backend/test_modal_volume_setup.py`
 
+### R2/S3 アーティファクトストア
+
+S3互換ストレージ（AWS S3、Cloudflare R2）へ生成画像をアップロードする
+オプションのアーティファクトストア。標準CIではローカルファイルストレージを使用。
+
+- インターフェース: `src/manga_autopilot/services/artifact_store.py`
+- ローカルストア: `LocalArtifactStore`（CI デフォルト）
+- S3ストア: `S3CompatibleArtifactStore`（`pip install -e ".[s3]"` 必要）
+- Contract tests: `tests/backend/test_artifact_store.py`
+
 ## ドキュメント
 
 - [`CHANGELOG.md`](CHANGELOG.md) — リリース履歴
