@@ -37,6 +37,9 @@ dev = [
 modal = [
     "modal>=0.64.0",
 ]
+s3 = [
+    "boto3>=1.34.0",
+]
 
 [project.urls]
 Homepage = "https://github.com/Kataage/ComfyUI-Manga-Autopilot"

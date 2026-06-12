@@ -252,6 +252,19 @@ The following items are **out of scope** for v1.0 and remain in the Planned sect
 | Contract: modal volume put commands | Done | `test_modal_volume_setup.py` | Yes | Generates commands without executing |
 | CLI helper | Done | `modal_volume_setup.py` | Yes | --validate-only, --print-commands |
 
+### R2/S3 Artifact Store Foundation
+
+| Area | Status | Test | CI | Notes |
+|------|--------|------|----|-------|
+| ArtifactStore protocol | Done | `test_artifact_store.py` (21 tests) | Yes | No cloud credentials required |
+| LocalArtifactStore upload | Done | `test_artifact_store.py` | Yes | Saves to local directory |
+| LocalArtifactStore path traversal | Done | `test_artifact_store.py` | Yes | Rejects `..`, absolute paths |
+| LocalArtifactStore public URL | Done | `test_artifact_store.py` | Yes | Generates URL when configured |
+| build_panel_artifact_key | Done | `test_artifact_store.py` | Yes | Safe key generation |
+| S3 store requires boto3 | Done | `test_artifact_store.py` | Yes | Clear ImportError when missing |
+| Factory from env vars | Done | `test_artifact_store.py` | Yes | Reads MANGA_AUTOPILOT_ARTIFACT_STORE |
+| Real S3/R2 E2E (opt-in) | Opt-in | `test_real_s3_artifact_store_e2e.py` | No | Requires S3 bucket and credentials |
+
 ## How to Use
 
 ### Before every release
