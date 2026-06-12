@@ -265,6 +265,20 @@ The following items are **out of scope** for v1.0 and remain in the Planned sect
 | Factory from env vars | Done | `test_artifact_store.py` | Yes | Reads MANGA_AUTOPILOT_ARTIFACT_STORE |
 | Real S3/R2 E2E (opt-in) | Opt-in | `test_real_s3_artifact_store_e2e.py` | No | Requires S3 bucket and credentials |
 
+### Artifact Access Policy & Signed URLs
+
+| Area | Status | Test | CI | Notes |
+|------|--------|------|----|-------|
+| ArtifactAccessPolicy model | Done | `test_artifact_access.py` (28 tests) | Yes | public/private/signed modes |
+| LocalArtifactUrlSigner | Done | `test_artifact_access.py` | Yes | CI default signer |
+| S3 presigned URL signer (mocked) | Done | `test_artifact_access.py` | Yes | boto3 presigned URL |
+| S3 signer requires boto3 | Done | `test_artifact_access.py` | Yes | Clear ImportError when missing |
+| S3 signer rejects empty bucket | Done | `test_artifact_access.py` | Yes | ValueError on init |
+| Path traversal rejection | Done | `test_artifact_access.py` | Yes | Rejects `..`, absolute paths |
+| Env policy factory | Done | `test_artifact_access.py` | Yes | Reads MANGA_AUTOPILOT_ARTIFACT_ACCESS_MODE |
+| Env signer factory | Done | `test_artifact_access.py` | Yes | Returns signer or None |
+| Real S3/R2 signed URL E2E (opt-in) | Opt-in | `test_real_s3_signed_url_e2e.py` | No | Requires S3 + signed mode |
+
 ## How to Use
 
 ### Before every release

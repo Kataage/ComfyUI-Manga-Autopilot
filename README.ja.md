@@ -428,6 +428,27 @@ S3互換ストレージ（AWS S3、Cloudflare R2）へ生成画像をアップ�
 - S3ストア: `S3CompatibleArtifactStore`（`pip install -e ".[s3]"` 必要）
 - Contract tests: `tests/backend/test_artifact_store.py`
 
+### アーティファクトアクセスポリシー＆署名付きURL
+
+アーティファクトURLの生成、保存、アクセス方法を制御：
+
+- **public**: artifact_urlをメタデータに保存；署名不要
+- **private**: artifact_keyのみ保存；URLは返さない
+- **signed**: artifact_keyを保存；必要時に期限付きURLを発行
+
+- インターフェース: `src/manga_autopilot/services/artifact_access.py`
+- ローカル署名: `LocalArtifactUrlSigner`（CI デフォルト）
+- S3署名: `S3CompatibleArtifactUrlSigner`（`pip install -e ".[s3]"` 必要）
+- Contract tests: `tests/backend/test_artifact_access.py`
+
+### アーティファクトアクセスポリシー環境変数
+
+| 変数 | デフォルト | 説明 |
+|------|-----------|------|
+| `MANGA_AUTOPILOT_ARTIFACT_ACCESS_MODE` | `public` | `public`、`private`、または `signed` |
+| `MANGA_AUTOPILOT_SIGNED_URL_TTL_SECONDS` | `3600` | 署名付きURLのTTL |
+| `MANGA_AUTOPILOT_PERSIST_SIGNED_URLS` | `false` | 署名付きURLをメタデータに保存 |
+
 ## ドキュメント
 
 - [`CHANGELOG.md`](CHANGELOG.md) — リリース履歴

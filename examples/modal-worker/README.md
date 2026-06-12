@@ -462,3 +462,56 @@ pytest tests/backend/test_modal_volume_setup.py -q
 - **Do not commit model files into this repository.**
 - SHA-256 checksums in manifest are optional but recommended for verification.
 - The helper generates commands but does not execute them.
+
+## Artifact Access Policy & Signed URLs
+
+Controls how artifact URLs are generated, stored, and accessed by Modal
+workers and clients.
+
+### Modes
+
+| Mode | Description | URL in metadata |
+|------|-------------|-----------------|
+| `public` | artifact_url stored; no signing | Yes |
+| `private` | only artifact_key stored; no URL | No |
+| `signed` | artifact_key stored; presigned URLs on demand | No (ephemeral) |
+
+### Environment Variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `MANGA_AUTOPILOT_ARTIFACT_ACCESS_MODE` | `public` | Access mode |
+| `MANGA_AUTOPILOT_SIGNED_URL_TTL_SECONDS` | `3600` | Signed URL TTL |
+| `MANGA_AUTOPILOT_PERSIST_SIGNED_URLS` | `false` | Persist signed URLs |
+
+### R2 Private Bucket with Signed URLs
+
+For production with Cloudflare R2:
+
+```bash
+export MANGA_AUTOPILOT_ARTIFACT_STORE=s3
+export MANGA_AUTOPILOT_ARTIFACT_ACCESS_MODE=signed
+export MANGA_AUTOPILOT_S3_ENDPOINT_URL=https://<account_id>.r2.cloudflarestorage.com
+export MANGA_AUTOPILOT_S3_BUCKET=my-manga-artifacts
+export MANGA_AUTOPILOT_S3_REGION=auto
+export MANGA_AUTOPILOT_S3_ACCESS_KEY_ID=...
+export MANGA_AUTOPILOT_S3_SECRET_ACCESS_KEY=...
+export MANGA_AUTOPILOT_SIGNED_URL_TTL_SECONDS=3600
+```
+
+### Artifact Key Naming
+
+```
+projects/{project_id}/runs/{run_id}/pages/{page_id}/panels/{panel_id}/{candidate_id}.png
+```
+
+Keys are canonical and safe for S3. Path traversal and absolute paths
+are rejected.
+
+### Security Notes
+
+- **Signed URLs are ephemeral** — not persisted in metadata by default.
+- **artifact_key is canonical** — always stored; URL is optional.
+- S3 presigned URLs require credentials (boto3).
+- Standard CI uses `LocalArtifactUrlSigner` (no cloud credentials).
+- No user authentication is implemented yet.
