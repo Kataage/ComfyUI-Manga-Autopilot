@@ -434,6 +434,27 @@ storage (AWS S3, Cloudflare R2).  Standard CI uses local file storage.
 - S3 store: `S3CompatibleArtifactStore` (requires `pip install -e ".[s3]"`)
 - Contract tests: `tests/backend/test_artifact_store.py`
 
+### Artifact Access Policy & Signed URLs
+
+Controls how artifact URLs are generated, stored, and accessed:
+
+- **public**: artifact_url stored in metadata; no signing needed
+- **private**: only artifact_key stored; no URL returned
+- **signed**: artifact_key stored; presigned URLs issued on demand
+
+- Interface: `src/manga_autopilot/services/artifact_access.py`
+- Local signer: `LocalArtifactUrlSigner` (CI default)
+- S3 signer: `S3CompatibleArtifactUrlSigner` (requires `pip install -e ".[s3]"`)
+- Contract tests: `tests/backend/test_artifact_access.py`
+
+### Artifact Access Policy Environment Variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `MANGA_AUTOPILOT_ARTIFACT_ACCESS_MODE` | `public` | `public`, `private`, or `signed` |
+| `MANGA_AUTOPILOT_SIGNED_URL_TTL_SECONDS` | `3600` | Signed URL TTL |
+| `MANGA_AUTOPILOT_PERSIST_SIGNED_URLS` | `false` | Persist signed URLs in metadata |
+
 ## Documentation
 
 - [`CHANGELOG.md`](CHANGELOG.md) — release history
