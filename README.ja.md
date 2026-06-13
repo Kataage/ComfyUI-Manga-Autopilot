@@ -449,6 +449,34 @@ S3互換ストレージ（AWS S3、Cloudflare R2）へ生成画像をアップ�
 | `MANGA_AUTOPILOT_SIGNED_URL_TTL_SECONDS` | `3600` | 署名付きURLのTTL |
 | `MANGA_AUTOPILOT_PERSIST_SIGNED_URLS` | `false` | 署名付きURLをメタデータに保存 |
 
+### Modal Worker プロダクション強化
+
+Modal GPU ワーカーの運用安全保障：
+
+- Bearer token 認証（オプション）
+- タイムアウトポリシー（startup/generation/upload/job TTL）
+- 非同期ジョブライフサイクル（queued → running → completed/error/cancelled/expired）
+- 古いジョブのクリーンアップ
+- Concurrency guard
+- 構造化 diagnostics エンドポイント
+- 構造化 error codes
+
+- インターフェース: `src/manga_autopilot/services/modal_worker_hardening.py`
+- Contract tests: `tests/backend/test_modal_worker_hardening.py`
+
+### Modal Worker 環境変数
+
+| 変数 | デフォルト | 説明 |
+|------|-----------|------|
+| `MANGA_AUTOPILOT_MODAL_WORKER_TOKEN` | （空） | 認証用 Bearer token |
+| `MANGA_AUTOPILOT_MODAL_HEALTH_REQUIRES_AUTH` | `false` | /v1/health の認証 |
+| `MANGA_AUTOPILOT_MODAL_STARTUP_TIMEOUT_SEC` | `120` | ComfyUI 起動タイムアウト |
+| `MANGA_AUTOPILOT_MODAL_GENERATION_TIMEOUT_SEC` | `600` | 生成タイムアウト |
+| `MANGA_AUTOPILOT_MODAL_UPLOAD_TIMEOUT_SEC` | `120` | アップロードタイムアウト |
+| `MANGA_AUTOPILOT_MODAL_JOB_TTL_SEC` | `3600` | 非同期ジョブ TTL |
+| `MANGA_AUTOPILOT_MODAL_MAX_CONCURRENT_JOBS` | `1` | 最大同時ジョブ数 |
+| `MANGA_AUTOPILOT_MODAL_REJECT_WHEN_BUSY` | `true` | 満杯時にリジェクト |
+
 ## ドキュメント
 
 - [`CHANGELOG.md`](CHANGELOG.md) — リリース履歴

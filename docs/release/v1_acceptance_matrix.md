@@ -279,6 +279,19 @@ The following items are **out of scope** for v1.0 and remain in the Planned sect
 | Env signer factory | Done | `test_artifact_access.py` | Yes | Returns signer or None |
 | Real S3/R2 signed URL E2E (opt-in) | Opt-in | `test_real_s3_signed_url_e2e.py` | No | Requires S3 + signed mode |
 
+### Modal Worker Production Hardening
+
+| Area | Status | Test | CI | Notes |
+|------|--------|------|----|-------|
+| Bearer token auth | Done | `test_modal_worker_hardening.py` (29 tests) | Yes | Optional token auth |
+| Timeout policy model | Done | `test_modal_worker_hardening.py` | Yes | Env-based config |
+| Timeout policy rejects invalid | Done | `test_modal_worker_hardening.py` | Yes | > 0 required |
+| Async job metadata | Done | `test_modal_worker_hardening.py` | Yes | Timestamps + expires_at |
+| Job TTL / expired cleanup | Done | `test_modal_worker_hardening.py` | Yes | mark/cleanup expired |
+| Concurrency guard | Done | `test_modal_worker_hardening.py` | Yes | reject_when_busy |
+| Structured error response | Done | `test_modal_worker_hardening.py` | Yes | error_code field |
+| Diagnostics response | Done | `test_modal_worker_hardening.py` | Yes | auth/timeout/concurrency/artifact |
+
 ## How to Use
 
 ### Before every release

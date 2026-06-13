@@ -515,3 +515,127 @@ are rejected.
 - S3 presigned URLs require credentials (boto3).
 - Standard CI uses `LocalArtifactUrlSigner` (no cloud credentials).
 - No user authentication is implemented yet.
+
+## Production Hardening
+
+Operational safety controls for Modal GPU workers in production-like
+environments.
+
+### Auth Setup
+
+```bash
+# Set a bearer token for worker endpoints
+export MANGA_AUTOPILOT_MODAL_WORKER_TOKEN=your-secret-token
+
+# Optional: require auth for /v1/health (default: no)
+export MANGA_AUTOPILOT_MODAL_HEALTH_REQUIRES_AUTH=false
+```
+
+**Important:** `MANGA_AUTOPILOT_REMOTE_WORKER_TOKEN` must match
+`MANGA_AUTOPILOT_MODAL_WORKER_TOKEN` when using RemoteHTTPExecutor.
+
+### Timeout Tuning
+
+```bash
+export MANGA_AUTOPILOT_MODAL_STARTUP_TIMEOUT_SEC=120
+export MANGA_AUTOPILOT_MODAL_GENERATION_TIMEOUT_SEC=600
+export MANGA_AUTOPILOT_MODAL_UPLOAD_TIMEOUT_SEC=120
+export MANGA_AUTOPILOT_MODAL_JOB_TTL_SEC=3600
+```
+
+### Concurrency Tuning
+
+```bash
+export MANGA_AUTOPILOT_MODAL_MAX_CONCURRENT_JOBS=1
+export MANGA_AUTOPILOT_MODAL_REJECT_WHEN_BUSY=true
+```
+
+### Diagnostics Endpoint
+
+```bash
+curl https://your-worker-url/v1/health
+```
+
+Response:
+
+```json
+{
+  "status": "ok",
+  "executor": "modal-comfyui",
+  "auth_enabled": true,
+  "health_requires_auth": false,
+  "timeouts": {
+    "startup_timeout_sec": 120,
+    "generation_timeout_sec": 600,
+    "upload_timeout_sec": 120,
+    "job_ttl_sec": 3600
+  },
+  "concurrency": {
+    "max_concurrent_jobs": 1,
+    "running_jobs": 0,
+    "queued_jobs": 0,
+    "reject_when_busy": true
+  },
+  "artifact": {
+    "mode": "base64",
+    "store": "local",
+    "access_mode": "public"
+  }
+}
+```
+
+### Unauthorized Response
+
+```json
+{
+  "status": "error",
+  "error": "unauthorized",
+  "error_code": "UNAUTHORIZED",
+  "metadata": {
+    "executor": "modal-comfyui"
+  }
+}
+```
+
+### Worker Busy Response
+
+```json
+{
+  "status": "error",
+  "error": "worker busy",
+  "error_code": "WORKER_BUSY",
+  "metadata": {
+    "executor": "modal-comfyui"
+  }
+}
+```
+
+### Structured Error Codes
+
+| Code | Description |
+|------|-------------|
+| `UNAUTHORIZED` | Invalid or missing bearer token |
+| `WORKER_BUSY` | At concurrency limit |
+| `STARTUP_TIMEOUT` | ComfyUI server did not start |
+| `GENERATION_TIMEOUT` | Generation exceeded time limit |
+| `UPLOAD_TIMEOUT` | Artifact upload failed |
+| `CHECKPOINT_NOT_FOUND` | Model checkpoint missing |
+| `WORKFLOW_INVALID` | Invalid workflow registry |
+| `COMFYUI_NOT_READY` | ComfyUI not responding |
+| `ARTIFACT_UPLOAD_FAILED` | Upload error |
+| `JOB_NOT_FOUND` | Async job not found |
+| `JOB_EXPIRED` | Job TTL elapsed |
+| `JOB_CANCELLED` | Job was cancelled |
+| `UNKNOWN_ERROR` | Unexpected error |
+
+### Recommended Defaults
+
+| Variable | Value | Notes |
+|----------|-------|-------|
+| `MANGA_AUTOPILOT_MODAL_WORKER_TOKEN` | (set in prod) | Required for auth |
+| `MANGA_AUTOPILOT_MODAL_STARTUP_TIMEOUT_SEC` | `120` | Increase for slow GPU |
+| `MANGA_AUTOPILOT_MODAL_GENERATION_TIMEOUT_SEC` | `600` | Depends on workflow |
+| `MANGA_AUTOPILOT_MODAL_UPLOAD_TIMEOUT_SEC` | `120` | Depends on artifact size |
+| `MANGA_AUTOPILOT_MODAL_JOB_TTL_SEC` | `3600` | 1 hour default |
+| `MANGA_AUTOPILOT_MODAL_MAX_CONCURRENT_JOBS` | `1` | Match GPU count |
+| `MANGA_AUTOPILOT_MODAL_REJECT_WHEN_BUSY` | `true` | Safer for prod |
