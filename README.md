@@ -455,6 +455,34 @@ Controls how artifact URLs are generated, stored, and accessed:
 | `MANGA_AUTOPILOT_SIGNED_URL_TTL_SECONDS` | `3600` | Signed URL TTL |
 | `MANGA_AUTOPILOT_PERSIST_SIGNED_URLS` | `false` | Persist signed URLs in metadata |
 
+### Modal Worker Production Hardening
+
+Operational safety controls for Modal GPU workers:
+
+- Bearer token authentication (optional)
+- Timeout policy (startup/generation/upload/job TTL)
+- Async job lifecycle (queued → running → completed/error/cancelled/expired)
+- Stale job cleanup
+- Concurrency guard
+- Structured diagnostics endpoint
+- Structured error codes
+
+- Interface: `src/manga_autopilot/services/modal_worker_hardening.py`
+- Contract tests: `tests/backend/test_modal_worker_hardening.py`
+
+### Modal Worker Environment Variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `MANGA_AUTOPILOT_MODAL_WORKER_TOKEN` | (empty) | Bearer token for auth |
+| `MANGA_AUTOPILOT_MODAL_HEALTH_REQUIRES_AUTH` | `false` | Auth for /v1/health |
+| `MANGA_AUTOPILOT_MODAL_STARTUP_TIMEOUT_SEC` | `120` | ComfyUI startup timeout |
+| `MANGA_AUTOPILOT_MODAL_GENERATION_TIMEOUT_SEC` | `600` | Generation timeout |
+| `MANGA_AUTOPILOT_MODAL_UPLOAD_TIMEOUT_SEC` | `120` | Upload timeout |
+| `MANGA_AUTOPILOT_MODAL_JOB_TTL_SEC` | `3600` | Async job TTL |
+| `MANGA_AUTOPILOT_MODAL_MAX_CONCURRENT_JOBS` | `1` | Max concurrent jobs |
+| `MANGA_AUTOPILOT_MODAL_REJECT_WHEN_BUSY` | `true` | Reject when at capacity |
+
 ## Documentation
 
 - [`CHANGELOG.md`](CHANGELOG.md) — release history
