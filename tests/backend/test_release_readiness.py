@@ -32,6 +32,10 @@ class TestReleaseArtifactsExist:
         path = _REPO_ROOT / "docs" / "release" / "v1_acceptance_matrix.md"
         assert path.exists(), f"Missing: {path}"
 
+    def test_post_release_smoke_doc_exists(self):
+        path = _REPO_ROOT / "docs" / "release" / "v0.1.0-rc1_post_release_smoke.md"
+        assert path.exists(), f"Missing: {path}"
+
 
 # -------------------------------------------------------- version tests
 
