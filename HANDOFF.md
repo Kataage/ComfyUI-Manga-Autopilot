@@ -1,6 +1,6 @@
 # Claude Code handoff: Anima Manga Autopilot MVP
 
-Updated: 2026-08-26 JST (Claude Code, Task 4 complete)
+Updated: 2026-08-26 JST (Claude Code, Task 5 complete)
 
 ## Objective
 
@@ -12,7 +12,7 @@ The user accepted the recommended choices from the prior grilling session and as
 
 `docs/superpowers/plans/2026-08-26-anima-mvp.md`
 
-Follow that plan from Task 5 onward. Do not restart completed Tasks 1-4.
+Follow that plan from Task 6 onward. Do not restart completed Tasks 1-5.
 
 ## Repository and Git state
 
@@ -27,8 +27,11 @@ Completed commits:
 1. `8a95977 feat: enforce strict structured planning`
 2. `a251243 feat: add story bible and scene state reducer`
 3. `eb52846 feat: plan panels against layouts and continuity`
+4. `968399e feat: add Anima generation profiles and prompt adapter`
 
-Task 4 is implemented and green but not yet committed, pending user approval. See "Task 4 result" below.
+5. `<pending> feat: version projects and snapshot Anima runs`
+
+See "Task 4 result" and "Task 5 result" below for what those commits contain.
 
 ## Completed behavior
 
@@ -71,7 +74,7 @@ Targeted Ruff result: all checks passed. `git diff --check` also passed before t
 
 ## Task 4 result
 
-Delivered files:
+Committed as `968399e`. Delivered files:
 
 - `src/manga_autopilot/models/generation_profile.py` - `LicenseMetadata`, `GenerationSettings`, `ModelAssets`, `ResolutionPolicy`, `ResolvedResolution`, `GenerationProfile`, `SemanticPromptSegments`, plus `POSITIVE_SEGMENT_ORDER` and `PROFILE_OWNED_FIELDS`.
 - `src/manga_autopilot/services/generation_profiles.py` - `load_builtin_profile`, `list_builtin_profiles`, `resolve_panel_resolution`, `resolve_default_resolution`.
@@ -107,6 +110,44 @@ Full backend suite: `7 failed, 858 passed, 15 skipped` in 68s. The 7 failures ar
 `.\.venv\Scripts\python.exe -m ruff check src/manga_autopilot tests/backend/test_generation_profiles.py tests/backend/test_anima_prompt_builder.py` reported `All checks passed!`, and `git diff --check` was clean.
 
 Environment note: `..\test-tmp` is not writable from every agent sandbox. If pytest reports `PermissionError ... pytest-of-kouda`, point `$env:TEMP` and `$env:TMP` at a temp directory the current agent can write to. Pass `-p no:cacheprovider` when `.pytest_cache` is also unwritable.
+
+## Task 5 result
+
+Delivered files:
+
+- `src/manga_autopilot/services/project_migration.py` - `detect_schema_version`, `migrate_document`, `migrate_project_document`, `backup_project_document`, `write_project_document`, `UnsupportedSchemaVersionError`.
+- `src/manga_autopilot/services/model_fingerprint.py` - `ModelFingerprint`, `FingerprintCache`, `sha256_file`.
+- `src/manga_autopilot/services/run_snapshot.py` - `RunSnapshot`, `RunSnapshotWriter`, `PanelPromptSnapshot`, `LLMSettingsSnapshot`, `EnvironmentSnapshot`, `hash_json_document`, `scrub_secrets`, `assert_no_secrets`, `log_prompt_digest`.
+- `src/manga_autopilot/models/project.py` - `CURRENT_PROJECT_SCHEMA_VERSION = 2`, `MigrationRecord`, and the `schema_version` / `migration_history` fields.
+- `src/manga_autopilot/storage/paths.py` - `ProjectPaths.backups`.
+- `src/manga_autopilot/services/project_manager.py` - migrating load, backup-then-atomic-write save.
+- `src/manga_autopilot/services/run_artifacts.py` - `snapshot.json` reported in the run artifact summary.
+- `src/manga_autopilot/services/export.py` - `ProjectBundler.bundle(..., include_sources=False)` and `ExportService.zip(..., include_sources=False)`.
+- Tests: `tests/backend/test_project_migration.py` (12), `tests/backend/test_run_snapshot.py` (19), plus 3 in `test_run_artifacts.py` and 3 in `test_export.py`.
+
+Design decisions worth knowing:
+
+- Migration is lazy. `migrate_project_document` reads and upgrades in memory and never writes; `ProjectManager.load` uses it, so opening an old project leaves the file byte-identical. The backup and rewrite happen on the first save, and `backups/project.json.<utc-stamp>.bak` is a byte-for-byte copy of the original.
+- The on-disk document, not the in-memory `Project`, owns `schema_version` and `migration_history`. `_write` merges the model dump onto the existing document, so fields this build does not model (and the migration audit trail) survive a save by a stale caller.
+- Writes go through a temporary sibling plus `Path.replace`, so an interrupted save cannot truncate `project.json`.
+- v1 to v2 only stamps the version and records the migration. Asset paths and every other field are deliberately untouched.
+- Fingerprints keep the model's name, size, and SHA-256 but never its absolute path, so a snapshot does not leak the user's directory layout. The cache is keyed by resolved path and invalidated by size or mtime.
+- Secret detection matches whole normalised key names and singular suffixes (`_key`, `_token`, ...), not substrings. `max_tokens` is a length budget and is kept; `access_token` is a credential and is dropped. `RunSnapshotWriter.write` refuses to serialise a document that still carries one.
+- The output-only bundle is an allowlist: `exports/` plus `manifest.json`. It cannot leak a prompt even if a future release starts writing prompts into a new project-root file.
+
+Verification (2026-08-26, Claude Code):
+
+```powershell
+$env:TEMP='<a temp dir the agent can write to>'
+$env:TMP=$env:TEMP
+.\.venv\Scripts\python.exe -m pytest tests/backend/test_project_migration.py tests/backend/test_run_snapshot.py tests/backend/test_project_manager.py tests/backend/test_run_artifacts.py tests/backend/test_export.py -q -p no:cacheprovider
+```
+
+Result: `76 passed`.
+
+Full backend suite: `7 failed, 895 passed, 15 skipped` in 66s - the same 7 pre-existing portability failures, no regressions.
+
+`.\.venv\Scripts\python.exe -m ruff check src/manga_autopilot tests/backend` reported `All checks passed!`.
 
 ## Verified Anima configuration evidence
 
@@ -172,12 +213,17 @@ Task 8 should fix the tests or test fixtures with `tmp_path`, normalized persist
 
 ## Remaining sequence
 
-1. Commit Task 4 as `feat: add Anima generation profiles and prompt adapter` (awaiting user approval).
-2. Implement Task 5 migration, fingerprinting, and run snapshots.
-3. Implement Task 6 strict preflight, sequential generation semantics, and managed LM Studio lifecycle. Keep all live work opt-in.
-4. Implement Task 7 review gates, edit invalidation, and fake-service E2E.
-5. Implement Task 8 form review UI, API-format workflow example, docs, portability fixes, and full non-GPU verification.
-6. Run the final verification commands in the plan and inspect `git status`, `git diff --check`, and commit history.
+1. Implement Task 6 strict preflight, sequential generation semantics, and managed LM Studio lifecycle. Keep all live work opt-in.
+2. Implement Task 7 review gates, edit invalidation, and fake-service E2E.
+3. Implement Task 8 form review UI, API-format workflow example, docs, portability fixes, and full non-GPU verification.
+4. Run the final verification commands in the plan and inspect `git status`, `git diff --check`, and commit history.
+
+## Standing approvals (2026-08-26)
+
+Granted by the user in the Claude Code session that implemented Tasks 4 and 5:
+
+- Commit a task yourself once its tests are green, `ruff check` passes, and the full backend suite shows no new failures. Do not ask per task.
+- Still ask before: `git push`, adding a dependency, downloading or loading a model, running anything on the GPU, and any use of an external service.
 
 ## Implementation constraints and decisions
 

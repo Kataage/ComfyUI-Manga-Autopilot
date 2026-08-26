@@ -105,6 +105,11 @@ class ProjectPaths:
         return self.root / "latest_run_id.txt"
 
     @property
+    def backups(self) -> Path:
+        """Timestamped copies taken before a document is migrated in place."""
+        return self.root / "backups"
+
+    @property
     def runs(self) -> Path:
         return self.root / "runs"
 
