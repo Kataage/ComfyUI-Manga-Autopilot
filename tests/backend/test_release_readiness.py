@@ -42,22 +42,22 @@ class TestReleaseArtifactsExist:
 
 class TestVersionMetadata:
     def test_pyproject_version(self):
-        content = (_REPO_ROOT / "pyproject.toml").read_text()
+        content = (_REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8")
         match = re.search(r'^version\s*=\s*"(.+?)"', content, re.MULTILINE)
         assert match, "version not found in pyproject.toml"
         assert match.group(1) == "0.1.0-rc1"
 
     def test_init_version(self):
-        content = (_REPO_ROOT / "src" / "manga_autopilot" / "__init__.py").read_text()
+        content = (_REPO_ROOT / "src" / "manga_autopilot" / "__init__.py").read_text(encoding="utf-8")
         assert "__version__ = \"0.1.0-rc1\"" in content
 
     def test_readme_mentions_v0_1_0_rc1(self):
-        content = (_REPO_ROOT / "README.md").read_text()
+        content = (_REPO_ROOT / "README.md").read_text(encoding="utf-8")
         # Check for version mention in any form (v0.x, v1.0.0, 0.1.0)
         assert "v0.x" in content or "0.1.0" in content or "v1.0" in content
 
     def test_readme_ja_mentions_v0_1_0_rc1(self):
-        content = (_REPO_ROOT / "README.ja.md").read_text()
+        content = (_REPO_ROOT / "README.ja.md").read_text(encoding="utf-8")
         assert "v0.x" in content or "0.1.0" in content or "v1.0" in content
 
 
@@ -66,7 +66,7 @@ class TestVersionMetadata:
 
 class TestReadmeConsistency:
     def test_readme_has_key_sections(self):
-        content = (_REPO_ROOT / "README.md").read_text()
+        content = (_REPO_ROOT / "README.md").read_text(encoding="utf-8")
         sections = [
             "Modal Worker",
             "Artifact Store",
@@ -77,7 +77,7 @@ class TestReadmeConsistency:
             assert section.lower() in content.lower(), f"Missing section: {section}"
 
     def test_readme_ja_has_key_sections(self):
-        content = (_REPO_ROOT / "README.ja.md").read_text()
+        content = (_REPO_ROOT / "README.ja.md").read_text(encoding="utf-8")
         sections = [
             "Modal",
             "アーティファクト",
@@ -113,7 +113,7 @@ class TestSecurityScan:
     def test_no_example_secret_values(self):
         """Check that README/docs don't contain real-looking secrets."""
         for md_file in _REPO_ROOT.glob("*.md"):
-            content = md_file.read_text()
+            content = md_file.read_text(encoding="utf-8")
             # Real AWS key pattern: 20 uppercase chars starting with AKIA
             assert not re.search(r"AKIA[0-9A-Z]{16}", content), (
                 f"Real AWS key found in {md_file.name}"

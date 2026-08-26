@@ -483,6 +483,24 @@ Operational safety controls for Modal GPU workers:
 | `MANGA_AUTOPILOT_MODAL_MAX_CONCURRENT_JOBS` | `1` | Max concurrent jobs |
 | `MANGA_AUTOPILOT_MODAL_REJECT_WHEN_BUSY` | `true` | Reject when at capacity |
 
+## Anima MVP (strict mode)
+
+A project whose `generation_profile_id` starts with `anima_` runs in strict mode:
+the generation profile owns every technical field, prompts are rendered
+deterministically without an LLM call, four review gates pause the run, and no
+image is queued before the Storyboard gate is approved. Every other project keeps
+its previous behaviour.
+
+- Three profiles ship with the extension: `anima_base`, `anima_aesthetic`, and
+  `anima_turbo`.
+- Model weights and LoRAs are never bundled or downloaded. Install them yourself
+  and acknowledge the CircleStone Labs non-commercial licence.
+- `examples/workflows/anima_turbo.registry.json` is a ready-to-register
+  single-panel API-format workflow.
+
+See [`docs/anima_mvp.md`](docs/anima_mvp.md) for setup, the resolution policy,
+the review API, invalidation rules, snapshots, and preflight codes.
+
 ## Documentation
 
 - [`CHANGELOG.md`](CHANGELOG.md) — release history
@@ -490,6 +508,8 @@ Operational safety controls for Modal GPU workers:
   v1.0 acceptance matrix
 - [`docs/release/v1_release_checklist.md`](docs/release/v1_release_checklist.md) —
   pre-release checklist
+- [`docs/anima_mvp.md`](docs/anima_mvp.md) — Anima strict mode: profiles,
+  review gates, invalidation, snapshots, preflight
 - [`docs/install.md`](docs/install.md) — install
 - [`docs/quickstart.md`](docs/quickstart.md) — 6-step happy path
 - [`docs/workflow_binding.md`](docs/workflow_binding.md) — workflow

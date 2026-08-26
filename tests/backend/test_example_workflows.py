@@ -159,3 +159,137 @@ async def test_example_registry_comfy_executor_e2e(tmp_path: Path) -> None:
     assert submitted_graph["3"]["inputs"]["seed"] == 42
     assert submitted_graph["5"]["inputs"]["width"] == 832
     assert submitted_graph["5"]["inputs"]["height"] == 1216
+
+
+# ---------------------------------------------------------------------------
+# Anima Turbo example (plan Task 8, step 4)
+# ---------------------------------------------------------------------------
+
+_ANIMA_REGISTRY = _EXAMPLE_DIR / "anima_turbo.registry.json"
+_ANIMA_GRAPH = _EXAMPLE_DIR / "anima_turbo.workflow.json"
+
+
+def _anima_payload() -> dict[str, Any]:
+    return json.loads(_ANIMA_REGISTRY.read_text(encoding="utf-8"))
+
+
+def test_anima_example_is_a_valid_workflow_payload() -> None:
+    definition = validate_workflow_payload(_anima_payload())
+
+    assert definition.workflow_id == "anima_turbo"
+    assert definition.type_value() == "text_to_image"
+    assert definition.has_output_binding()
+
+
+def test_anima_example_graph_matches_the_standalone_file() -> None:
+    payload = _anima_payload()
+
+    assert payload["api_graph"] == json.loads(_ANIMA_GRAPH.read_text(encoding="utf-8"))
+
+
+def test_anima_example_bindings_all_resolve() -> None:
+    payload = _anima_payload()
+    graph = payload["api_graph"]
+
+    for key, binding in payload["bindings"].items():
+        node = graph.get(binding["node_id"])
+        assert node is not None, f"{key} points at a missing node"
+        assert binding["input"] in node["inputs"], f"{key} points at a missing input"
+
+
+def test_anima_example_keeps_the_verified_models_and_sampling() -> None:
+    graph = _anima_payload()["api_graph"]
+    by_class = {node["class_type"]: node["inputs"] for node in graph.values()}
+
+    assert by_class["UNETLoader"]["unet_name"] == "silvermoonmixAnima_v23.safetensors"
+    assert by_class["CLIPLoader"]["clip_name"] == "qwen_3_06b_base.safetensors"
+    assert by_class["VAELoader"]["vae_name"] == "qwen_image_vae.safetensors"
+    assert by_class["LoraLoader|pysssss"]["lora_name"] == "anima-turbo-lora-v0.2.safetensors"
+    sampler = by_class["KSampler"]
+    assert (sampler["steps"], sampler["cfg"]) == (12, 1.0)
+    assert (sampler["sampler_name"], sampler["scheduler"]) == ("er_sde", "simple")
+
+
+def test_anima_example_carries_no_user_specific_prompt_text() -> None:
+    raw = _ANIMA_GRAPH.read_text(encoding="utf-8")
+
+    # The source workflow's positive prompt described a specific person and outfit.
+    for leaked in ("navy pleated skirt", "white blouse", "anima_two_prompt"):
+        assert leaked not in raw
+
+
+def test_anima_profile_overrides_the_example_generation_fields() -> None:
+    from manga_autopilot.models.generation_profile import SemanticPromptSegments
+    from manga_autopilot.services.anima_prompt_builder import AnimaPromptBuilder
+    from manga_autopilot.services.generation_profiles import load_builtin_profile
+
+    graph = _anima_payload()["api_graph"]
+    baked = graph["8"]["inputs"]
+    profile = load_builtin_profile("anima_turbo")
+
+    spec = AnimaPromptBuilder().render(
+        SemanticPromptSegments(subject=["1girl"]),
+        profile,
+        seed=999,
+        panel_size=(3, 4),
+    )
+
+    # The profile decides; the values baked into the example are only defaults.
+    assert (spec.steps, spec.cfg) == (baked["steps"], baked["cfg"])
+    assert (spec.sampler, spec.scheduler) == (baked["sampler_name"], baked["scheduler"])
+    assert spec.seed == 999 != baked["seed"]
+    assert (spec.width, spec.height) == (
+        graph["7"]["inputs"]["width"],
+        graph["7"]["inputs"]["height"],
+    )
+
+
+def test_anima_example_registers_in_a_registry(tmp_path: Path) -> None:
+    registry = WorkflowRegistry.open(tmp_path)
+
+    definition = registry.register(_anima_payload())
+
+    assert registry.get("anima_turbo").workflow_id == definition.workflow_id
+
+
+def test_anima_example_passes_preflight_against_its_own_node_set(tmp_path: Path) -> None:
+    from manga_autopilot.services.generation_profiles import load_builtin_profile
+    from manga_autopilot.services.preflight import (
+        AnimaPreflight,
+        ComfyCapabilities,
+        PreflightRequest,
+    )
+
+    graph = _anima_payload()["api_graph"]
+    # A capability snapshot describing exactly what this example needs.
+    object_info = {
+        node["class_type"]: {"input": {"required": {}}} for node in graph.values()
+    }
+    object_info["UNETLoader"]["input"]["required"]["unet_name"] = [
+        ["silvermoonmixAnima_v23.safetensors"],
+        {},
+    ]
+    object_info["CLIPLoader"]["input"]["required"]["clip_name"] = [
+        ["qwen_3_06b_base.safetensors"],
+        {},
+    ]
+    object_info["VAELoader"]["input"]["required"]["vae_name"] = [
+        ["qwen_image_vae.safetensors"],
+        {},
+    ]
+    object_info["LoraLoader|pysssss"]["input"]["required"]["lora_name"] = [
+        ["anima-turbo-lora-v0.2.safetensors"],
+        {},
+    ]
+
+    report = AnimaPreflight(ComfyCapabilities.from_object_info(object_info)).run(
+        PreflightRequest(
+            profile=load_builtin_profile("anima_turbo"),
+            workflow=validate_workflow_payload(_anima_payload()),
+            output_dir=tmp_path / "out",
+            license_acknowledged=True,
+            panel_sizes=[(3, 4)],
+        )
+    )
+
+    assert report.errors == ()

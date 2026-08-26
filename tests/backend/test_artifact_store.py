@@ -198,12 +198,13 @@ class TestFactoryFromEnv:
         store = create_artifact_store_from_env()
         assert isinstance(store, LocalArtifactStore)
 
-    def test_local_store_uses_env_root(self, monkeypatch: pytest.MonkeyPatch):
+    def test_local_store_uses_env_root(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+        root = tmp_path / "test-artifacts"
         monkeypatch.setenv("MANGA_AUTOPILOT_ARTIFACT_STORE", "local")
-        monkeypatch.setenv("MANGA_AUTOPILOT_ARTIFACT_LOCAL_ROOT", "/tmp/test-artifacts")
+        monkeypatch.setenv("MANGA_AUTOPILOT_ARTIFACT_LOCAL_ROOT", str(root))
         store = create_artifact_store_from_env()
         assert isinstance(store, LocalArtifactStore)
-        assert store.root == Path("/tmp/test-artifacts")
+        assert store.root == root
 
 
 # ----------------------------------------------- response contract

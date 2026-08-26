@@ -108,3 +108,27 @@ def test_character_round_trip_json() -> None:
     data = char.model_dump(mode="json")
     restored = Character.model_validate(data)
     assert restored == char
+
+
+#: A literal Windows separator, built without an escape sequence.
+SEP = chr(92)
+
+
+def test_asset_ref_path_is_stored_posix_separated() -> None:
+    """A project written on Windows must still resolve elsewhere."""
+    from manga_autopilot.models.character import AssetRef
+
+    windows_path = SEP.join(["assets", "characters", "alice", "ref_001.png"])
+
+    ref = AssetRef(asset_id="ref_001", path=windows_path)
+
+    assert ref.path == "assets/characters/alice/ref_001.png"
+    assert SEP not in ref.model_dump_json()
+
+
+def test_asset_ref_leaves_a_posix_path_alone() -> None:
+    from manga_autopilot.models.character import AssetRef
+
+    ref = AssetRef(asset_id="ref_001", path="assets/characters/alice/ref_001.png")
+
+    assert ref.path == "assets/characters/alice/ref_001.png"

@@ -15,6 +15,7 @@ import { mountPageEditor } from "./page_editor.js";
 import { mountCharacterManager } from "./character_manager.js";
 import { mountProgressMonitor } from "./progress_monitor.js";
 import { mountExportCenter } from "./export_center.js";
+import { mountReviewEditor } from "./review_editor.js";
 
 export const EXTENSION_NAME = "comfyui.manga.autopilot";
 export const SIDEBAR_TAB_ID = "manga-autopilot";
@@ -36,6 +37,9 @@ function resolveMounts() {
         mountExportCenter: mountExportCenter
             || window.MangaAutopilot?.mountExportCenter
             || null,
+        mountReviewEditor: mountReviewEditor
+            || window.MangaAutopilot?.mountReviewEditor
+            || null,
     };
 }
 
@@ -44,6 +48,7 @@ const TABS = [
     { id: "editor", label: "Page Editor" },
     { id: "characters", label: "Character Manager" },
     { id: "progress", label: "Progress" },
+    { id: "reviews", label: "Reviews" },
     { id: "export", label: "Export Center" },
 ];
 
@@ -216,6 +221,8 @@ function createWorkspaceView() {
             mountInto(mounts.mountProgressMonitor, "progress");
         } else if (id === "export") {
             mountInto(mounts.mountExportCenter, "export");
+        } else if (id === "reviews") {
+            mountInto(mounts.mountReviewEditor, "reviews");
         } else if (id === "projects") {
             content.appendChild(createProjectsView());
         }

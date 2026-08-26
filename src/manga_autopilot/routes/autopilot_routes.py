@@ -1412,7 +1412,9 @@ async def cleanup_runs(request: web.Request) -> web.Response:
             {
                 "run_id": c.run_id,
                 "status": c.status,
-                "path": str(Path(c.path).relative_to(paths.root)) if Path(c.path).is_relative_to(paths.root) else c.path,
+                "path": Path(c.path).relative_to(paths.root).as_posix()
+                if Path(c.path).is_relative_to(paths.root)
+                else c.path,
                 "reason": c.reason,
             }
             for c in plan.candidates
