@@ -201,9 +201,10 @@ class GenerationLoop:
         panel: PanelPlan,
         prompt: PromptSpec,
         workflow_id: str,
+        panel_id: str = "",
     ) -> list[CandidateImage]:
         spec = CandidateSpec(
-            panel_id=f"panel_{panel.panel_number:03d}",
+            panel_id=panel_id or f"panel_{panel.panel_number:03d}",
             candidate_count=self.config.candidate_count,
             base_seed=prompt.seed or 0,
             prompt=prompt,
@@ -297,18 +298,24 @@ class GenerationLoop:
         project_id: str,
         cancel_check: Callable[[], bool] | None = None,
         run_id: str = "",
+        panel_id: str = "",
     ) -> GenerationOutcome:
         """Run the loop for a single panel and return the outcome.
 
         ``executor`` is the only side-effectful dependency.  ``cancel_check``
         is invoked between candidates; returning ``True`` aborts and marks
         the job as :attr:`JobStatus.CANCELLED`.
+
+        ``panel_id`` defaults to ``panel_{panel_number:03d}``, which is unique
+        only within a page. A caller that spans pages should pass the panel
+        record's own id: otherwise page 2's first panel writes over page 1's
+        candidate images, which share the derived id.
         """
 
         job = GenerationJob(
             project_id=project_id,
             page_number=page_number,
-            panel_id=f"panel_{panel.panel_number:03d}",
+            panel_id=panel_id or f"panel_{panel.panel_number:03d}",
             workflow_id=workflow_id,
             input={
                 "positive": prompt.positive,
@@ -320,7 +327,7 @@ class GenerationLoop:
             max_retries=self.config.max_retries,
         )
         page_id = f"page_{page_number:04d}"
-        panel_id = f"panel_{panel.panel_number:03d}"
+        panel_id = panel_id or f"panel_{panel.panel_number:03d}"
         # PENDING is the implicit default; advance to VALIDATING while we
         # build the candidate list so callers can observe a real transition.
         self._set_status(job, JobStatus.VALIDATING)
@@ -328,7 +335,7 @@ class GenerationLoop:
 
         try:
             try:
-                candidates = self._build_candidates(panel, prompt, workflow_id)
+                candidates = self._build_candidates(panel, prompt, workflow_id, panel_id)
             except ValueError as exc:
                 if self.config.strict:
                     # Strict Anima surfaces misconfiguration instead of quietly
@@ -570,6 +577,7 @@ async def run_panels_sequentially(
             project_id=project_id,
             cancel_check=cancel_check,
             run_id=run_id,
+            panel_id=record.panel_id,
         )
 
         status = _record_status_for(outcome.job.status)

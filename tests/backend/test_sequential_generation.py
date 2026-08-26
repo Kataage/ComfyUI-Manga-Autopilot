@@ -405,3 +405,30 @@ async def test_prompt_builder_failure_is_reported_not_faked(tmp_path: Path) -> N
     assert records[0].status == "failed"
     with pytest.raises(ValueError):
         _explode(records[0])
+
+
+async def test_panels_from_different_pages_do_not_overwrite_each_other(tmp_path: Path) -> None:
+    """The loop's derived panel id is unique only within a page.
+
+    ``run_panels_sequentially`` passes each record's own id, so page 2 panel 1
+    no longer writes over page 1 panel 1's candidate image.
+    """
+    records = [_record(1), _record(1)]
+    records[0].panel_id = "p1_01"
+    records[1].panel_id = "p2_01"
+    records[1].page_number = 2
+    executor = RecordingExecutor()
+
+    await run_panels_sequentially(
+        records=records,
+        loop=_loop(tmp_path, threshold=PASS_THRESHOLD, strict=True),
+        executor=executor,
+        prompt_for=lambda record: _prompt(),
+        workflow_id="wf",
+        project_id="p1",
+        persist=lambda current: None,
+    )
+
+    assert [call.panel_id for call in executor.calls] == ["p1_01", "p2_01"]
+    assert [call.candidate_id for call in executor.calls] == ["p1_01_c00", "p2_01_c00"]
+    assert records[0].image_path != records[1].image_path

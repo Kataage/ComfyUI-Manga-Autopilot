@@ -85,6 +85,10 @@ class Project(BaseModel):
     updated_at: str = Field(default_factory=_utc_now_iso)
     schema_version: int = CURRENT_PROJECT_SCHEMA_VERSION
     migration_history: list[MigrationRecord] = Field(default_factory=list)
+    generation_profile_id: str = Field(default="", max_length=64)
+    """Selects strict Anima behaviour when it starts with ``anima_``."""
+    license_acknowledged: bool = False
+    """Set once the user has acknowledged the model licence for this profile."""
 
 
 __all__ = [

@@ -163,6 +163,7 @@ def register_all(
         health_routes,
         panel_routes,
         project_routes,
+        review_routes,
         workflow_routes,
     )
 
@@ -178,6 +179,7 @@ def register_all(
     autopilot_routes.register(router)
     export_routes.register(router)
     project_routes.register(router)
+    review_routes.register(router)
     panel_routes.register(router)
 
 

@@ -1,6 +1,6 @@
 # Claude Code handoff: Anima Manga Autopilot MVP
 
-Updated: 2026-08-26 JST (Claude Code, Task 6 complete)
+Updated: 2026-08-27 JST (Claude Code, Task 7 complete)
 
 ## Objective
 
@@ -12,7 +12,7 @@ The user accepted the recommended choices from the prior grilling session and as
 
 `docs/superpowers/plans/2026-08-26-anima-mvp.md`
 
-Follow that plan from Task 7 onward. Do not restart completed Tasks 1-6.
+Follow that plan from Task 8 onward. Do not restart completed Tasks 1-7.
 
 ## Repository and Git state
 
@@ -29,7 +29,8 @@ Completed commits:
 3. `eb52846 feat: plan panels against layouts and continuity`
 4. `968399e feat: add Anima generation profiles and prompt adapter`
 5. `a04cb48 feat: version projects and snapshot Anima runs`
-6. `<pending> feat: add strict Anima preflight and managed execution`
+6. `abd80f1 feat: add strict Anima preflight and managed execution`
+7. `<pending> feat: gate and invalidate Anima projects safely`
 
 See the per-task result sections below for what those commits contain.
 
@@ -195,6 +196,48 @@ Full backend suite: `7 failed, 948 passed, 15 skipped` in 65s - the same 7 pre-e
 
 `.\.venv\Scripts\python.exe -m ruff check src/manga_autopilot tests/backend` reported `All checks passed!`.
 
+## Task 7 result
+
+Delivered files:
+
+- `src/manga_autopilot/services/review_gate.py` - `ReviewPolicy`, `ReviewBoard`, `ReviewGateState`, `ReviewDecision`, `ReviewStore`, `ReviewCoordinator`, `split_for_early_review`, `run_with_early_artwork_review`.
+- `src/manga_autopilot/services/edit_invalidation.py` - `EditDescriptor`, `InvalidationResult`, `compute_invalidation`, `apply_invalidation`.
+- `src/manga_autopilot/routes/review_routes.py` - `GET /reviews`, `POST /reviews/{gate}/approve`, `POST /reviews/{gate}/reject`, plus coordinator registration.
+- `src/manga_autopilot/services/autopilot.py` - `AutopilotRun.awaiting_review`, `Orchestrator.reviews`, gate waits after Story, before generation, and before lettering; `start_orchestrator(reviews=...)`.
+- `src/manga_autopilot/routes/autopilot_routes.py` - strict runs render page one, wait for the early artwork review, then the rest; the coordinator is published for the review API at every start/restart site.
+- `src/manga_autopilot/routes/project_routes.py` - `generation_profile_id` and `license_acknowledged` are patchable.
+- `src/manga_autopilot/models/project.py` - those two fields.
+- `src/manga_autopilot/services/generation_job.py` - `GenerationLoop.run(..., panel_id=...)`.
+- Tests: `test_review_gates.py` (25), `test_edit_invalidation.py` (13), `test_anima_autopilot_e2e.py` (11).
+
+Design decisions worth knowing:
+
+- Four gates: `story`, `storyboard`, `artwork_early`, `artwork_final`. The plan named three; Artwork needs two checkpoints because the cadence is "render page one, ask, then render the rest, ask again before lettering".
+- Waiting uses a per-gate `asyncio.Event` on the coordinator, not the run's pause event. A run waiting for a review is not a user who pressed pause, and merging them would make "resume" ambiguous.
+- The spec-7.2 state machine was left alone. The gate a run is blocked on is exposed as `run.awaiting_review` and in `to_status()`, rather than adding states that would need new `_FORWARD` edges.
+- `ReviewPolicy.for_profile` returns an empty gate list for anything that is not `anima_*`, and an empty policy reports every gate approved. Legacy projects therefore run exactly as before, with no branch in the orchestrator.
+- Decisions are idempotent: repeating the standing decision records nothing. A changed decision appends, so the history shows approve-then-reject.
+- Invalidation marks, never deletes. `apply_invalidation` sets panels back to `draft`, appends an `invalidated` history entry, and deliberately keeps the old `image_path` so the previous artwork stays visible until something replaces it. No GPU work is started.
+- A dialogue edit does not touch panel images - only `bubbles`, `page_render`, `exports`. A continuity edit invalidates the edited panel and everything after it in reading order, because scene state flows forward.
+
+Bug found and fixed while wiring the E2E:
+
+- `GenerationLoop` derived its panel id as `panel_{panel_number:03d}`, which is unique only within a page, so page 2's first panel overwrote page 1's candidate image (`{candidate_id}.png`). `run()` now accepts an explicit `panel_id`, and `run_panels_sequentially` passes each record's own id. The old default is unchanged for existing callers. Covered by `test_panels_from_different_pages_do_not_overwrite_each_other`.
+
+Verification (2026-08-27, Claude Code):
+
+```powershell
+$env:TEMP='<a temp dir the agent can write to>'
+$env:TMP=$env:TEMP
+.\.venv\Scripts\python.exe -m pytest tests/backend/test_review_gates.py tests/backend/test_edit_invalidation.py tests/backend/test_anima_autopilot_e2e.py tests/backend/test_autopilot.py tests/backend/test_autopilot_resume_e2e.py -q -p no:cacheprovider
+```
+
+Result: `72 passed`.
+
+Full backend suite: `7 failed, 998 passed, 15 skipped` in 74s - the same 7 pre-existing portability failures, no regressions.
+
+`.\.venv\Scripts\python.exe -m ruff check src/manga_autopilot tests/backend` reported `All checks passed!`.
+
 ## Verified Anima configuration evidence
 
 The read-only local workflow was checked on 2026-08-26:
@@ -259,9 +302,8 @@ Task 8 should fix the tests or test fixtures with `tmp_path`, normalized persist
 
 ## Remaining sequence
 
-1. Implement Task 7 review gates, edit invalidation, and fake-service E2E.
-2. Implement Task 8 form review UI, API-format workflow example, docs, portability fixes, and full non-GPU verification.
-3. Run the final verification commands in the plan and inspect `git status`, `git diff --check`, and commit history.
+1. Implement Task 8 form review UI, API-format workflow example, docs, portability fixes, and full non-GPU verification.
+2. Run the final verification commands in the plan and inspect `git status`, `git diff --check`, and commit history.
 
 ## Standing approvals (2026-08-26)
 

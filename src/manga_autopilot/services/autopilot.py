@@ -389,6 +389,13 @@ class AutopilotRun:
     actually was when the user pressed pause (rather than always jumping
     to ``PANELS_GENERATING``).
     """
+    awaiting_review: str = ""
+    """The review gate this run is currently blocked on, if any.
+
+    A run waiting for a review is not the same thing as a user who pressed
+    pause, so this is tracked separately from :attr:`pause_event` and does not
+    move the state machine into ``PAUSED``.
+    """
     input: dict[str, Any] = field(default_factory=dict)
     source: dict[str, str | None] = field(default_factory=lambda: {"restart_of_run_id": None, "resume_of_run_id": None})
 
@@ -424,6 +431,7 @@ class AutopilotRun:
             "started_at": self.started_at.isoformat(),
             "finished_at": self.finished_at.isoformat() if self.finished_at else None,
             "failure_reason": self.machine.failure_reason,
+            "awaiting_review": self.awaiting_review or None,
             "steps": [s.to_dict() for s in self.steps],
             "log": self.log,
             "artefacts": self.artefacts,
@@ -761,6 +769,30 @@ class Orchestrator:
 
     hooks: OrchestratorHooks = field(default_factory=OrchestratorHooks)
     project_root: Path | None = None
+    reviews: Any = None
+    """An optional ``ReviewCoordinator``. ``None`` means no gates apply."""
+
+    async def _gate(self, run: AutopilotRun, gate: str) -> bool:
+        """Wait for `gate`. Returns whether the pipeline may continue."""
+        if self.reviews is None:
+            return True
+        from manga_autopilot.services.review_gate import ReviewRejectedError
+
+        def _mark(name: str) -> None:
+            run.awaiting_review = name
+            run.log_event("review_awaiting", {"gate": name})
+
+        try:
+            await self.reviews.wait_for(gate, on_wait=_mark)
+        except ReviewRejectedError as exc:
+            run.awaiting_review = ""
+            run.log_event("review_rejected", {"gate": gate, "reason": str(exc)})
+            run.machine.fail(AutopilotState.FAILED_PANEL_QA, reason=str(exc))
+            return False
+        if run.awaiting_review == gate:
+            run.awaiting_review = ""
+            run.log_event("review_approved", {"gate": gate})
+        return True
 
     async def _step(
         self,
@@ -844,6 +876,8 @@ class Orchestrator:
             await self._step(run, AutopilotState.STORY_PLANNED, "plan_story")
             if _is_cancelled(run):
                 return self._finalize(run)
+            if not await self._gate(run, "story"):
+                return self._finalize(run)
 
             await self._step(run, AutopilotState.CHARACTERS_DEFINED, "define_characters")
             if _is_cancelled(run):
@@ -868,6 +902,9 @@ class Orchestrator:
             await self._step(run, AutopilotState.WORKFLOWS_BUILT, "validate_workflow")
             if _is_cancelled(run):
                 return self._finalize(run)
+            # Nothing reaches the GPU before the storyboard is approved.
+            if not await self._gate(run, "storyboard"):
+                return self._finalize(run)
 
             await self._step(run, AutopilotState.PANELS_GENERATING, "generate_panels")
             if _is_cancelled(run):
@@ -875,6 +912,9 @@ class Orchestrator:
 
             await self._step(run, AutopilotState.PANELS_QA_CHECKING, "qa_panels")
             if _is_cancelled(run):
+                return self._finalize(run)
+
+            if not await self._gate(run, "artwork_final"):
                 return self._finalize(run)
 
             await self._step(run, AutopilotState.LETTERING, "lettering")
@@ -977,12 +1017,15 @@ def start_orchestrator(
     hooks: OrchestratorHooks,
     project_root: Path | None = None,
     input_payload: Mapping[str, Any] | None = None,
+    reviews: Any = None,
 ) -> tuple[AutopilotRun, asyncio.Task, asyncio.Event, asyncio.Event]:
     """Spin up an orchestrator task for ``project_id``.
 
     Returns ``(run, task, cancel_event, pause_event)``.  The caller can pass
     the events to :meth:`AutopilotController.attach_task` so the controller's
     pause/resume/cancel methods can affect the running pipeline.
+
+    ``reviews`` is an optional ``ReviewCoordinator``; without one no gate blocks.
     """
 
     machine = AutopilotStateMachine(project_id=project_id)
@@ -995,7 +1038,7 @@ def start_orchestrator(
     pause_event = asyncio.Event()
     pause_event.set()  # not paused by default
 
-    orchestrator = Orchestrator(hooks=hooks, project_root=project_root)
+    orchestrator = Orchestrator(hooks=hooks, project_root=project_root, reviews=reviews)
 
     async def _driver() -> None:
         # block while paused

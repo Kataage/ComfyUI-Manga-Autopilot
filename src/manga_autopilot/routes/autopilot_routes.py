@@ -116,6 +116,43 @@ def _anima_technical_retry_count(run: AutopilotRun) -> int:
     return profile.technical_retry_count if profile is not None else 1
 
 
+def _open_review_coordinator(app: Application, project_id: str, storage_root: Path):
+    """Build the review coordinator for a run and publish it for the review API.
+
+    A project with no Anima profile gets an empty policy, so every gate reports
+    approved and the pipeline never pauses.
+    """
+    from manga_autopilot.routes.review_routes import register_coordinator
+    from manga_autopilot.services.project_manager import ProjectManager
+    from manga_autopilot.services.review_gate import (
+        ReviewCoordinator,
+        ReviewPolicy,
+        ReviewStore,
+    )
+
+    profile_id = ""
+    try:
+        profile_id = ProjectManager(storage_root).load(project_id).generation_profile_id
+    except Exception as exc:  # noqa: BLE001 - a missing project is not fatal here
+        log.debug("could not read the generation profile for %s: %s", project_id, exc)
+
+    root = ensure_project_paths(storage_root, project_id).root
+    store = ReviewStore(root)
+    coordinator = ReviewCoordinator(
+        board=store.load(project_id, ReviewPolicy.for_profile(profile_id)),
+        store=store,
+    )
+    register_coordinator(app, project_id, coordinator)
+    return coordinator
+
+
+def _review_coordinator(app: Application, project_id: str):
+    """Return the live review coordinator for `project_id`, if a run published one."""
+    from manga_autopilot.routes.review_routes import COORDINATORS_KEY
+
+    return app.get(COORDINATORS_KEY, {}).get(project_id)
+
+
 def _is_anima_run(run: AutopilotRun) -> bool:
     profile_id = run.input.get("generation_profile_id")
     return isinstance(profile_id, str) and profile_id.startswith("anima_")
@@ -547,17 +584,33 @@ def _make_generate_panels(
             # A strict run persists each panel before submitting the next, so an
             # interruption resumes instead of re-rendering, and it never
             # substitutes a fabricated prompt for one the planner could not build.
-            results = await run_panels_sequentially(
-                records=records,
-                loop=loop,
-                executor=executor,
-                prompt_for=lambda record: builder.build(record.plan),
-                workflow_id=str(run.input.get("workflow_id") or workflow_id),
-                project_id=project_id,
-                persist=lambda current: _write_panel_records(project_root, current),
-                run_id=run.run_id,
-                cancel_check=_cancel_check,
-            )
+            from manga_autopilot.services.review_gate import run_with_early_artwork_review
+
+            async def _generate(batch: list[PanelRecord]) -> list[Any]:
+                return await run_panels_sequentially(
+                    records=batch,
+                    loop=loop,
+                    executor=executor,
+                    prompt_for=lambda record: builder.build(record.plan),
+                    workflow_id=str(run.input.get("workflow_id") or workflow_id),
+                    project_id=project_id,
+                    persist=lambda _batch: _write_panel_records(project_root, records),
+                    run_id=run.run_id,
+                    cancel_check=_cancel_check,
+                )
+
+            coordinator = _review_coordinator(app, project_id)
+            if coordinator is None:
+                results = await _generate(records)
+            else:
+                # Page one is rendered on its own so the artwork direction can be
+                # judged before the remaining pages consume GPU time.
+                results = await run_with_early_artwork_review(
+                    records,
+                    generate=_generate,
+                    coordinator=coordinator,
+                    on_wait=lambda gate: run.log_event("review_awaiting", {"gate": gate}),
+                )
             blocked = [r for r in results if r.status in {"failed", "rejected"}]
             if blocked:
                 raise RuntimeError(
@@ -1057,6 +1110,7 @@ async def start(request: web.Request) -> web.Response:
         hooks=hooks,
         project_root=ensure_project_paths(storage_root, project_id).root,
         input_payload=input_payload,
+        reviews=_open_review_coordinator(request.app, project_id, storage_root),
     )
     save_run_metadata(ensure_project_paths(storage_root, project_id).root, run)
     return web.json_response(run.to_status(), status=202)
@@ -1210,6 +1264,7 @@ async def restart(request: web.Request) -> web.Response:
         hooks=hooks,
         project_root=paths.root,
         input_payload=restored_input,
+        reviews=_open_review_coordinator(request.app, project_id, storage_root),
     )
     # Link to previous run
     run.source["restart_of_run_id"] = previous_run_id
@@ -1285,6 +1340,7 @@ async def resume_cancelled(request: web.Request) -> web.Response:
         hooks=hooks,
         project_root=paths.root,
         input_payload=restored_input,
+        reviews=_open_review_coordinator(request.app, project_id, storage_root),
     )
     # Link to previous run as resume
     run.source["resume_of_run_id"] = previous_run_id
