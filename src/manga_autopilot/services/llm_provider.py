@@ -17,15 +17,31 @@ import json
 import logging
 import os
 import re
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
 import aiohttp
+from jsonschema import Draft202012Validator
 from pydantic import BaseModel, Field, model_validator
 
 log = logging.getLogger(__name__)
 
 ProviderType = Literal["local", "ollama", "openai_compatible", "manual"]
+
+
+def json_schema_response_format(
+    name: str,
+    schema: Mapping[str, Any],
+) -> dict[str, Any]:
+    return {
+        "type": "json_schema",
+        "json_schema": {
+            "name": name,
+            "strict": True,
+            "schema": dict(schema),
+        },
+    }
 
 
 class LLMSettings(BaseModel):
@@ -74,6 +90,7 @@ class LLMProvider(abc.ABC):
         *,
         system: str | None = None,
         max_repair_attempts: int = 1,
+        semantic_validator: Callable[[dict[str, Any]], Sequence[str]] | None = None,
     ) -> dict[str, Any]:
         """Run ``complete`` and validate against ``schema`` (with up to N repair attempts)."""
 
@@ -81,7 +98,12 @@ class LLMProvider(abc.ABC):
             max_repair_attempts=max_repair_attempts,
             system_prompt=system,
         )
-        outcome = await loop.run(self, prompt, schema)
+        outcome = await loop.run(
+            self,
+            prompt,
+            schema,
+            semantic_validator=semantic_validator,
+        )
         if not outcome.ok:
             raise ValueError(outcome.error or "JSON repair exhausted")
         return outcome.data
@@ -164,7 +186,10 @@ class OpenAICompatibleProvider(LLMProvider):
             "max_tokens": self.settings.max_tokens,
         }
         if schema is not None:
-            payload["response_format"] = {"type": "json_object"}
+            payload["response_format"] = json_schema_response_format(
+                "manga_autopilot_response",
+                schema,
+            )
         async with aiohttp.ClientSession() as session:
             async with session.post(url, json=payload, headers=headers) as resp:
                 resp.raise_for_status()
@@ -216,10 +241,12 @@ def _validate_json(text: str, schema: dict[str, Any]) -> dict[str, Any]:
     data = _extract_json(text)
     if not isinstance(data, dict):
         raise ValueError(f"expected JSON object, got {type(data).__name__}")
-    required = schema.get("required") or []
-    missing = [k for k in required if k not in data]
-    if missing:
-        raise ValueError(f"missing required keys: {missing}")
+    validator = Draft202012Validator(schema)
+    errors = sorted(validator.iter_errors(data), key=lambda error: list(error.absolute_path))
+    if errors:
+        error = errors[0]
+        path = "/" + "/".join(str(part) for part in error.absolute_path)
+        raise ValueError(f"{path}: {error.message}")
     return data
 
 
@@ -271,13 +298,19 @@ class JSONRepairLoop:
         provider: LLMProvider,
         prompt: str,
         schema: dict[str, Any],
+        *,
+        semantic_validator: Callable[[dict[str, Any]], Sequence[str]] | None = None,
     ) -> RepairOutcome:
         attempts = 0
         last_error = "no attempt"
+        history: list[str] = []
         text = await provider.complete(prompt, schema=schema, system=self.system_prompt)
         attempts += 1
+        history.append(text)
         try:
-            return RepairOutcome(ok=True, data=_validate_json(text, schema), attempts=attempts, history=[text])
+            data = _validate_json(text, schema)
+            _validate_semantics(data, semantic_validator)
+            return RepairOutcome(ok=True, data=data, attempts=attempts, history=history)
         except ValueError as exc:
             last_error = str(exc)
             log.warning("LLM JSON invalid (attempt %d): %s", attempts, exc)
@@ -288,18 +321,32 @@ class JSONRepairLoop:
                 repair_prompt, schema=schema, system=self.system_prompt
             )
             attempts += 1
+            history.append(text)
             try:
+                data = _validate_json(text, schema)
+                _validate_semantics(data, semantic_validator)
                 return RepairOutcome(
                     ok=True,
-                    data=_validate_json(text, schema),
+                    data=data,
                     attempts=attempts,
-                    history=[text],
+                    history=history,
                 )
             except ValueError as exc:
                 last_error = str(exc)
                 log.warning("LLM JSON repair invalid (attempt %d): %s", attempts, exc)
 
-        return RepairOutcome(ok=False, error=last_error, attempts=attempts, history=[text])
+        return RepairOutcome(ok=False, error=last_error, attempts=attempts, history=history)
+
+
+def _validate_semantics(
+    data: dict[str, Any],
+    validator: Callable[[dict[str, Any]], Sequence[str]] | None,
+) -> None:
+    if validator is None:
+        return
+    issues = list(validator(data))
+    if issues:
+        raise ValueError("semantic validation failed: " + "; ".join(issues))
 
 
 __all__ = [
@@ -312,4 +359,5 @@ __all__ = [
     "enforce_json_schema",
     "JSONRepairLoop",
     "RepairOutcome",
+    "json_schema_response_format",
 ]

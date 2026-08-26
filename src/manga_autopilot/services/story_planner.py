@@ -11,6 +11,7 @@ from typing import Any
 from manga_autopilot.models.story import Act, StoryPlan
 from manga_autopilot.services.json_schema_validator import validate_llm_output
 from manga_autopilot.services.llm_provider import LLMProvider
+from manga_autopilot.services.semantic_validation import validate_page_sequence
 
 log = logging.getLogger(__name__)
 
@@ -83,6 +84,7 @@ class StoryPlanner:
     language: str = "ja"
     genre: str = "fantasy"
     max_repair_attempts: int = 1
+    strict: bool = False
     system_prompt: str = (
         "You are a meticulous manga story planner. Always respond with strict JSON only."
     )
@@ -99,11 +101,24 @@ class StoryPlanner:
 
     async def plan(self, idea: str) -> StoryPlan:
         prompt = self.build_prompt(idea)
+        validation_options: dict[str, Any] = {}
+        if self.strict:
+            def _validate_semantics(data: dict[str, Any]) -> list[str]:
+                return [
+                    f"{issue.path}: {issue.message}"
+                    for issue in validate_page_sequence(
+                        data.get("pages", []),
+                        self.page_count,
+                    )
+                ]
+
+            validation_options["semantic_validator"] = _validate_semantics
         data = await self.provider.complete_json(
             prompt,
             schema=STORY_PLAN_SCHEMA,
             system=self.system_prompt,
             max_repair_attempts=self.max_repair_attempts,
+            **validation_options,
         )
         return self._to_model(data, idea)
 

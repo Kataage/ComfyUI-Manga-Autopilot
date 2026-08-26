@@ -5,12 +5,13 @@ from __future__ import annotations
 import json
 import logging
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from manga_autopilot.models.page import Dialogue, PagePlan, PanelPlan, SoundEffect
 from manga_autopilot.services.json_schema_validator import validate_llm_output
 from manga_autopilot.services.llm_provider import LLMProvider
+from manga_autopilot.services.semantic_validation import validate_panel_sequence
 
 log = logging.getLogger(__name__)
 
@@ -114,6 +115,10 @@ class PanelPlanner:
     provider: LLMProvider
     panel_count: int = 4
     max_repair_attempts: int = 1
+    strict: bool = False
+    character_ids: set[str] = field(default_factory=set)
+    layout_id: str | None = None
+    registered_layout_ids: set[str] | None = None
     system_prompt: str = (
         "You are a manga director. Always respond with strict JSON only."
     )
@@ -127,11 +132,27 @@ class PanelPlanner:
 
     async def plan(self, page_plan: PagePlan | Mapping[str, Any] | str) -> PanelPlanList:
         prompt = self.build_prompt(page_plan)
+        validation_options: dict[str, Any] = {}
+        if self.strict:
+            def _validate_semantics(data: dict[str, Any]) -> list[str]:
+                return [
+                    f"{issue.path}: {issue.message}"
+                    for issue in validate_panel_sequence(
+                        data.get("panels", []),
+                        self.panel_count,
+                        self.character_ids,
+                        layout_id=self.layout_id,
+                        registered_layout_ids=self.registered_layout_ids,
+                    )
+                ]
+
+            validation_options["semantic_validator"] = _validate_semantics
         data = await self.provider.complete_json(
             prompt,
             schema=PANEL_PLAN_SCHEMA,
             system=self.system_prompt,
             max_repair_attempts=self.max_repair_attempts,
+            **validation_options,
         )
         outcome = validate_llm_output(data, jsonschema_definition=PANEL_PLAN_SCHEMA)
         if not outcome.ok:
