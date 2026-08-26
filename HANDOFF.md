@@ -1,6 +1,6 @@
 # Claude Code handoff: Anima Manga Autopilot MVP
 
-Updated: 2026-08-26 JST
+Updated: 2026-08-26 JST (Claude Code, Task 4 complete)
 
 ## Objective
 
@@ -12,7 +12,7 @@ The user accepted the recommended choices from the prior grilling session and as
 
 `docs/superpowers/plans/2026-08-26-anima-mvp.md`
 
-Follow that plan from Task 4 onward. Do not restart completed Tasks 1-3.
+Follow that plan from Task 5 onward. Do not restart completed Tasks 1-4.
 
 ## Repository and Git state
 
@@ -28,15 +28,7 @@ Completed commits:
 2. `a251243 feat: add story bible and scene state reducer`
 3. `eb52846 feat: plan panels against layouts and continuity`
 
-Current working tree intentionally contains two uncommitted red TDD tests for Task 4:
-
-- `tests/backend/test_generation_profiles.py`
-- `tests/backend/test_anima_prompt_builder.py`
-
-Do not discard these tests. Their current collection failures are expected because the production modules have not been created:
-
-- `manga_autopilot.services.generation_profiles`
-- `manga_autopilot.models.generation_profile`
+Task 4 is implemented and green but not yet committed, pending user approval. See "Task 4 result" below.
 
 ## Completed behavior
 
@@ -77,30 +69,44 @@ Result: `41 passed, 6 warnings`.
 
 Targeted Ruff result: all checks passed. `git diff --check` also passed before the Task 3 commit.
 
-## Current Task 4 red state
+## Task 4 result
 
-Run:
+Delivered files:
+
+- `src/manga_autopilot/models/generation_profile.py` - `LicenseMetadata`, `GenerationSettings`, `ModelAssets`, `ResolutionPolicy`, `ResolvedResolution`, `GenerationProfile`, `SemanticPromptSegments`, plus `POSITIVE_SEGMENT_ORDER` and `PROFILE_OWNED_FIELDS`.
+- `src/manga_autopilot/services/generation_profiles.py` - `load_builtin_profile`, `list_builtin_profiles`, `resolve_panel_resolution`, `resolve_default_resolution`.
+- `src/manga_autopilot/services/anima_prompt_builder.py` - `AnimaPromptBuilder.render(segments, profile, *, seed, panel_size=None) -> PromptSpec`.
+- `src/manga_autopilot/profiles/__init__.py`, `anima_base.json`, `anima_aesthetic.json`, `anima_turbo.json`.
+- `pyproject.toml` - `[tool.setuptools.package-data]` ships `manga_autopilot.profiles/*.json`.
+- `src/manga_autopilot/models/__init__.py` - re-exports the new models.
+- Tests: `tests/backend/test_generation_profiles.py` (15 tests), `tests/backend/test_anima_prompt_builder.py` (11 tests).
+
+`src/manga_autopilot/services/prompt_builder.py` was deliberately left unchanged. `PromptSpec` and its `negative_full()` bans are reused as they are, so generic projects keep the previous LLM-driven behavior.
+
+Design decisions worth knowing:
+
+- Resolution is a pure function of the panel aspect ratio. The policy keeps a 1,228,800-pixel budget, rounds each side to the nearest multiple of 64, then clamps to 512-1536. Extreme ratios clamp rather than exceed the supported side range: 8:1 resolves to 1536x512.
+- `SemanticPromptSegments.technical_overrides` is accepted but never applied. `AnimaPromptBuilder` logs a warning naming the ignored keys. Steps, CFG, sampler, scheduler, and dimensions come from the profile; the seed comes from the caller.
+- Positive order: profile `quality_prefix`, `identity`, `must_keep`, `subject`, `action`, `camera`, `emotion`, `background`, `lighting`, `style` (segment style first, then `style_defaults`). Terms are comma-split, trimmed, and deduplicated case-insensitively keeping the first occurrence.
+- `anima_aesthetic` sets `allow_score_tags: false`, which strips `score_*` from both prompts per the model card.
+- Profile JSON is loaded through `importlib.resources` and cached with `functools.cache`. Unknown IDs raise `KeyError`.
+- `anima_base` uses steps 30 / CFG 4.5 and `anima_aesthetic` uses steps 32 / CFG 4.0, both inside the model card's 30-50 step and CFG 4-5 guidance. Only `anima_turbo` mirrors the verified local workflow exactly.
+
+Verification (2026-08-26, Claude Code):
 
 ```powershell
-New-Item -ItemType Directory -Force -Path ..\test-tmp | Out-Null
-$env:TEMP=(Resolve-Path ..\test-tmp).Path
+$env:TEMP='<a temp dir the agent can write to>'
 $env:TMP=$env:TEMP
-.\.venv\Scripts\python.exe -m pytest tests/backend/test_generation_profiles.py tests/backend/test_anima_prompt_builder.py -q
+.\.venv\Scripts\python.exe -m pytest tests/backend/test_generation_profiles.py tests/backend/test_anima_prompt_builder.py tests/backend/test_prompt_builder.py -q -p no:cacheprovider
 ```
 
-Current result: two collection errors for the missing production modules listed above. Implement only enough to turn these tests green, then add edge cases before committing Task 4.
+Result: `33 passed in 0.46s`.
 
-Task 4 intended files:
+Full backend suite: `7 failed, 858 passed, 15 skipped` in 68s. The 7 failures are the pre-existing portability issues listed under "Baseline suite caveat".
 
-- `src/manga_autopilot/models/generation_profile.py`
-- `src/manga_autopilot/services/generation_profiles.py`
-- `src/manga_autopilot/services/anima_prompt_builder.py`
-- `src/manga_autopilot/profiles/anima_base.json`
-- `src/manga_autopilot/profiles/anima_aesthetic.json`
-- `src/manga_autopilot/profiles/anima_turbo.json`
-- `pyproject.toml` package data
+`.\.venv\Scripts\python.exe -m ruff check src/manga_autopilot tests/backend/test_generation_profiles.py tests/backend/test_anima_prompt_builder.py` reported `All checks passed!`, and `git diff --check` was clean.
 
-The new deterministic builder must not accept LLM overrides for seed, dimensions, steps, CFG, sampler, or scheduler. It should order identity and `must_keep` segments before subject/action/camera/emotion/background/lighting/style, deduplicate while preserving first occurrence, and retain the application's text/watermark bans.
+Environment note: `..\test-tmp` is not writable from every agent sandbox. If pytest reports `PermissionError ... pytest-of-kouda`, point `$env:TEMP` and `$env:TMP` at a temp directory the current agent can write to. Pass `-p no:cacheprovider` when `.pytest_cache` is also unwritable.
 
 ## Verified Anima configuration evidence
 
@@ -154,22 +160,19 @@ Do not launch a GPU generation, download/load a model, interrupt ComfyUI, or alt
 
 ## Baseline suite caveat
 
-After creating `.venv` and installing dev dependencies, the baseline backend suite produced:
+After creating `.venv` and installing dev dependencies, the baseline backend suite produced `799 passed, 11 failed, 15 skipped`. The Task 4 verification run produces `858 passed, 7 failed, 15 skipped`; the earlier baseline was measured with a partly unwritable temp directory, so its failure count was inflated.
 
-`799 passed, 11 failed, 15 skipped`
+The 7 remaining failures predate this branch and are Windows/sandbox portability issues tracked for Task 8:
 
-The 11 failures predate this branch and are Windows/sandbox portability issues tracked for Task 8:
-
-- hard-coded Unix `/tmp` expectations
-- a path-separator assertion
-- storage attempts under `C:\Users\kouda\.manga_autopilot`
-- README reads using the Windows default code page instead of explicit UTF-8
+- `test_artifact_store.py::TestFactoryFromEnv::test_local_store_uses_env_root` - a hard-coded Unix `/tmp` expectation resolves to `C:/tmp/...`
+- `test_character_service.py::test_register_reference_image` - asserts a forward-slash asset path against the persisted `assets\characters\alice\ref_001.png`
+- `test_release_readiness.py` (5 tests) - README reads use the Windows default code page (`cp932`) instead of explicit UTF-8
 
 Task 8 should fix the tests or test fixtures with `tmp_path`, normalized persisted asset references, and explicit UTF-8 reads. Do not weaken the corresponding production behavior.
 
 ## Remaining sequence
 
-1. Finish Task 4 and commit `feat: add Anima generation profiles and prompt adapter`.
+1. Commit Task 4 as `feat: add Anima generation profiles and prompt adapter` (awaiting user approval).
 2. Implement Task 5 migration, fingerprinting, and run snapshots.
 3. Implement Task 6 strict preflight, sequential generation semantics, and managed LM Studio lifecycle. Keep all live work opt-in.
 4. Implement Task 7 review gates, edit invalidation, and fake-service E2E.

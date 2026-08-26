@@ -48,6 +48,9 @@ Issues = "https://github.com/Kataage/ComfyUI-Manga-Autopilot/issues"
 [tool.setuptools.packages.find]
 where = ["src"]
 
+[tool.setuptools.package-data]
+"manga_autopilot.profiles" = ["*.json"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests/backend"]
 asyncio_mode = "auto"
