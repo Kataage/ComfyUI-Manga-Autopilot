@@ -92,9 +92,86 @@ def _default_workflow_id(app: Application) -> str:
     return "anime_t2i_default"
 
 
+def _anima_profile(run: AutopilotRun):
+    """Return the resolved profile for a strict run, or ``None`` if unknown."""
+    from manga_autopilot.services.generation_profiles import load_builtin_profile
+
+    try:
+        return load_builtin_profile(str(run.input.get("generation_profile_id") or ""))
+    except KeyError:
+        log.warning(
+            "unknown generation profile %r; falling back to generic defaults",
+            run.input.get("generation_profile_id"),
+        )
+        return None
+
+
+def _anima_candidate_count(run: AutopilotRun) -> int:
+    profile = _anima_profile(run)
+    return profile.candidate_count if profile is not None else 1
+
+
+def _anima_technical_retry_count(run: AutopilotRun) -> int:
+    profile = _anima_profile(run)
+    return profile.technical_retry_count if profile is not None else 1
+
+
 def _is_anima_run(run: AutopilotRun) -> bool:
     profile_id = run.input.get("generation_profile_id")
     return isinstance(profile_id, str) and profile_id.startswith("anima_")
+
+
+async def _run_anima_preflight(
+    app: Application,
+    run: AutopilotRun,
+    *,
+    project_root: Path,
+    workflow_id: str,
+) -> None:
+    """Block a strict Anima run whose environment is not ready.
+
+    The check needs a live ``/object_info`` snapshot. When the application has no
+    ComfyUI client - the in-process test wiring and fake executors - there is
+    nothing to check against, so the gate logs and steps aside rather than
+    failing a run it cannot actually assess.
+    """
+    from manga_autopilot.services.generation_profiles import load_builtin_profile
+    from manga_autopilot.services.preflight import (
+        AnimaPreflight,
+        ComfyCapabilities,
+        PreflightRequest,
+    )
+
+    client = app.get("manga_comfy_client")
+    if client is None:
+        log.warning(
+            "skipping Anima preflight for %s: no ComfyUI client is configured",
+            run.run_id,
+        )
+        return
+
+    registry = app.get("manga_workflow_registry")
+    if registry is None:
+        log.warning("skipping Anima preflight for %s: no workflow registry", run.run_id)
+        return
+
+    profile = load_builtin_profile(str(run.input["generation_profile_id"]))
+    workflow = registry.get(workflow_id)
+    capabilities = ComfyCapabilities.from_object_info(await client.get_object_info())
+
+    request = PreflightRequest(
+        profile=profile,
+        workflow=workflow,
+        output_dir=project_root / "assets" / "panels",
+        comfy_base_url=getattr(client, "base_url", "http://127.0.0.1:8188"),
+        allow_remote_comfyui=bool(run.input.get("allow_remote_comfyui")),
+        comfy_auth_configured=bool(run.input.get("comfy_auth_configured")),
+        license_acknowledged=bool(run.input.get("license_acknowledged")),
+    )
+    report = AnimaPreflight(capabilities).run(request)
+    for warning in report.warnings:
+        log.warning("anima preflight: %s: %s", warning.code, warning.message)
+    report.raise_if_blocked()
 
 
 # ----------------------------------------------------------------- hook helpers
@@ -420,6 +497,7 @@ def _make_generate_panels(
     from manga_autopilot.services.generation_job import (
         GenerationLoop,
         GenerationLoopConfig,
+        run_panels_sequentially,
     )
 
     paths = ensure_project_paths(storage_root, project_id)
@@ -442,16 +520,52 @@ def _make_generate_panels(
         records = _read_panel_records(project_root)
         if not records:
             return []
+        strict = _is_anima_run(run)
+        if strict:
+            await _run_anima_preflight(
+                app,
+                run,
+                project_root=project_root,
+                workflow_id=str(run.input.get("workflow_id") or workflow_id),
+            )
         executor = _resolve_executor(app, project_id)
         loop = GenerationLoop(
             project_root=project_root,
             config=GenerationLoopConfig(
-                candidate_count=int(run.input["candidate_count"]) if run.input.get("candidate_count") is not None else 1,
+                candidate_count=_anima_candidate_count(run) if strict else (
+                    int(run.input["candidate_count"]) if run.input.get("candidate_count") is not None else 1
+                ),
                 max_retries=int(run.input["max_retries"]) if run.input.get("max_retries") is not None else 1,
                 threshold=float(run.input["threshold"]) if run.input.get("threshold") is not None else 0.5,
+                strict=strict,
+                technical_retry_count=_anima_technical_retry_count(run) if strict else 1,
             ),
         )
         builder = PromptBuilder(provider=_llm_provider(app))
+
+        if strict:
+            # A strict run persists each panel before submitting the next, so an
+            # interruption resumes instead of re-rendering, and it never
+            # substitutes a fabricated prompt for one the planner could not build.
+            results = await run_panels_sequentially(
+                records=records,
+                loop=loop,
+                executor=executor,
+                prompt_for=lambda record: builder.build(record.plan),
+                workflow_id=str(run.input.get("workflow_id") or workflow_id),
+                project_id=project_id,
+                persist=lambda current: _write_panel_records(project_root, current),
+                run_id=run.run_id,
+                cancel_check=_cancel_check,
+            )
+            blocked = [r for r in results if r.status in {"failed", "rejected"}]
+            if blocked:
+                raise RuntimeError(
+                    "strict generation stopped at "
+                    + ", ".join(f"{r.panel_id} ({r.status})" for r in blocked)
+                )
+            return [r.outcome.job.to_dict() for r in results if r.outcome is not None]
+
         rendered: list[dict[str, Any]] = []
         failed_panel_ids: list[str] = []
         skipped_panel_ids: list[str] = []

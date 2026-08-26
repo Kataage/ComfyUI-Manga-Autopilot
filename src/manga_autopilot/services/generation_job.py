@@ -19,6 +19,7 @@ persisted to ``{project_root}/jobs/{job_id}.json`` for replay/audit.
 
 from __future__ import annotations
 
+import inspect
 import logging
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -35,6 +36,7 @@ from manga_autopilot.models.job import (
     write_job,
 )
 from manga_autopilot.models.page import PanelPlan
+from manga_autopilot.models.panel import PanelRecord
 from manga_autopilot.services.prompt_builder import PromptSpec
 from manga_autopilot.services.qa import (
     CandidateGenerator,
@@ -111,6 +113,19 @@ class GenerationExecutorResult:
     workflow_id: str = ""
 
 
+class ExecutorTimeout(RuntimeError):
+    """Raised by an executor when a submission timed out.
+
+    ``prompt_id`` lets a strict run reconcile against ComfyUI history before
+    resubmitting, so a render that actually finished is adopted rather than
+    paid for twice.
+    """
+
+    def __init__(self, message: str, *, prompt_id: str = "") -> None:
+        super().__init__(message)
+        self.prompt_id = prompt_id
+
+
 @dataclass
 class GenerationLoopConfig:
     candidate_count: int = 1
@@ -118,6 +133,10 @@ class GenerationLoopConfig:
     threshold: float = 0.5
     panel_width: int = 512
     panel_height: int = 512
+    strict: bool = False
+    """Strict Anima semantics: no quality auto-retry, no fallback image."""
+    technical_retry_count: int = 1
+    """Strict mode only: how many times a technical failure is retried."""
 
 
 @dataclass
@@ -192,6 +211,59 @@ class GenerationLoop:
         )
         return self.candidate_generator.generate(spec)
 
+    async def _submit(
+        self,
+        executor: GenerationExecutor,
+        request: PanelExecutionRequest,
+    ) -> GenerationExecutorResult:
+        """Submit one candidate.
+
+        Generic runs submit once and let any exception propagate. Strict runs
+        first reconcile a timeout against ComfyUI history by prompt id, and then
+        retry a technical failure ``technical_retry_count`` times. A quality
+        problem is not a technical failure and never reaches this method.
+        """
+        if not self.config.strict:
+            return await executor.submit(request)
+
+        attempts = max(0, self.config.technical_retry_count) + 1
+        last_error: Exception | None = None
+        for attempt in range(attempts):
+            try:
+                return await executor.submit(request)
+            except ExecutorTimeout as exc:
+                last_error = exc
+                recovered = await self._reconcile(executor, exc.prompt_id)
+                if recovered is not None:
+                    log.info(
+                        "adopted already-finished render for prompt %s instead of resubmitting",
+                        exc.prompt_id,
+                    )
+                    return recovered
+            except Exception as exc:  # noqa: BLE001 - retried, then re-raised below
+                last_error = exc
+            if attempt + 1 < attempts:
+                log.warning(
+                    "technical failure on %s (%s); retrying once",
+                    request.candidate_id,
+                    last_error,
+                )
+        assert last_error is not None
+        raise last_error
+
+    async def _reconcile(
+        self,
+        executor: GenerationExecutor,
+        prompt_id: str,
+    ) -> GenerationExecutorResult | None:
+        """Ask the executor whether `prompt_id` already produced an image."""
+        if not prompt_id:
+            return None
+        reconcile = getattr(executor, "reconcile", None)
+        if reconcile is None:
+            return None
+        return await reconcile(prompt_id)
+
     def _score(
         self,
         panel: PanelPlan,
@@ -258,6 +330,10 @@ class GenerationLoop:
             try:
                 candidates = self._build_candidates(panel, prompt, workflow_id)
             except ValueError as exc:
+                if self.config.strict:
+                    # Strict Anima surfaces misconfiguration instead of quietly
+                    # shipping a placeholder panel.
+                    raise
                 # ``candidate_count=0`` (or other misconfiguration) is treated
                 # as a soft failure: fall back to the safe image so the
                 # pipeline never crashes.
@@ -298,7 +374,7 @@ class GenerationLoop:
                         height=cand.height,
                         metadata={"run_id": run_id, "attempt_index": attempt} if run_id else {"attempt_index": attempt},
                     )
-                    result = await executor.submit(request)
+                    result = await self._submit(executor, request)
                     if cancel_check is not None and cancel_check():
                         job.status = JobStatus.CANCELLED
                         job.error = "cancelled"
@@ -338,6 +414,13 @@ class GenerationLoop:
                     self._set_status(job, JobStatus.COMPLETED)
                     break
 
+                if self.config.strict:
+                    # A strict run never guesses on the user's behalf: a quality
+                    # rejection waits for a decision instead of burning GPU time
+                    # on an automatic retry or substituting a fallback image.
+                    self._set_status(job, JobStatus.AWAITING_REVIEW)
+                    break
+
                 # Decide whether to retry or fall back.  Pass the failing
                 # QA result's issues to the retry controller so it can
                 # produce a :class:`QualityIssue` list it understands.
@@ -367,8 +450,14 @@ class GenerationLoop:
                 JobStatus.COMPLETED,
                 JobStatus.FAILED,
                 JobStatus.CANCELLED,
+                JobStatus.AWAITING_REVIEW,
             ):
-                job = self._apply_fallback(panel, job, prompt)
+                if self.config.strict:
+                    job.status = JobStatus.FAILED
+                    job.error = job.error or "strict run produced no candidate"
+                    job.touch()
+                else:
+                    job = self._apply_fallback(panel, job, prompt)
 
         except Exception as exc:  # noqa: BLE001
             job.status = JobStatus.FAILED
@@ -418,6 +507,117 @@ class GenerationLoop:
 
 
 # ---------------------------------------------------------- ComfyUI-backed executor
+@dataclass
+class SequentialPanelResult:
+    """What happened to one panel during a sequential run."""
+
+    panel_id: str
+    status: str
+    outcome: GenerationOutcome | None = None
+
+
+async def run_panels_sequentially(
+    *,
+    records: list[PanelRecord],
+    loop: GenerationLoop,
+    executor: GenerationExecutor,
+    prompt_for: Callable[[PanelRecord], PromptSpec],
+    workflow_id: str,
+    project_id: str,
+    persist: Callable[[list[PanelRecord]], Any],
+    run_id: str = "",
+    cancel_check: Callable[[], bool] | None = None,
+) -> list[SequentialPanelResult]:
+    """Generate `records` one panel at a time, persisting after each.
+
+    A panel is written to disk before the next one is submitted, so an
+    interrupted run resumes from the last completed panel rather than
+    re-rendering work that was already paid for. A panel that comes back
+    ``AWAITING_REVIEW`` stops the run: the user decides what happens next.
+
+    ``prompt_for`` may raise; the panel is then marked failed and the run stops.
+    Nothing is substituted for a prompt that could not be built.
+    """
+    results: list[SequentialPanelResult] = []
+
+    for record in records:
+        if cancel_check is not None and cancel_check():
+            log.info("sequential run cancelled before %s", record.panel_id)
+            break
+
+        if _panel_is_complete(record):
+            results.append(SequentialPanelResult(record.panel_id, "skipped"))
+            continue
+
+        try:
+            prompt = prompt_for(record)
+            if inspect.isawaitable(prompt):
+                prompt = await prompt
+        except Exception as exc:  # noqa: BLE001 - reported, never faked
+            log.warning("prompt build failed for %s: %s", record.panel_id, exc)
+            record.status = "failed"
+            record.updated_at = datetime.now(timezone.utc)
+            persist(records)
+            results.append(SequentialPanelResult(record.panel_id, "failed"))
+            break
+
+        outcome = await loop.run(
+            panel=record.plan,
+            page_number=record.page_number,
+            prompt=prompt,
+            workflow_id=workflow_id,
+            executor=executor,
+            project_id=project_id,
+            cancel_check=cancel_check,
+            run_id=run_id,
+        )
+
+        status = _record_status_for(outcome.job.status)
+        if outcome.selected_image_path is not None:
+            record.image_path = str(outcome.selected_image_path)
+        if status != "cancelled":
+            # A cancelled panel was never judged, so its record keeps the status
+            # it had; only a real verdict overwrites it.
+            record.status = status
+        record.workflow_id = workflow_id
+        record.history.append(
+            {
+                "kind": "sequential_generation",
+                "job_id": outcome.job.id,
+                "at": _utc_now_iso(),
+                "job_status": outcome.job.status.value,
+            }
+        )
+        record.updated_at = datetime.now(timezone.utc)
+        persist(records)
+        results.append(SequentialPanelResult(record.panel_id, status, outcome))
+
+        if status != "generated":
+            log.info("sequential run stopped at %s (%s)", record.panel_id, status)
+            break
+
+    return results
+
+
+def _panel_is_complete(record: PanelRecord) -> bool:
+    return (
+        record.status in {"generated", "approved"}
+        and record.image_path is not None
+        and Path(record.image_path).exists()
+    )
+
+
+def _record_status_for(job_status: JobStatus) -> str:
+    """Map a job outcome onto the panel record status the run should record."""
+    if job_status == JobStatus.COMPLETED:
+        return "generated"
+    if job_status == JobStatus.AWAITING_REVIEW:
+        return "rejected"
+    if job_status == JobStatus.CANCELLED:
+        return "cancelled"
+    return "failed"
+
+
 @dataclass
 class ComfyExecutor:
     """A real :class:`GenerationExecutor` backed by :class:`ComfyClient`.

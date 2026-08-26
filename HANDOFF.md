@@ -1,6 +1,6 @@
 # Claude Code handoff: Anima Manga Autopilot MVP
 
-Updated: 2026-08-26 JST (Claude Code, Task 5 complete)
+Updated: 2026-08-26 JST (Claude Code, Task 6 complete)
 
 ## Objective
 
@@ -12,7 +12,7 @@ The user accepted the recommended choices from the prior grilling session and as
 
 `docs/superpowers/plans/2026-08-26-anima-mvp.md`
 
-Follow that plan from Task 6 onward. Do not restart completed Tasks 1-5.
+Follow that plan from Task 7 onward. Do not restart completed Tasks 1-6.
 
 ## Repository and Git state
 
@@ -28,10 +28,10 @@ Completed commits:
 2. `a251243 feat: add story bible and scene state reducer`
 3. `eb52846 feat: plan panels against layouts and continuity`
 4. `968399e feat: add Anima generation profiles and prompt adapter`
+5. `a04cb48 feat: version projects and snapshot Anima runs`
+6. `<pending> feat: add strict Anima preflight and managed execution`
 
-5. `<pending> feat: version projects and snapshot Anima runs`
-
-See "Task 4 result" and "Task 5 result" below for what those commits contain.
+See the per-task result sections below for what those commits contain.
 
 ## Completed behavior
 
@@ -149,6 +149,52 @@ Full backend suite: `7 failed, 895 passed, 15 skipped` in 66s - the same 7 pre-e
 
 `.\.venv\Scripts\python.exe -m ruff check src/manga_autopilot tests/backend` reported `All checks passed!`.
 
+## Task 6 result
+
+Delivered files:
+
+- `src/manga_autopilot/services/preflight.py` - `AnimaPreflight`, `PreflightRequest`, `PreflightReport`, `PreflightIssue`, `ComfyCapabilities`, `PreflightError`, `is_loopback`.
+- `src/manga_autopilot/services/lm_studio_lifecycle.py` - `ManagedLMStudioSession`, `LoadedModel`, `run_lms_cli`, `redact_secrets`.
+- `src/manga_autopilot/services/generation_job.py` - `ExecutorTimeout`, strict `GenerationLoopConfig` flags, `GenerationLoop._submit`/`_reconcile`, `run_panels_sequentially`, `SequentialPanelResult`.
+- `src/manga_autopilot/models/job.py` - `JobStatus.AWAITING_REVIEW`.
+- `src/manga_autopilot/config.py` - `ComfyUISettings.auth_token_env` plus `auth_is_configured()`, and `LMStudioSettings`.
+- `src/manga_autopilot/routes/autopilot_routes.py` - preflight gate, profile-derived candidate/retry counts, strict runs routed through `run_panels_sequentially`.
+- Tests: `test_anima_preflight.py` (23), `test_sequential_generation.py` (14), `test_lm_studio_lifecycle.py` (16), plus an updated `JobStatus` assertion in `test_generation_job.py`.
+
+Live interfaces verified on 2026-08-26 before writing any of this (read-only):
+
+- ComfyUI `/object_info`: combo inputs arrive as `[[option, ...], {config}]`, typed inputs as `["MODEL"]`. The three model files and the LoRA that `anima_turbo` declares are all installed on this machine.
+- LM Studio CLI: `lms load <model-key> [--identifier X] [--ttl N] [--context-length N] [--gpu R] -y`, `lms unload <identifier>` (and a `--all` that this project must never issue), `lms ps --json` returning objects with `identifier`, `modelKey`, `status`.
+- LM Studio had the user's own `gemma-4-26b-a4b-it` loaded at the time, which is exactly the instance the session must not touch.
+
+Design decisions worth knowing:
+
+- Preflight is pure. It takes a `/object_info` snapshot the caller already fetched, so the whole check runs without a server, and it never writes anything except a probe file it deletes.
+- Warnings do not block. `report.ok` is false only for errors; `raise_if_blocked()` names every failing code.
+- The plan's "unsupported dimensions" check became two honest checks: `resolution.policy_invalid` (error) for a self-inconsistent policy, and `resolution.aspect_clamped` (warning) when a panel aspect cannot be honoured inside the side limits. A check that the resolver's own output is in range would be vacuous, since the resolver guarantees it.
+- Strict mode is a flag on `GenerationLoopConfig`, not a fork of the loop. Generic projects keep the existing candidate/retry/fallback behaviour untouched.
+- A strict quality rejection sets `AWAITING_REVIEW` and stops. A technical failure retries `technical_retry_count` times (1 from the profile). A timeout carrying a prompt id reconciles through `executor.reconcile(prompt_id)` first, so a render that actually finished is adopted instead of paid for twice.
+- A cancelled panel keeps its previous record status rather than being marked failed, so the run stays resumable.
+- `ManagedLMStudioSession` adopts an instance the user already had loaded and records `owns_instance=False`; `unload()` is then a no-op. Bulk (`--all`) and download (`get`) commands are rejected inside `_invoke`, not merely avoided.
+
+Known gap, deliberate:
+
+- The route's preflight gate steps aside with a warning when the application has no `manga_comfy_client` or `manga_workflow_registry`. The in-process test wiring uses fake executors and has neither, and failing a run the gate cannot actually assess would be worse than logging. In a real install both are present and the gate is live. Task 7 or 8 should decide whether a strict run must hard-fail when it cannot preflight.
+
+Verification (2026-08-26, Claude Code):
+
+```powershell
+$env:TEMP='<a temp dir the agent can write to>'
+$env:TMP=$env:TEMP
+.\.venv\Scripts\python.exe -m pytest tests/backend/test_anima_preflight.py tests/backend/test_sequential_generation.py tests/backend/test_lm_studio_lifecycle.py tests/backend/test_generation_job.py tests/backend/test_comfy_executor_e2e.py -q -p no:cacheprovider
+```
+
+Result: `69 passed`.
+
+Full backend suite: `7 failed, 948 passed, 15 skipped` in 65s - the same 7 pre-existing portability failures, no regressions.
+
+`.\.venv\Scripts\python.exe -m ruff check src/manga_autopilot tests/backend` reported `All checks passed!`.
+
 ## Verified Anima configuration evidence
 
 The read-only local workflow was checked on 2026-08-26:
@@ -213,10 +259,9 @@ Task 8 should fix the tests or test fixtures with `tmp_path`, normalized persist
 
 ## Remaining sequence
 
-1. Implement Task 6 strict preflight, sequential generation semantics, and managed LM Studio lifecycle. Keep all live work opt-in.
-2. Implement Task 7 review gates, edit invalidation, and fake-service E2E.
-3. Implement Task 8 form review UI, API-format workflow example, docs, portability fixes, and full non-GPU verification.
-4. Run the final verification commands in the plan and inspect `git status`, `git diff --check`, and commit history.
+1. Implement Task 7 review gates, edit invalidation, and fake-service E2E.
+2. Implement Task 8 form review UI, API-format workflow example, docs, portability fixes, and full non-GPU verification.
+3. Run the final verification commands in the plan and inspect `git status`, `git diff --check`, and commit history.
 
 ## Standing approvals (2026-08-26)
 
