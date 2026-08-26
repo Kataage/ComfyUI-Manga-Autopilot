@@ -7,6 +7,8 @@ from typing import Literal
 
 from pydantic import BaseModel, Field, NonNegativeInt, field_validator
 
+from manga_autopilot.models.scene_state import SceneStateDelta
+
 
 # ----------------------------------------------------------------- Dialogue
 class Dialogue(BaseModel):
@@ -40,6 +42,8 @@ class PanelPlan(BaseModel):
     visual_priority: VisualPriority = "character"
     dialogue: list[Dialogue] = Field(default_factory=list)
     sfx: list[SoundEffect] = Field(default_factory=list)
+    layout_id: str | None = Field(default=None, max_length=64)
+    scene_delta: SceneStateDelta = Field(default_factory=SceneStateDelta)
 
     @field_validator("characters")
     @classmethod

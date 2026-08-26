@@ -57,6 +57,14 @@ class ProjectPaths:
         return self.root / "story.json"
 
     @property
+    def story_bible_json(self) -> Path:
+        return self.root / "story_bible.json"
+
+    @property
+    def scene_state_json(self) -> Path:
+        return self.root / "scene_state.json"
+
+    @property
     def characters_json(self) -> Path:
         return self.root / "characters.json"
 
