@@ -11,7 +11,8 @@ from typing import TYPE_CHECKING, Any
 
 from aiohttp import web
 
-from manga_autopilot.models.page import PagePlan
+from manga_autopilot.models.bible import StoryBible
+from manga_autopilot.models.page import PagePlan, PanelPlan
 from manga_autopilot.models.panel import (
     PanelLayout,
     PanelRecord,
@@ -91,6 +92,11 @@ def _default_workflow_id(app: Application) -> str:
     return "anime_t2i_default"
 
 
+def _is_anima_run(run: AutopilotRun) -> bool:
+    profile_id = run.input.get("generation_profile_id")
+    return isinstance(profile_id, str) and profile_id.startswith("anima_")
+
+
 # ----------------------------------------------------------------- hook helpers
 def _read_panel_records(project_root: Path) -> list[PanelRecord]:
     path = project_root / "panels.json"
@@ -131,15 +137,27 @@ def _make_plan_story(
                 page_count=int(run.input.get("page_count") or 1),
                 language=str(run.input.get("language") or "ja"),
                 genre=str(run.input.get("genre") or "fantasy"),
+                strict=_is_anima_run(run),
             )
             plan = await planner.plan(str(run.input.get("idea") or ""))
             (project_root / "story.json").write_text(
                 json.dumps(plan.model_dump(mode="json"), ensure_ascii=False, indent=2),
                 encoding="utf-8",
             )
+            if _is_anima_run(run):
+                paths.story_bible_json.write_text(
+                    json.dumps(
+                        plan.story_bible.model_dump(mode="json"),
+                        ensure_ascii=False,
+                        indent=2,
+                    ),
+                    encoding="utf-8",
+                )
             return plan.model_dump(mode="json")
         except Exception as exc:  # noqa: BLE001
             log.warning("plan_story failed: %s", exc)
+            if _is_anima_run(run):
+                raise
             return None
 
     return _hook
@@ -193,14 +211,53 @@ def _make_plan_pages(
 
     async def _hook(run: AutopilotRun) -> list[PagePlan]:
         page_count = int(run.input.get("page_count") or 1)
+        strict = _is_anima_run(run)
         try:
-            planner = PagePlanner(provider=_llm_provider(app), page_count=page_count)
             story_plan = run.artefacts.get("plan_story")
             if not isinstance(story_plan, (dict, str)):
                 story_plan = {"title": "", "pages": []}
-            plan_list = await planner.plan(story_plan)
-            pages = list(plan_list.pages)
+            if strict:
+                if not isinstance(story_plan, dict):
+                    raise ValueError("strict planning requires a structured StoryPlan")
+                pages = [PagePlan.model_validate(item) for item in story_plan.get("pages", [])]
+                if len(pages) != page_count:
+                    raise ValueError(
+                        f"StoryPlan contains {len(pages)} pages; expected {page_count}"
+                    )
+                from manga_autopilot.services.page_templates import (
+                    fallback_grid,
+                    layout_catalog,
+                )
+
+                layout_slots = {
+                    str(item["layout_id"]): int(item["panel_count"])
+                    for item in layout_catalog("page")
+                }
+                for page in pages:
+                    if page.layout_id is None:
+                        page.layout_id = fallback_grid(page.panel_count).template_id
+                    elif page.layout_id.startswith("fallback_grid_"):
+                        expected = fallback_grid(page.panel_count).template_id
+                        if page.layout_id != expected:
+                            raise ValueError(
+                                f"layout {page.layout_id!r} does not match "
+                                f"panel_count={page.panel_count}"
+                            )
+                    elif page.layout_id not in layout_slots:
+                        raise ValueError(f"layout {page.layout_id!r} is not registered")
+                    elif layout_slots[page.layout_id] != page.panel_count:
+                        raise ValueError(
+                            f"layout {page.layout_id!r} has "
+                            f"{layout_slots[page.layout_id]} slots; "
+                            f"received panel_count={page.panel_count}"
+                        )
+            else:
+                planner = PagePlanner(provider=_llm_provider(app), page_count=page_count)
+                plan_list = await planner.plan(story_plan)
+                pages = list(plan_list.pages)
         except Exception as exc:  # noqa: BLE001
+            if strict:
+                raise
             log.warning("plan_pages fell back to stub: %s", exc)
             pages = [
                 PagePlan(
@@ -230,13 +287,15 @@ def _make_plan_panels(
     project_root = paths.root
 
     async def _hook(run: AutopilotRun) -> list[dict[str, Any]]:
+        from manga_autopilot.models.scene_state import SceneState
+        from manga_autopilot.services.character_service import CharacterService
+        from manga_autopilot.services.page_templates import fallback_grid, layout_catalog
+        from manga_autopilot.services.scene_state_reducer import apply_scene_delta
+
         existing = {r.panel_id: r for r in _read_panel_records(project_root)}
         panels_per_page = int(run.input.get("panels_per_page") or 1)
+        strict = _is_anima_run(run)
         records: list[PanelRecord] = []
-        try:
-            planner = PanelPlanner(panels=[])
-        except TypeError:
-            planner = PanelPlanner(provider=_llm_provider(app))  # type: ignore[call-arg]
         raw_pages: list[Any] = run.artefacts.get("plan_pages") or []
         pages: list[PagePlan] = []
         for item in raw_pages:
@@ -249,23 +308,94 @@ def _make_plan_panels(
                     continue
         if not pages:
             return [r.model_dump(mode="json") for r in existing.values()]
+
+        story_payload = run.artefacts.get("plan_story")
+        story_bible = StoryBible()
+        if isinstance(story_payload, dict):
+            story_bible = StoryBible.model_validate(
+                story_payload.get("story_bible")
+                or story_payload.get("storyBible")
+                or {}
+            )
+        character_service = CharacterService.for_project(storage_root, project_id)
+        characters = character_service.list()
+        known_character_ids = {character.id for character in characters}
+        character_payloads = [
+            character.model_dump(mode="json") for character in characters
+        ]
+        state = SceneState()
+        if paths.scene_state_json.exists():
+            state = SceneState.model_validate_json(
+                paths.scene_state_json.read_text(encoding="utf-8")
+            )
+
         for page in pages:
+            effective_count = page.panel_count if strict else panels_per_page
+            page_layout_id = page.layout_id
+            if strict and page_layout_id is None:
+                page_layout_id = fallback_grid(effective_count).template_id
+                page.layout_id = page_layout_id
+            catalog = layout_catalog("page")
+            registered_layout_ids = {
+                str(item["layout_id"]) for item in catalog
+            }
+            if page_layout_id and page_layout_id.startswith("fallback_grid_"):
+                registered_layout_ids.add(page_layout_id)
+                catalog.append(
+                    {
+                        "layout_id": page_layout_id,
+                        "panel_count": effective_count,
+                        "reading_order": list(range(1, effective_count + 1)),
+                    }
+                )
+            planner = PanelPlanner(
+                provider=_llm_provider(app),
+                panel_count=effective_count,
+                strict=strict,
+                character_ids=known_character_ids,
+                layout_id=page_layout_id,
+                registered_layout_ids=registered_layout_ids,
+                story_bible=story_bible.model_dump(mode="json"),
+                scene_state=state.model_dump(mode="json"),
+                active_characters=character_payloads,
+                layouts=catalog,
+            )
             try:
                 panel_list = await planner.plan(page)
-                plans = list(panel_list.panels)[:panels_per_page]
+                plans = list(panel_list.panels)[:effective_count]
             except Exception as exc:  # noqa: BLE001
+                if strict:
+                    raise
                 log.warning("plan_panels fell back to stub for page %s: %s", page.page_number, exc)
                 plans = []
-            while len(plans) < panels_per_page:
+            while len(plans) < effective_count:
                 pn = len(plans) + 1
                 plans.append(
-                    type(plans[0])(
+                    PanelPlan(
                         panel_number=pn,
                         purpose=f"panel {pn} of page {page.page_number}",
                         action=page.summary or "scene",
                     )
                 )
             for plan in plans:
+                if strict:
+                    reduced = apply_scene_delta(
+                        state,
+                        plan.scene_delta,
+                        known_character_ids,
+                    )
+                    if not reduced.applied:
+                        details = "; ".join(item.message for item in reduced.warnings)
+                        raise ValueError(f"scene delta rejected: {details}")
+                    state = reduced.state
+                    paths.scene_state_json.write_text(
+                        json.dumps(
+                            state.model_dump(mode="json"),
+                            ensure_ascii=False,
+                            indent=2,
+                        ),
+                        encoding="utf-8",
+                    )
                 pid = f"panel_{page.page_number:03d}_{plan.panel_number:02d}"
                 record = existing.get(pid) or PanelRecord(
                     panel_id=pid,

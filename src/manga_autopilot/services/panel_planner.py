@@ -78,6 +78,43 @@ PANEL_PLAN_SCHEMA: dict[str, Any] = {
                             },
                         },
                     },
+                    "layoutId": {"type": "string"},
+                    "sceneDelta": {
+                        "type": "object",
+                        "properties": {
+                            "page_number": {"type": "integer", "minimum": 1},
+                            "panel_number": {"type": "integer", "minimum": 1},
+                            "events": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "required": ["kind"],
+                                    "properties": {
+                                        "kind": {
+                                            "type": "string",
+                                            "enum": [
+                                                "set_location",
+                                                "set_time",
+                                                "set_weather",
+                                                "set_emotion",
+                                                "set_position",
+                                                "set_clothing",
+                                                "acquire_object",
+                                                "drop_object",
+                                                "transfer_object",
+                                                "set_object_state",
+                                            ],
+                                        },
+                                        "character_id": {"type": ["string", "null"]},
+                                        "target_character_id": {"type": ["string", "null"]},
+                                        "value": {"type": "string"},
+                                        "state": {"type": "string"},
+                                        "reason": {"type": "string"},
+                                    },
+                                },
+                            },
+                        },
+                    },
                 },
             },
         }
@@ -97,6 +134,18 @@ PROMPT_TEMPLATE = """あなたは漫画の演出家です。
 
 PagePlan:
 {plan}
+
+Story Bible:
+{story_bible}
+
+Prior Scene State:
+{scene_state}
+
+Active Characters:
+{active_characters}
+
+Available Layouts:
+{layouts}
 """
 
 
@@ -119,6 +168,10 @@ class PanelPlanner:
     character_ids: set[str] = field(default_factory=set)
     layout_id: str | None = None
     registered_layout_ids: set[str] | None = None
+    story_bible: Mapping[str, Any] | str | None = None
+    scene_state: Mapping[str, Any] | str | None = None
+    active_characters: list[Mapping[str, Any]] = field(default_factory=list)
+    layouts: list[Mapping[str, Any]] = field(default_factory=list)
     system_prompt: str = (
         "You are a manga director. Always respond with strict JSON only."
     )
@@ -128,7 +181,22 @@ class PanelPlanner:
             plan = plan.model_dump(mode="json")
         if isinstance(plan, Mapping):
             plan = json.dumps(plan, ensure_ascii=False, indent=2)
-        return PROMPT_TEMPLATE.format(panel_count=self.panel_count, plan=plan)
+        return PROMPT_TEMPLATE.format(
+            panel_count=self.panel_count,
+            plan=plan,
+            story_bible=self._context_json(self.story_bible),
+            scene_state=self._context_json(self.scene_state),
+            active_characters=self._context_json(self.active_characters),
+            layouts=self._context_json(self.layouts),
+        )
+
+    @staticmethod
+    def _context_json(value: Any) -> str:
+        if value is None:
+            return "{}"
+        if isinstance(value, str):
+            return value
+        return json.dumps(value, ensure_ascii=False, indent=2)
 
     async def plan(self, page_plan: PagePlan | Mapping[str, Any] | str) -> PanelPlanList:
         prompt = self.build_prompt(page_plan)
@@ -171,6 +239,8 @@ class PanelPlanner:
             action=payload.get("action", ""),
             emotion=payload.get("emotion", ""),
             visual_priority=payload.get("visualPriority", "character"),
+            layout_id=payload.get("layoutId"),
+            scene_delta=payload.get("sceneDelta") or {},
             dialogue=[
                 Dialogue(
                     character_id=d.get("characterId"),

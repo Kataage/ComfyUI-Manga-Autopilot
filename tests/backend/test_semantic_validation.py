@@ -151,12 +151,14 @@ async def test_strict_story_planner_repairs_wrong_global_page_count() -> None:
         [
             {
                 "title": "x",
+                "storyBible": {"rules": ["keep the key visible"]},
                 "pages": [
                     {"pageNumber": 1, "summary": "one", "panelCount": 1},
                 ],
             },
             {
                 "title": "x",
+                "storyBible": {"rules": ["keep the key visible"]},
                 "pages": [
                     {"pageNumber": 1, "summary": "one", "panelCount": 1},
                     {"pageNumber": 2, "summary": "two", "panelCount": 1},
@@ -172,4 +174,26 @@ async def test_strict_story_planner_repairs_wrong_global_page_count() -> None:
     ).plan("idea")
 
     assert [page.page_number for page in result.pages] == [1, 2]
+    assert result.story_bible.rules == ["keep the key visible"]
     assert provider.responses == []
+
+
+async def test_strict_story_planner_rejects_missing_story_bible() -> None:
+    payload = {
+        "title": "x",
+        "pages": [
+            {"pageNumber": 1, "summary": "one", "panelCount": 1},
+        ],
+    }
+    provider = _SequenceProvider([payload, payload])
+
+    try:
+        await StoryPlanner(
+            provider=provider,
+            page_count=1,
+            strict=True,
+        ).plan("idea")
+    except ValueError as exc:
+        assert "storyBible" in str(exc)
+    else:
+        raise AssertionError("strict planning accepted a missing Story Bible")

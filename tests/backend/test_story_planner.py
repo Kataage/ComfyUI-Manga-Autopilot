@@ -65,6 +65,10 @@ async def test_planner_parses_valid_payload() -> None:
         "theme": "courage",
         "genre": "fantasy",
         "mood": "warm",
+        "storyBible": {
+            "world": "cat village",
+            "rules": ["cats speak at dusk"],
+        },
         "acts": [
             {
                 "id": "act-1",
@@ -82,6 +86,7 @@ async def test_planner_parses_valid_payload() -> None:
                 "emotionalGoal": "curiosity",
                 "visualGoal": "village",
                 "panelCount": 2,
+                "layoutId": "page_2_horizontal",
             },
             {
                 "pageNumber": 2,
@@ -99,6 +104,8 @@ async def test_planner_parses_valid_payload() -> None:
     assert plan.title == "Cat Hero"
     assert len(plan.pages) == 2
     assert plan.pages[0].page_number == 1
+    assert plan.pages[0].layout_id == "page_2_horizontal"
+    assert plan.story_bible.rules == ["cats speak at dusk"]
 
 
 async def test_planner_repairs_invalid_json() -> None:

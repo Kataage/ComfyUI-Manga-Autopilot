@@ -67,6 +67,7 @@ class PagePlan(BaseModel):
     visual_goal: str = Field(default="", max_length=256)
     panel_count: int = Field(ge=1, le=24)
     cliffhanger: str | None = Field(default=None, max_length=512)
+    layout_id: str | None = Field(default=None, max_length=64)
     panels: list[PanelPlan] = Field(default_factory=list)
 
     @field_validator("panels")

@@ -25,6 +25,27 @@ STORY_PLAN_SCHEMA: dict[str, Any] = {
         "theme": {"type": "string"},
         "genre": {"type": "string"},
         "mood": {"type": "string"},
+        "storyBible": {
+            "type": "object",
+            "properties": {
+                "title": {"type": "string"},
+                "genre": {"type": "string"},
+                "tone": {"type": "string"},
+                "theme": {"type": "string"},
+                "world": {"type": "string"},
+                "rules": {"type": "array", "items": {"type": "string"}},
+                "timeline": {"type": "array", "items": {"type": "string"}},
+                "locations": {"type": "object", "additionalProperties": {"type": "string"}},
+                "important_objects": {
+                    "type": "object",
+                    "additionalProperties": {"type": "string"},
+                },
+                "relationships": {"type": "array", "items": {"type": "string"}},
+                "foreshadowing": {"type": "array", "items": {"type": "string"}},
+                "resolved_events": {"type": "array", "items": {"type": "string"}},
+                "unresolved_events": {"type": "array", "items": {"type": "string"}},
+            },
+        },
         "acts": {
             "type": "array",
             "items": {
@@ -51,6 +72,7 @@ STORY_PLAN_SCHEMA: dict[str, Any] = {
                     "emotionalGoal": {"type": "string"},
                     "visualGoal": {"type": "string"},
                     "panelCount": {"type": "integer"},
+                    "layoutId": {"type": "string"},
                     "cliffhanger": {"type": "string"},
                 },
             },
@@ -68,6 +90,7 @@ PROMPT_TEMPLATE = """あなたは漫画原作者です。
 - 言語: {language}
 - ジャンル: {genre}
 - 1ページごとに summary, emotionalGoal, visualGoal, panelCount を含める
+- storyBible に世界、ルール、場所、重要物、関係、伏線、解決済み・未解決イベントを含める
 - セリフは短くする
 - 各ページの目的が重複しないようにする
 - 最終ページには読後感または次への引きを入れる
@@ -104,13 +127,16 @@ class StoryPlanner:
         validation_options: dict[str, Any] = {}
         if self.strict:
             def _validate_semantics(data: dict[str, Any]) -> list[str]:
-                return [
+                messages = [
                     f"{issue.path}: {issue.message}"
                     for issue in validate_page_sequence(
                         data.get("pages", []),
                         self.page_count,
                     )
                 ]
+                if "storyBible" not in data:
+                    messages.append("/storyBible: Story Bible is required in strict mode")
+                return messages
 
             validation_options["semantic_validator"] = _validate_semantics
         data = await self.provider.complete_json(
@@ -137,6 +163,7 @@ class StoryPlanner:
             theme=data.get("theme", ""),
             genre=data.get("genre", self.genre),
             mood=data.get("mood", ""),
+            story_bible=data.get("storyBible") or {},
             acts=acts,
             pages=pages,
         )
@@ -166,6 +193,7 @@ class StoryPlanner:
                     visual_goal=item.get("visualGoal", ""),
                     panel_count=max(1, int(item.get("panelCount", 1))),
                     cliffhanger=item.get("cliffhanger"),
+                    layout_id=item.get("layoutId"),
                 )
             )
         return out

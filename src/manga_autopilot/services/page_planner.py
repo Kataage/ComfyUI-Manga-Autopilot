@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import logging
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from pydantic import BaseModel, Field
@@ -13,7 +13,10 @@ from pydantic import BaseModel, Field
 from manga_autopilot.models.page import PagePlan
 from manga_autopilot.services.json_schema_validator import validate_llm_output
 from manga_autopilot.services.llm_provider import LLMProvider
-from manga_autopilot.services.semantic_validation import validate_page_sequence
+from manga_autopilot.services.semantic_validation import (
+    validate_page_layouts,
+    validate_page_sequence,
+)
 
 log = logging.getLogger(__name__)
 
@@ -33,6 +36,7 @@ PAGE_PLAN_SCHEMA: dict[str, Any] = {
                     "emotionalGoal": {"type": "string"},
                     "visualGoal": {"type": "string"},
                     "panelCount": {"type": "integer", "minimum": 1, "maximum": 24},
+                    "layoutId": {"type": "string"},
                     "cliffhanger": {"type": "string"},
                 },
             },
@@ -66,6 +70,7 @@ class PagePlanner:
     page_count: int = 4
     max_repair_attempts: int = 1
     strict: bool = False
+    layout_slots: dict[str, int] = field(default_factory=dict)
     system_prompt: str = (
         "You are a manga editor. Always respond with strict JSON only."
     )
@@ -80,12 +85,22 @@ class PagePlanner:
         validation_options: dict[str, Any] = {}
         if self.strict:
             def _validate_semantics(data: dict[str, Any]) -> list[str]:
+                issues = validate_page_sequence(
+                    data.get("pages", []),
+                    self.page_count,
+                )
+                if self.layout_slots:
+                    issues.extend(
+                        issue
+                        for issue in validate_page_layouts(
+                            data.get("pages", []),
+                            self.layout_slots,
+                        )
+                        if issue.severity == "error"
+                    )
                 return [
                     f"{issue.path}: {issue.message}"
-                    for issue in validate_page_sequence(
-                        data.get("pages", []),
-                        self.page_count,
-                    )
+                    for issue in issues
                 ]
 
             validation_options["semantic_validator"] = _validate_semantics
@@ -114,6 +129,7 @@ class PagePlanner:
                     "emotional_goal": page.get("emotionalGoal", ""),
                     "visual_goal": page.get("visualGoal", ""),
                     "panel_count": int(page.get("panelCount", 1)),
+                    "layout_id": page.get("layoutId"),
                     "cliffhanger": page.get("cliffhanger"),
                 }
             )

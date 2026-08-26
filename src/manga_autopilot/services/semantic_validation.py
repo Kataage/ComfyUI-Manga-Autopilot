@@ -10,6 +10,8 @@ class SemanticIssue:
     path: str
     code: str
     message: str
+    severity: str = "error"
+    fallback: str | None = None
 
 
 def validate_page_sequence(
@@ -87,6 +89,48 @@ def validate_panel_sequence(
     return issues
 
 
+def validate_page_layouts(
+    pages: Sequence[Any],
+    layout_slots: Mapping[str, int],
+) -> list[SemanticIssue]:
+    issues: list[SemanticIssue] = []
+    for index, page in enumerate(pages):
+        layout_id = _read(page, "layoutId", "layout_id")
+        panel_count = int(_read(page, "panelCount", "panel_count") or 0)
+        if not layout_id:
+            issues.append(
+                SemanticIssue(
+                    path=f"/pages/{index}/layoutId",
+                    code="layout_fallback",
+                    message=f"no layout supplied; using fallback_grid_{panel_count}",
+                    severity="warning",
+                    fallback=f"fallback_grid_{panel_count}",
+                )
+            )
+            continue
+        if layout_id not in layout_slots:
+            issues.append(
+                SemanticIssue(
+                    path=f"/pages/{index}/layoutId",
+                    code="unknown_layout",
+                    message=f"layout {layout_id!r} is not registered",
+                )
+            )
+            continue
+        if layout_slots[layout_id] != panel_count:
+            issues.append(
+                SemanticIssue(
+                    path=f"/pages/{index}/panelCount",
+                    code="layout_slot_mismatch",
+                    message=(
+                        f"layout {layout_id!r} has {layout_slots[layout_id]} slots, "
+                        f"received panelCount={panel_count}"
+                    ),
+                )
+            )
+    return issues
+
+
 def _read(value: Any, *names: str) -> Any:
     if isinstance(value, Mapping):
         for name in names:
@@ -102,5 +146,6 @@ def _read(value: Any, *names: str) -> Any:
 __all__ = [
     "SemanticIssue",
     "validate_page_sequence",
+    "validate_page_layouts",
     "validate_panel_sequence",
 ]
