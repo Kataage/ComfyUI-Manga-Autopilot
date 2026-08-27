@@ -402,3 +402,38 @@ def test_higher_cfg_profiles_are_not_warned(tmp_path: Path) -> None:
             _request(tmp_path, profile=load_builtin_profile(profile_id))
         )
         assert "prompt.negative_inert_at_cfg1" not in report.codes()
+
+
+# ------------------------------------------------ a stopped server, named as such
+
+
+async def test_an_unreachable_comfyui_is_named_in_the_error(tmp_path: Path) -> None:
+    """A live run failed as FAILED_PANEL_GENERATION when ComfyUI was simply down."""
+    from aiohttp import web
+
+    from manga_autopilot.routes.autopilot_routes import _run_anima_preflight
+    from manga_autopilot.services.autopilot import AutopilotRun, AutopilotStateMachine
+
+    class _DeadClient:
+        base_url = "http://127.0.0.1:8188"
+
+        async def get_object_info(self):
+            raise ConnectionRefusedError("connection refused")
+
+    class _Registry:
+        def get(self, workflow_id):
+            return _workflow()
+
+    app = web.Application()
+    app["manga_comfy_client"] = _DeadClient()
+    app["manga_workflow_registry"] = _Registry()
+    run = AutopilotRun(
+        project_id="p",
+        machine=AutopilotStateMachine(project_id="p"),
+        input={"generation_profile_id": "anima_turbo"},
+    )
+
+    with pytest.raises(RuntimeError, match="not reachable"):
+        await _run_anima_preflight(
+            app, run, project_root=tmp_path, workflow_id="anima_turbo"
+        )

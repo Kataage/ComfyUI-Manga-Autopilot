@@ -194,7 +194,17 @@ async def _run_anima_preflight(
 
     profile = load_builtin_profile(str(run.input["generation_profile_id"]))
     workflow = registry.get(workflow_id)
-    capabilities = ComfyCapabilities.from_object_info(await client.get_object_info())
+    try:
+        object_info = await client.get_object_info()
+    except Exception as exc:  # noqa: BLE001 - re-raised with the cause named
+        # "FAILED_PANEL_GENERATION" on its own sends the reader hunting through
+        # prompts and workflows for a problem that is just a stopped server.
+        base_url = getattr(client, "base_url", "the configured endpoint")
+        raise RuntimeError(
+            f"ComfyUI at {base_url} is not reachable, so nothing can be generated: "
+            f"{type(exc).__name__}: {exc}"
+        ) from exc
+    capabilities = ComfyCapabilities.from_object_info(object_info)
 
     request = PreflightRequest(
         profile=profile,
