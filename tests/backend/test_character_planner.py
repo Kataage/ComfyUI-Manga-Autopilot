@@ -169,3 +169,46 @@ def test_spec_to_character_produces_a_persistable_record(tmp_path) -> None:
 
     assert created.id == "char_hero"
     assert [c.id for c in service.list()] == ["char_hero"]
+
+
+def test_a_sentence_is_not_treated_as_a_colour() -> None:
+    """A live planner produced 'Trembling hands and expressive, teary eyes'.
+
+    Reading that as an eye colour makes the character card nonsense. The traits
+    are kept verbatim regardless, so skipping loses nothing.
+    """
+    from manga_autopilot.services.character_planner import (
+        UNSPECIFIED,
+        CharacterSpec,
+        spec_to_character,
+    )
+
+    character = spec_to_character(
+        CharacterSpec(
+            id="c",
+            name="C",
+            role="support",
+            visual_traits=[
+                "Long, straight hair tied loosely with a thin ribbon",
+                "Trembling hands and expressive, teary eyes",
+            ],
+        )
+    )
+
+    assert character.appearance.hair_color == UNSPECIFIED
+    assert character.appearance.eye_color == UNSPECIFIED
+    assert len(character.appearance.distinctive_features) == 2
+
+
+def test_a_short_colour_phrase_is_still_read() -> None:
+    from manga_autopilot.services.character_planner import CharacterSpec, spec_to_character
+
+    character = spec_to_character(
+        CharacterSpec(
+            id="c", name="C", role="support",
+            visual_traits=["long black hair", "bright amber eyes"],
+        )
+    )
+
+    assert character.appearance.hair_color == "long black"
+    assert character.appearance.eye_color == "bright amber"

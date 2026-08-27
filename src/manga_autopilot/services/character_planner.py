@@ -127,11 +127,20 @@ _EYE_MARKERS = ("eye", "eyes")
 UNSPECIFIED = "unspecified"
 
 
+#: A colour is a couple of words. Anything longer is a sentence about the
+#: character, and putting it in `hair_color` produces cards that read like
+#: "eye_color: Trembling hands and expressive, teary" - which is what a live
+#: planner actually produced on 2026-08-27.
+MAX_COLOUR_WORDS = 3
+
+
 def _trait_value(traits: Sequence[str], markers: Sequence[str]) -> str:
-    """Return the first trait mentioning any marker, with the marker removed.
+    """Return a short colour phrase from the first trait that names one.
 
     ``["blue hair"]`` yields ``"blue"``. A trait that is only the marker itself
-    (``"hair"``) carries no information and is skipped.
+    carries no information, and a trait long enough to be a sentence is a
+    description rather than a colour, so both are skipped. Nothing is lost by
+    skipping: every trait is kept verbatim in ``distinctive_features``.
     """
     for trait in traits:
         lowered = trait.lower()
@@ -139,7 +148,7 @@ def _trait_value(traits: Sequence[str], markers: Sequence[str]) -> str:
             if marker not in lowered.split() and marker not in lowered:
                 continue
             words = [word for word in trait.split() if word.lower() not in markers]
-            if words:
+            if words and len(words) <= MAX_COLOUR_WORDS:
                 return " ".join(words)
     return ""
 
@@ -176,6 +185,7 @@ def spec_to_character(spec: CharacterSpec) -> Character:
 
 
 __all__ = [
+    "MAX_COLOUR_WORDS",
     "UNSPECIFIED",
     "CharacterPlanner",
     "CharacterSpec",
