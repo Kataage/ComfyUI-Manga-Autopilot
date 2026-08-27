@@ -32,6 +32,9 @@ WARNING = "warning"
 
 LOOPBACK_HOSTS = frozenset({"localhost", "::1", "0.0.0.0"})
 
+#: ComfyUI skips the negative branch when cond_scale is close to 1.0.
+CFG1_TOLERANCE = 1e-6
+
 #: Binding keys whose absence means the profile cannot enforce its own settings.
 TECHNICAL_BINDING_KEYS: tuple[str, ...] = ("steps", "cfg", "seed", "width", "height")
 
@@ -166,6 +169,7 @@ class AnimaPreflight:
         issues: list[PreflightIssue] = []
         issues.extend(self._check_endpoint(request))
         issues.extend(self._check_license(request))
+        issues.extend(self._check_negative_prompt_reachability(request))
         issues.extend(self._check_models(request))
         issues.extend(self._check_workflow(request))
         issues.extend(self._check_resolution(request))
@@ -215,6 +219,31 @@ class AnimaPreflight:
                 )
             ]
         return []
+
+    # ------------------------------------------------------ negative prompt
+    def _check_negative_prompt_reachability(
+        self, request: PreflightRequest
+    ) -> list[PreflightIssue]:
+        """Warn when the profile's CFG makes the negative prompt do nothing.
+
+        ComfyUI's ``sampling_function`` sets ``uncond_ = None`` when
+        ``cond_scale`` is close to 1.0, so at CFG 1 the negative branch is not
+        evaluated at all. The wiring still looks correct in the graph, which is
+        what makes this worth saying out loud: the effect is zero, not small.
+        Verified against comfy/samplers.py in ComfyUI 0.30.0 on 2026-08-27.
+        """
+        if abs(request.profile.generation.cfg - 1.0) > CFG1_TOLERANCE:
+            return []
+        return [
+            PreflightIssue(
+                "prompt.negative_inert_at_cfg1",
+                f"profile {request.profile.id} renders at CFG "
+                f"{request.profile.generation.cfg}, so ComfyUI skips the negative "
+                "branch entirely and the negative prompt has no effect; express "
+                "anything you need to suppress positively instead",
+                WARNING,
+            )
+        ]
 
     # --------------------------------------------------------------- models
     def _check_models(self, request: PreflightRequest) -> list[PreflightIssue]:
@@ -396,6 +425,7 @@ class AnimaPreflight:
 
 
 __all__ = [
+    "CFG1_TOLERANCE",
     "ERROR",
     "LORA_FIELDS",
     "TECHNICAL_BINDING_KEYS",

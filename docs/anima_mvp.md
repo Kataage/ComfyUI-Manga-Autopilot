@@ -101,11 +101,31 @@ camera, emotion, background, lighting, style
 
 Terms are comma-split, trimmed, and deduplicated case-insensitively keeping the
 first occurrence, so identity survives truncation by the text encoder. The
-application's text/watermark bans are always appended to the negative prompt.
+application's text/watermark bans are always appended to the negative prompt -
+though see the CFG 1 caveat below for when that has no effect.
 
 `steps`, `cfg`, `sampler`, `scheduler`, and the dimensions come from the profile;
 the seed comes from the run. If the planner emits `technical_overrides`, they are
 accepted and then ignored, with a warning naming the ignored keys.
+
+### The negative prompt is inert at CFG 1
+
+`anima_turbo` renders at CFG 1. ComfyUI's `sampling_function` sets
+`uncond_ = None` when `cond_scale` is close to 1.0, so **the negative branch is
+not evaluated at all**. The effect is zero, not small, and the graph still looks
+correctly wired, which is what makes it easy to miss.
+
+Practical consequence: with the Turbo profile, `negative_defaults` and the
+application's text/watermark bans do nothing. Express what you need to suppress
+positively instead - "plain background" rather than a negative "signage, text".
+`anima_base` (CFG 4.5) and `anima_aesthetic` (CFG 4.0) evaluate the negative
+normally.
+
+Preflight reports this as the `prompt.negative_inert_at_cfg1` warning.
+
+Verified against `comfy/samplers.py` in ComfyUI 0.30.0 on 2026-08-27, and
+observed in a live one-panel render: background signage text appeared despite
+`text` and `watermark` being in the negative prompt.
 
 ## Review gates
 
@@ -205,6 +225,7 @@ downloaded, loaded, or queued during the check.
 | `output.unwritable` | error | The panel output directory cannot be written |
 | `workflow.technical_field_unbound` | warning | The workflow does not bind `steps`/`cfg`/... so the profile cannot enforce them |
 | `resolution.aspect_clamped` | warning | A panel aspect had to be clamped |
+| `prompt.negative_inert_at_cfg1` | warning | The profile renders at CFG 1, where the negative prompt has no effect |
 
 Set `comfyui.auth_token_env` in `config.yaml` to the **name** of an environment
 variable holding the token. The token itself is never stored in configuration.

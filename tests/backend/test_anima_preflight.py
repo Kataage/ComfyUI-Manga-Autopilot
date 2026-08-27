@@ -378,3 +378,27 @@ def test_raise_if_blocked_reports_every_error(tmp_path: Path) -> None:
     assert "license.not_acknowledged" in message
     assert "comfy.remote_not_allowed" in message
     assert excinfo.value.report is report
+
+
+# ------------------------------------------------------- negative at CFG 1
+
+
+def test_cfg1_profiles_warn_that_the_negative_prompt_is_inert(tmp_path: Path) -> None:
+    """anima_turbo renders at CFG 1, where ComfyUI skips the negative branch.
+
+    Verified against comfy/samplers.py (ComfyUI 0.30.0): ``sampling_function``
+    sets ``uncond_ = None`` when ``cond_scale`` is close to 1.0.
+    """
+    report = _preflight().run(_request(tmp_path))
+
+    assert report.ok is True
+    assert "prompt.negative_inert_at_cfg1" in report.codes()
+    assert any("no effect" in issue.message for issue in report.warnings)
+
+
+def test_higher_cfg_profiles_are_not_warned(tmp_path: Path) -> None:
+    for profile_id in ("anima_base", "anima_aesthetic"):
+        report = _preflight().run(
+            _request(tmp_path, profile=load_builtin_profile(profile_id))
+        )
+        assert "prompt.negative_inert_at_cfg1" not in report.codes()
