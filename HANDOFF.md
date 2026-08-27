@@ -16,7 +16,7 @@ Every task in that plan is done. The remaining work is live acceptance, which ne
 
 ## Repository and Git state
 
-- Repository: `C:\Users\kouda\Documents\Codex\2026-08-26\new-chat\work\ComfyUI-Manga-Autopilot`
+- Repository: `C:\Claude Code\comfyui-manga-autopilot` (relocated from the Codex sandbox on 2026-08-27; the `.venv` works at the new path)
 - Branch: `codex/anima-mvp`
 - Base: `c88a542` (`origin/main` at clone time)
 - Python environment: `.venv`
@@ -348,12 +348,47 @@ generations, and it belongs with the quality iteration below.
 
 Suite: `1038 passed, 15 skipped`, `ruff check .` clean, `git diff --check` clean.
 
+## Route-level integration (2026-08-27)
+
+The earlier E2E drove the `Orchestrator` directly, which left the HTTP path
+untested: coordinator publication, the early-artwork cadence in the route hook,
+and an approval travelling from a REST call back into a running pipeline. Two
+tests now cover it with a fake LLM and a fake executor, no GPU:
+
+- `test_the_route_path_pauses_at_every_gate_and_resumes_over_rest` walks a
+  two-page project through all four gates over the real endpoints, asserting the
+  executor is untouched before Storyboard approval and that only page 1 renders
+  before the early artwork review.
+- `test_a_rejection_over_rest_stops_the_route_run` proves a rejected story never
+  reaches the executor.
+
+Writing them exposed a real defect, now fixed (`377e321`):
+
+**Characters were never created by the autopilot.** `define_characters` passed a
+`CharacterSpec` (the planner's free-text output) straight to
+`CharacterService.create()`, which takes a `Character`. The AttributeError was
+caught by a bare `except` and logged as a warning, so a strict run carried on
+with an empty character list and failed several steps later with the misleading
+`character 'char_hero' is not defined` from panel planning.
+
+`spec_to_character()` now does the conversion: it reads hair and eye colour out
+of the trait list, keeps every trait verbatim under `distinctive_features`, and
+writes `unspecified` where the planner said nothing rather than inventing a
+value. A strict run re-raises instead of swallowing, so the failure surfaces
+where its cause is visible.
+
+The same run also confirmed Task 1's strict validation works from the route: the
+first attempt failed with `Story Bible is required in strict mode` because the
+fake planner had not supplied one.
+
+Suite: `1045 passed, 15 skipped`, `ruff check .` clean, `git diff --check` clean.
+
 ## What is not done
 
 The plan is complete, the suite is green, and one panel has been rendered for real. Still outstanding, each needing explicit user approval:
 
 1. **Live LM Studio acceptance** with a real planner model. `qwen3.5-9b` (6.55 GB) is **already installed locally** - checked with `lms ls` on 2026-08-27 - so this needs a load, not a download. Loading it is GPU/VRAM work and still needs the user to approve it. The strict path has never been driven by a real planner; the live render above used hand-written semantic segments.
-2. **A full page and a full run.** One panel is proven end to end; a multi-page run through the review gates with real artwork is not.
+2. **A full run with real artwork.** One panel is proven against the real GPU, and a two-page run is proven through the real routes with a fake executor. The two have not been combined: no multi-page run has produced real images.
 3. **Quality iteration** on real output - prompt wording, profile choice, layout catalogue - which is unpredictable in duration. The CFG 1 finding means Turbo prompts have to carry suppression positively, which is a prompt-design task, not a code task.
 
 Also left open deliberately: the route's preflight gate steps aside with a warning when the application has no `manga_comfy_client` or `manga_workflow_registry`. Whether a strict run should hard-fail when it cannot preflight is a product decision, not a bug to fix silently.
