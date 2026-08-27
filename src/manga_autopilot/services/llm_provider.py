@@ -197,7 +197,21 @@ class OpenAICompatibleProvider(LLMProvider):
         choices = data.get("choices") or []
         if not choices:
             return ""
-        return choices[0].get("message", {}).get("content", "")
+        choice = choices[0]
+        message = choice.get("message", {})
+        content = message.get("content") or ""
+        if not content and choice.get("finish_reason") == "length":
+            # A reasoning model spends max_tokens on `reasoning_content` before
+            # it writes any answer. Reporting "could not extract JSON from ''"
+            # here sends the reader looking in entirely the wrong place.
+            reasoning = len(message.get("reasoning_content") or "")
+            raise ValueError(
+                f"the model hit max_tokens ({self.settings.max_tokens}) before "
+                f"producing any content"
+                + (f"; it emitted {reasoning} characters of reasoning first" if reasoning else "")
+                + " - raise llm.max_tokens or use a non-reasoning model"
+            )
+        return content
 
 
 def build_provider(settings: LLMSettings) -> LLMProvider:

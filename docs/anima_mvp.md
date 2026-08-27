@@ -274,6 +274,27 @@ Two guarantees:
   rejected in code, not merely avoided.
 - It never downloads. `lms get` is rejected too; install the model yourself.
 
+**Use `session.api_model` for the request, not the model key.** LM Studio
+addresses a loaded model by its identifier: after
+`lms load qwen3.5-9b --identifier manga-autopilot-planner` the CLI says so
+outright, and `/v1/models` lists both names. An OpenAI-compatible request naming
+`qwen3.5-9b` makes LM Studio JIT-load a *second* copy of the same weights - twice
+the VRAM - and the managed unload then frees only its own instance while the one
+actually serving requests stays resident. Keep `llm.model` equal to
+`lm_studio.identifier`.
+
+### Reasoning models eat the token budget
+
+A reasoning model writes its chain of thought into `reasoning_content` and only
+then fills `content`. If `max_tokens` runs out first, `content` comes back empty
+with `finish_reason: length`. Measured with `qwen3.5-9b` on 2026-08-27: a
+two-page story plan produced 14,021 characters of reasoning and took 297
+seconds; a trivial `{"ok": true}` still cost 978 characters and 24 seconds.
+
+The provider now raises a message naming the token budget and the reasoning
+length instead of the opaque `could not extract JSON from ''`. Budget generously
+- or pick a non-reasoning planner.
+
 ## Running the tests
 
 ```powershell

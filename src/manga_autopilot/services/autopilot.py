@@ -776,6 +776,11 @@ class Orchestrator:
         """Wait for `gate`. Returns whether the pipeline may continue."""
         if self.reviews is None:
             return True
+        if run.machine.state.value.startswith("FAILED"):
+            # The step before this gate failed. Asking for a review of work that
+            # was never produced would strand the run waiting forever.
+            log.info("skipping review gate %s: the run has already failed", gate)
+            return False
         from manga_autopilot.services.review_gate import ReviewRejectedError
 
         def _mark(name: str) -> None:

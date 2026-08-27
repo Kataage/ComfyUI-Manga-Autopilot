@@ -267,3 +267,47 @@ def test_errors_do_not_leak_authorization_values() -> None:
         session.ensure_loaded()
 
     assert "sk-topsecret" not in str(excinfo.value)
+
+
+# --------------------------------------------------- the identifier is the API handle
+#
+# Confirmed against LM Studio on 2026-08-27: after
+#   lms load qwen3.5-9b --identifier manga-autopilot-planner
+# the CLI prints 'To use the model in the API/SDK, use the identifier
+# "manga-autopilot-planner"', and /v1/models lists both names. Requesting the
+# model key instead JIT-loads a second copy of the same weights.
+
+
+def test_api_model_is_the_identifier_not_the_model_key() -> None:
+    cli = FakeCli()
+    session = _session(cli)
+
+    assert session.api_model == "manga-autopilot-planner"
+
+    session.ensure_loaded()
+    assert session.api_model == session.instance_id
+    assert session.api_model != session.model_key
+
+
+def test_api_model_follows_an_adopted_instance() -> None:
+    existing = {
+        "type": "llm",
+        "modelKey": PLANNER_MODEL,
+        "identifier": "someone-elses-qwen",
+        "status": "idle",
+    }
+    session = _session(FakeCli(loaded=[USER_OWNED, existing]))
+
+    session.ensure_loaded()
+
+    assert session.api_model == "someone-elses-qwen"
+
+
+def test_cli_output_is_decoded_as_utf8() -> None:
+    """The CLI writes UTF-8; the Windows ANSI code page would raise here."""
+    import inspect
+
+    from manga_autopilot.services.lm_studio_lifecycle import run_lms_cli
+
+    source = inspect.getsource(run_lms_cli)
+    assert 'encoding="utf-8"' in source

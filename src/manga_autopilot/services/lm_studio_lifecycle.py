@@ -13,6 +13,14 @@ is running themselves, so this session follows two rules:
 The command surface was read off the installed LM Studio CLI on 2026-08-26:
 ``lms load <model-key> [--identifier X] [--ttl N] [--context-length N] [--gpu R] -y``,
 ``lms unload <identifier>``, and ``lms ps --json``.
+
+One trap, confirmed on 2026-08-27: **the identifier is the API handle.** After
+``lms load qwen3.5-9b --identifier manga-autopilot-planner`` the CLI says so
+outright, and ``/v1/models`` lists the identifier. An OpenAI-compatible request
+naming the *model key* instead makes LM Studio JIT-load a second copy of the
+same weights - twice the VRAM - and :meth:`ManagedLMStudioSession.unload` then
+frees only the instance it created while the one actually being used stays
+resident. Use :attr:`ManagedLMStudioSession.api_model` for the request.
 """
 
 from __future__ import annotations
@@ -69,6 +77,11 @@ def run_lms_cli(argv: Sequence[str], *, executable: str = "lms", timeout: int = 
             command,
             capture_output=True,
             text=True,
+            # The CLI writes UTF-8. Without this, Python decodes with the
+            # Windows ANSI code page and a non-ASCII model name or progress
+            # glyph raises UnicodeDecodeError on a reader thread.
+            encoding="utf-8",
+            errors="replace",
             timeout=timeout,
             check=False,
         )
@@ -98,6 +111,15 @@ class ManagedLMStudioSession:
 
     instance_id: str = field(default="", init=False)
     owns_instance: bool = field(default=False, init=False)
+
+    @property
+    def api_model(self) -> str:
+        """The name an OpenAI-compatible request must use to reach this instance.
+
+        LM Studio addresses a loaded model by its identifier. Naming the model
+        key instead loads a second copy.
+        """
+        return self.instance_id or self.identifier
 
     # ------------------------------------------------------------- inspect
     def list_loaded(self) -> list[LoadedModel]:
