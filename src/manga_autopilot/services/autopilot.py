@@ -129,6 +129,8 @@ class AutopilotState(str, Enum):
 
     FAILED_INPUT_VALIDATION = "FAILED_INPUT_VALIDATION"
     FAILED_STORY_PLANNING = "FAILED_STORY_PLANNING"
+    FAILED_PAGE_PLANNING = "FAILED_PAGE_PLANNING"
+    FAILED_PANEL_PLANNING = "FAILED_PANEL_PLANNING"
     FAILED_CHARACTER_SHEET = "FAILED_CHARACTER_SHEET"
     FAILED_WORKFLOW_VALIDATION = "FAILED_WORKFLOW_VALIDATION"
     FAILED_PANEL_GENERATION = "FAILED_PANEL_GENERATION"
@@ -162,6 +164,8 @@ _FORWARD: dict[AutopilotState, AutopilotState] = {
 _FAILED_STATES: set[AutopilotState] = {
     AutopilotState.FAILED_INPUT_VALIDATION,
     AutopilotState.FAILED_STORY_PLANNING,
+    AutopilotState.FAILED_PAGE_PLANNING,
+    AutopilotState.FAILED_PANEL_PLANNING,
     AutopilotState.FAILED_CHARACTER_SHEET,
     AutopilotState.FAILED_WORKFLOW_VALIDATION,
     AutopilotState.FAILED_PANEL_GENERATION,
@@ -303,6 +307,14 @@ _RECOVERY_TABLE: dict[AutopilotState, RecoveryStrategy] = {
     ),
     AutopilotState.FAILED_STORY_PLANNING: RecoveryStrategy(
         failure=AutopilotState.FAILED_STORY_PLANNING,
+        actions=[RecoveryAction.REPAIR_JSON, RecoveryAction.SIMPLIFY_PROMPT],
+    ),
+    AutopilotState.FAILED_PAGE_PLANNING: RecoveryStrategy(
+        failure=AutopilotState.FAILED_PAGE_PLANNING,
+        actions=[RecoveryAction.REPAIR_JSON, RecoveryAction.SIMPLIFY_PROMPT],
+    ),
+    AutopilotState.FAILED_PANEL_PLANNING: RecoveryStrategy(
+        failure=AutopilotState.FAILED_PANEL_PLANNING,
         actions=[RecoveryAction.REPAIR_JSON, RecoveryAction.SIMPLIFY_PROMPT],
     ),
     AutopilotState.FAILED_CHARACTER_SHEET: RecoveryStrategy(
@@ -853,6 +865,11 @@ class Orchestrator:
     ) -> None:
         failure_map = {
             AutopilotState.STORY_PLANNED: AutopilotState.FAILED_STORY_PLANNING,
+            # Without these two a failure in page or panel planning left the
+            # state machine untouched, so the pipeline walked on and produced
+            # nothing while still asking for artwork review.
+            AutopilotState.PAGES_PLANNED: AutopilotState.FAILED_PAGE_PLANNING,
+            AutopilotState.PANELS_PLANNED: AutopilotState.FAILED_PANEL_PLANNING,
             AutopilotState.CHARACTERS_DEFINED: AutopilotState.FAILED_CHARACTER_SHEET,
             AutopilotState.WORKFLOWS_BUILT: AutopilotState.FAILED_WORKFLOW_VALIDATION,
             AutopilotState.PANELS_GENERATING: AutopilotState.FAILED_PANEL_GENERATION,

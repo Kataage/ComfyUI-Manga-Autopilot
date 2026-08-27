@@ -246,12 +246,18 @@ def _make_plan_story(
 
     async def _hook(run: AutopilotRun) -> dict[str, Any] | None:
         try:
+            from manga_autopilot.services.page_templates import layout_catalog
+
+            strict = _is_anima_run(run)
             planner = StoryPlanner(
                 provider=_llm_provider(app),
                 page_count=int(run.input.get("page_count") or 1),
                 language=str(run.input.get("language") or "ja"),
                 genre=str(run.input.get("genre") or "fantasy"),
-                strict=_is_anima_run(run),
+                strict=strict,
+                # Strict planning rejects an unregistered layout id, so the
+                # planner has to be told the vocabulary rather than guess it.
+                layouts=layout_catalog("page") if strict else [],
             )
             plan = await planner.plan(str(run.input.get("idea") or ""))
             (project_root / "story.json").write_text(
@@ -431,6 +437,10 @@ def _make_plan_panels(
                 except Exception:
                     continue
         if not pages:
+            if strict:
+                raise ValueError(
+                    "no page plans are available; page planning produced nothing"
+                )
             return [r.model_dump(mode="json") for r in existing.values()]
 
         story_payload = run.artefacts.get("plan_story")

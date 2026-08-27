@@ -94,9 +94,18 @@ PROMPT_TEMPLATE = """あなたは漫画原作者です。
 - セリフは短くする
 - 各ページの目的が重複しないようにする
 - 最終ページには読後感または次への引きを入れる
-
+{layout_rules}
 企画:
 {idea}
+"""
+
+#: Appended when the caller knows which layouts exist. Without it the planner
+#: has no way to know the vocabulary and invents ids like "standard_linear",
+#: which strict validation then rejects - correctly, but only after a full
+#: planning round trip has been paid for.
+LAYOUT_RULES_TEMPLATE = """- layoutId は次の登録済みレイアウトからのみ選ぶ。panelCount は選んだレイアウトのコマ数と一致させる:
+{layout_lines}
+- 上のどれとも合わない場合は layoutId を省略する（自動で等分割グリッドが割り当てられる）
 """
 
 
@@ -108,6 +117,8 @@ class StoryPlanner:
     genre: str = "fantasy"
     max_repair_attempts: int = 1
     strict: bool = False
+    layouts: list[dict[str, Any]] = field(default_factory=list)
+    """Registered page layouts, as ``{"layout_id": ..., "panel_count": ...}``."""
     system_prompt: str = (
         "You are a meticulous manga story planner. Always respond with strict JSON only."
     )
@@ -119,8 +130,23 @@ class StoryPlanner:
             page_count=self.page_count,
             language=self.language,
             genre=self.genre,
+            layout_rules=self._layout_rules(),
             idea=idea,
         )
+
+    def _layout_rules(self) -> str:
+        """Describe the registered layouts, so the planner picks from them.
+
+        Strict planning rejects an unregistered ``layoutId``. Telling the model
+        the vocabulary up front is cheaper than discovering it through a failed
+        validation, and much cheaper than a run that plans nothing.
+        """
+        if not self.layouts:
+            return ""
+        lines = chr(10).join(
+            f"  - {item['layout_id']} ({item['panel_count']}コマ)" for item in self.layouts
+        )
+        return LAYOUT_RULES_TEMPLATE.format(layout_lines=lines)
 
     async def plan(self, idea: str) -> StoryPlan:
         prompt = self.build_prompt(idea)
