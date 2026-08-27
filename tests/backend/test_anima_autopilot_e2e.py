@@ -37,9 +37,12 @@ from manga_autopilot.services.generation_job import (
     PanelExecutionRequest,
     run_panels_sequentially,
 )
+from manga_autopilot.services.llm_provider import LLMProvider, LLMSettings
 from manga_autopilot.services.prompt_builder import PromptSpec
 from manga_autopilot.services.review_gate import (
+    ARTWORK_EARLY,
     ARTWORK_FINAL,
+    REVIEW_GATES,
     STORY,
     STORYBOARD,
     ReviewCoordinator,
@@ -418,3 +421,234 @@ async def test_reviews_for_an_unknown_project_is_a_404(client) -> None:
     response = await client.get("/manga_autopilot/api/projects/ghost/reviews")
 
     assert response.status == 404
+
+
+# ------------------------------------------------- the route path, end to end
+#
+# The tests above drive the Orchestrator directly. These drive the real HTTP
+# routes, which is where the coordinator is published, where the early-artwork
+# cadence lives, and where an approval has to travel from a REST call back into
+# a running pipeline. A fake LLM and a fake executor stand in; no GPU is used.
+
+
+class _RouteFakeLLM(LLMProvider):
+    """Enough JSON to satisfy the strict planners for a 2-page, 1-panel story."""
+
+    def __init__(self) -> None:
+        super().__init__(LLMSettings())
+
+    async def complete(self, prompt, *, schema=None, system=None) -> str:
+        required = (schema or {}).get("required", [])
+        pages = [
+            {
+                "pageNumber": n,
+                "summary": f"Page {n}",
+                "emotionalGoal": "determined",
+                "visualGoal": "wide shot",
+                "panelCount": 1,
+            }
+            for n in (1, 2)
+        ]
+        if "title" in required and "pages" in required:
+            # Strict mode requires a Story Bible; the planner rejects a plan
+            # without one, which is exactly what Task 1 put there.
+            return json.dumps(
+                {
+                    "title": "Route Test",
+                    "logline": "A test story.",
+                    "genre": "fantasy",
+                    "storyBible": {
+                        "title": "Route Test",
+                        "genre": "fantasy",
+                        "tone": "quiet",
+                        "theme": "arrival",
+                        "world": "a wide field at dusk",
+                        "rules": ["the hero never runs"],
+                        "timeline": ["dusk"],
+                        "locations": {"field": "a wide open field"},
+                        "important_objects": {"cloak": "the hero's blue cloak"},
+                        "relationships": ["the hero travels alone"],
+                        "foreshadowing": ["the far treeline"],
+                        "resolved_events": [],
+                        "unresolved_events": ["what waits past the trees"],
+                    },
+                    "pages": pages,
+                }
+            )
+        if "characters" in required:
+            return json.dumps(
+                {
+                    "characters": [
+                        {
+                            "id": "char_hero",
+                            "name": "Hero",
+                            "role": "protagonist",
+                            "visualTraits": ["blue hair"],
+                            "mustKeep": ["blue hair"],
+                            "styleHints": "manga",
+                        }
+                    ]
+                }
+            )
+        if "pages" in required:
+            return json.dumps({"pages": pages})
+        if "panels" in required:
+            return json.dumps(
+                {
+                    "panels": [
+                        {
+                            "panelNumber": 1,
+                            "purpose": "establishing",
+                            "shot": "wide",
+                            "cameraAngle": "low",
+                            "action": "stands tall",
+                            "emotion": "determined",
+                            "characters": ["char_hero"],
+                            "background": "open field",
+                            "visualPriority": "character",
+                            "dialogue": [
+                                {
+                                    "speaker": "Hero",
+                                    "text": "go",
+                                    "type": "speech",
+                                    "characterId": "char_hero",
+                                }
+                            ],
+                        }
+                    ]
+                }
+            )
+        if "positive" in required:
+            return json.dumps(
+                {
+                    "positive": "hero standing tall, wide shot, blue hair",
+                    "negative": "low quality, blurry",
+                    "seed": 12345,
+                    "width": 64,
+                    "height": 64,
+                }
+            )
+        return "{}"
+
+
+async def _wait_for_gate(client, project_id, gate, *, timeout=15.0):
+    """Poll the review board until `gate` is the blocking one."""
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    last = None
+    while loop.time() < deadline:
+        response = await client.get(f"/manga_autopilot/api/projects/{project_id}/reviews")
+        last = await response.json()
+        if last["blocking_gate"] == gate and last["gates"][gate]["status"] == "awaiting_review":
+            return last
+        await asyncio.sleep(0.05)
+    raise AssertionError(f"gate {gate} never blocked; board was {last}")
+
+
+def _panel_statuses(storage_root: Path, project_id: str) -> list[str]:
+    path = storage_root / "projects" / project_id / "panels.json"
+    if not path.exists():
+        return []
+    return [item["status"] for item in json.loads(path.read_text(encoding="utf-8"))]
+
+
+async def _start_strict_run(aiohttp_client, tmp_path: Path, project_id: str):
+    executor = FakeComfy()
+    app = web.Application()
+    register_all(app, storage_root=str(tmp_path))
+    app["manga_llm_provider"] = _RouteFakeLLM()
+    app["manga_panel_executor"] = executor
+    client = await aiohttp_client(app)
+
+    created = await client.post(
+        "/manga_autopilot/api/projects", json={"name": "route e2e", "id": project_id}
+    )
+    assert created.status in (200, 201)
+    patched = await client.patch(
+        f"/manga_autopilot/api/projects/{project_id}",
+        json={"generation_profile_id": "anima_turbo", "license_acknowledged": True},
+    )
+    assert patched.status == 200
+
+    started = await client.post(
+        f"/manga_autopilot/api/projects/{project_id}/autopilot/start",
+        json={
+            "idea": "a hero crosses a field",
+            "generation_profile_id": "anima_turbo",
+            "page_count": 2,
+            "threshold": 0.0,
+            "candidate_count": 1,
+        },
+    )
+    assert started.status == 202
+    return client, executor
+
+
+async def test_the_route_path_pauses_at_every_gate_and_resumes_over_rest(
+    aiohttp_client, tmp_path: Path
+) -> None:
+    client, executor = await _start_strict_run(aiohttp_client, tmp_path, "proj-route")
+
+    # 1. Story: planning ran, nothing else did.
+    await _wait_for_gate(client, "proj-route", STORY)
+    assert executor.calls == []
+
+    approved = await client.post(
+        "/manga_autopilot/api/projects/proj-route/reviews/story/approve",
+        json={"note": "reads fine"},
+    )
+    assert approved.status == 200
+
+    # 2. Storyboard: still nothing has reached the executor.
+    await _wait_for_gate(client, "proj-route", STORYBOARD)
+    assert executor.calls == [], "no image may be queued before Storyboard approval"
+
+    await client.post("/manga_autopilot/api/projects/proj-route/reviews/storyboard/approve")
+
+    # 3. Early artwork: page 1 rendered, page 2 has not.
+    await _wait_for_gate(client, "proj-route", ARTWORK_EARLY)
+    pages_rendered = {call.page_id for call in executor.calls}
+    assert pages_rendered == {"page_0001"}, (
+        f"only page 1 should render before the early review, got {pages_rendered}"
+    )
+    assert _panel_statuses(tmp_path, "proj-route")[0] == "generated"
+
+    await client.post("/manga_autopilot/api/projects/proj-route/reviews/artwork_early/approve")
+
+    # 4. Final artwork: the remaining page rendered too.
+    await _wait_for_gate(client, "proj-route", ARTWORK_FINAL)
+    assert {call.page_id for call in executor.calls} == {"page_0001", "page_0002"}
+
+    await client.post("/manga_autopilot/api/projects/proj-route/reviews/artwork_final/approve")
+
+    # 5. The board clears and nothing blocks any more.
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + 15.0
+    board = None
+    while loop.time() < deadline:
+        response = await client.get("/manga_autopilot/api/projects/proj-route/reviews")
+        board = await response.json()
+        if board["blocking_gate"] is None:
+            break
+        await asyncio.sleep(0.05)
+    assert board["blocking_gate"] is None
+    assert [board["gates"][g]["status"] for g in REVIEW_GATES] == ["approved"] * 4
+
+
+async def test_a_rejection_over_rest_stops_the_route_run(
+    aiohttp_client, tmp_path: Path
+) -> None:
+    client, executor = await _start_strict_run(aiohttp_client, tmp_path, "proj-reject")
+
+    await _wait_for_gate(client, "proj-reject", STORY)
+    rejected = await client.post(
+        "/manga_autopilot/api/projects/proj-reject/reviews/story/reject",
+        json={"note": "the ending does not follow"},
+    )
+
+    assert rejected.status == 200
+    body = await rejected.json()
+    assert body["gates"][STORY]["status"] == "rejected"
+
+    await asyncio.sleep(0.3)
+    assert executor.calls == [], "a rejected story must never reach the executor"

@@ -94,3 +94,78 @@ def test_character_spec_defaults() -> None:
     spec = CharacterSpec(id="x", name="X", role="supporting")
     assert spec.visual_traits == []
     assert spec.age == ""
+
+
+# ------------------------------------------------- planner spec -> character
+#
+# The autopilot's define_characters hook used to hand a CharacterSpec straight
+# to CharacterService.create(), which wants a Character. The AttributeError was
+# swallowed into a warning, so a strict run silently ended up with no characters
+# and failed much later with "character 'char_hero' is not defined".
+
+
+def test_spec_to_character_reads_colours_out_of_the_traits() -> None:
+    from manga_autopilot.services.character_planner import CharacterSpec, spec_to_character
+
+    character = spec_to_character(
+        CharacterSpec(
+            id="char_hero",
+            name="Hero",
+            role="protagonist",
+            visual_traits=["blue hair", "green eyes", "red scarf"],
+        )
+    )
+
+    assert character.id == "char_hero"
+    assert character.role == "protagonist"
+    assert character.appearance.hair_color == "blue"
+    assert character.appearance.eye_color == "green"
+
+
+def test_spec_to_character_keeps_every_trait_verbatim() -> None:
+    from manga_autopilot.services.character_planner import CharacterSpec, spec_to_character
+
+    traits = ["blue hair", "green eyes", "red scarf", "left-handed"]
+    character = spec_to_character(
+        CharacterSpec(id="c", name="C", role="support", visual_traits=traits)
+    )
+
+    assert character.appearance.distinctive_features == traits
+    assert character.consistency_prompt == ", ".join(traits)
+
+
+def test_spec_to_character_says_unspecified_rather_than_inventing() -> None:
+    from manga_autopilot.services.character_planner import (
+        UNSPECIFIED,
+        CharacterSpec,
+        spec_to_character,
+    )
+
+    character = spec_to_character(CharacterSpec(id="c", name="C", role="support"))
+
+    assert character.appearance.hair_color == UNSPECIFIED
+    assert character.appearance.eye_color == UNSPECIFIED
+    assert character.appearance.distinctive_features == []
+
+
+def test_an_unknown_role_falls_back_to_support() -> None:
+    from manga_autopilot.services.character_planner import CharacterSpec, spec_to_character
+
+    assert spec_to_character(CharacterSpec(id="c", name="C", role="sidekick")).role == "support"
+    assert spec_to_character(CharacterSpec(id="c", name="C", role="VILLAIN")).role == "villain"
+
+
+def test_spec_to_character_produces_a_persistable_record(tmp_path) -> None:
+    """The whole point: CharacterService.create() must accept the result."""
+    from manga_autopilot.services.character_planner import CharacterSpec, spec_to_character
+    from manga_autopilot.services.character_service import CharacterService
+
+    service = CharacterService(project_root=tmp_path)
+    character = spec_to_character(
+        CharacterSpec(id="char_hero", name="Hero", role="protagonist", visual_traits=["blue hair"])
+    )
+
+    created = service.create(character)
+
+    assert created.id == "char_hero"
+    assert [c.id for c in service.list()] == ["char_hero"]

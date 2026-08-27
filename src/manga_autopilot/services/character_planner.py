@@ -4,12 +4,17 @@ from __future__ import annotations
 
 import json
 import logging
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
 from pydantic import BaseModel, Field
 
+from manga_autopilot.models.character import (
+    Character,
+    CharacterAppearance,
+    ColorPalette,
+)
 from manga_autopilot.services.json_schema_validator import validate_llm_output
 from manga_autopilot.services.llm_provider import LLMProvider
 
@@ -109,11 +114,74 @@ class CharacterPlanner:
         return CharacterList.model_validate(data)
 
 
+#: Roles the persisted :class:`Character` model accepts.
+_KNOWN_ROLES = {"protagonist", "heroine", "villain", "support", "mob"}
+
+#: What a trait has to say for us to read a colour out of it.
+_HAIR_MARKERS = ("hair",)
+_EYE_MARKERS = ("eye", "eyes")
+
+#: Used when the planner did not describe a required appearance field. Saying
+#: "unspecified" is honest; inventing "black hair" would put a fact into the
+#: character card that nobody chose.
+UNSPECIFIED = "unspecified"
+
+
+def _trait_value(traits: Sequence[str], markers: Sequence[str]) -> str:
+    """Return the first trait mentioning any marker, with the marker removed.
+
+    ``["blue hair"]`` yields ``"blue"``. A trait that is only the marker itself
+    (``"hair"``) carries no information and is skipped.
+    """
+    for trait in traits:
+        lowered = trait.lower()
+        for marker in markers:
+            if marker not in lowered.split() and marker not in lowered:
+                continue
+            words = [word for word in trait.split() if word.lower() not in markers]
+            if words:
+                return " ".join(words)
+    return ""
+
+
+def spec_to_character(spec: CharacterSpec) -> Character:
+    """Convert a planner :class:`CharacterSpec` into a persistable ``Character``.
+
+    The planner produces free text and a trait list; the persisted card needs a
+    structured appearance. Hair and eye colour are read out of the traits when
+    they say so, and every trait is kept verbatim under
+    ``appearance.distinctive_features`` so nothing the planner said is lost.
+
+    An unrecognised role falls back to ``support`` rather than failing: the role
+    vocabulary is ours, not the planner's.
+    """
+    traits = list(spec.visual_traits)
+    role = spec.role.strip().lower()
+    return Character(
+        id=spec.id,
+        name=spec.name,
+        role=role if role in _KNOWN_ROLES else "support",
+        description=spec.appearance,
+        personality=spec.personality,
+        age_appearance=spec.age[:64],
+        appearance=CharacterAppearance(
+            hair_color=_trait_value(traits, _HAIR_MARKERS) or UNSPECIFIED,
+            hair_style=_trait_value(traits, _HAIR_MARKERS) or UNSPECIFIED,
+            eye_color=_trait_value(traits, _EYE_MARKERS) or UNSPECIFIED,
+            distinctive_features=traits[:32],
+        ),
+        color_palette=ColorPalette(primary="#000000"),
+        consistency_prompt=", ".join(traits)[:1024],
+    )
+
+
 __all__ = [
+    "UNSPECIFIED",
     "CharacterPlanner",
     "CharacterSpec",
     "CharacterList",
     "CHARACTER_LIST_SCHEMA",
     "CHARACTER_SCHEMA",
     "PROMPT_TEMPLATE",
+    "spec_to_character",
 ]

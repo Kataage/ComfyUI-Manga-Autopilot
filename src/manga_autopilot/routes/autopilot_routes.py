@@ -282,7 +282,10 @@ def _make_define_characters(
     project_id: str,
     storage_root: Path,
 ) -> Callable[[AutopilotRun], Any]:
-    from manga_autopilot.services.character_planner import CharacterPlanner
+    from manga_autopilot.services.character_planner import (
+        CharacterPlanner,
+        spec_to_character,
+    )
     from manga_autopilot.services.character_service import CharacterService
 
     character_service = CharacterService.for_project(storage_root, project_id)
@@ -299,8 +302,15 @@ def _make_define_characters(
                     plan_input if isinstance(plan_input, (dict, str)) else {},
                 )
                 for ch in characters.characters:
-                    character_service.create(ch)
+                    # The planner emits a CharacterSpec (free text plus traits);
+                    # the persisted card needs a structured Character.
+                    character_service.create(spec_to_character(ch))
             except Exception as exc:  # noqa: BLE001
+                if _is_anima_run(run):
+                    # A strict run without characters fails later anyway, with a
+                    # confusing "character is not defined" from panel planning.
+                    # Fail here, where the cause is still visible.
+                    raise
                 log.warning("define_characters failed: %s", exc)
         ids = [c.id for c in character_service.list()]
         if project_root.joinpath("characters.json").exists():
