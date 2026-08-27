@@ -27,12 +27,14 @@ Anima 系モデルで生成する。
 
 ## 現在の状態（2026-08-27）
 
-- ブランチ `codex/anima-mvp`（111コミット、fd269e8）。**`origin/main` (c88a542) より15コミット先行しており未push**。
+- ブランチ `codex/anima-mvp`。**`origin/main` (c88a542) より先行しており未push**（回収時点で Codex の Anima MVP 作業14コミット、そこへ本 AGENTS.md の1件を追加）。
   このリポジトリは 2026-08-27 に `C:\Users\kouda\Documents\Codex\2026-08-26\new-chat\work\` から
   ここへ回収された。回収時点のバンドルは `_scratch/2026-08-27-rescue/manga-autopilot.bundle`。
-- `origin` の URL が回収元のローカルパスを指したままになっている可能性がある。
-  push する前に `git remote -v` が `https://github.com/Kataage/ComfyUI-Manga-Autopilot.git`
-  を指していることを確認すること。
+- `origin` は clone 直後は回収元のローカルパスを指していたが、2026-08-27 に
+  `https://github.com/Kataage/ComfyUI-Manga-Autopilot.git` へ付け替え済み
+  （`git ls-remote origin HEAD` → `c88a542` で到達確認）。
+- ローカルミラー `H:\backup\git-mirrors\comfyui-manga-autopilot.git` にも複製がある。
+  回収時点のバンドルは `C:\Claude Code\_scratch\2026-08-27-rescue\manga-autopilot.bundle`。
 
 ## 絶対に壊さないもの
 
@@ -65,6 +67,6 @@ py -3 -m venv .venv
 
 ## やってはいけないこと
 
-- 未push の15コミットを失う操作（`git reset --hard`、ブランチ削除、force push）を確認なく行わない
+- 未push のコミットを失う操作（`git reset --hard`、ブランチ削除、force push）を確認なく行わない。件数は `git rev-list --count origin/main..HEAD` で確認する
 - ライブ ComfyUI の `custom_nodes` / `workflows` を確認なく上書きしない
 - venv を移動しない（Windows の venv は `Scripts\*.exe` に絶対パスが焼き込まれている）
