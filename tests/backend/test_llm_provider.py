@@ -167,3 +167,90 @@ def test_enforce_json_schema_non_dict() -> None:
 def test_enforce_json_schema_unparseable() -> None:
     with pytest.raises(ValueError):
         enforce_json_schema("not json at all", {"type": "object"})
+
+
+# ------------------------------------------------- endpoint and error surfacing
+#
+# Found live on 2026-08-27: configuring the endpoint as ".../v1" produced
+# ".../v1/v1/chat/completions", and LM Studio answers an unknown path with
+# HTTP 200 and an {"error": ...} body. raise_for_status() saw nothing wrong and
+# the provider returned "", which surfaced several layers up as the useless
+# "could not extract JSON from LLM response: ''".
+
+
+def test_chat_completions_url_tolerates_a_v1_suffix() -> None:
+    from manga_autopilot.services.llm_provider import chat_completions_url
+
+    expected = "http://127.0.0.1:1234/v1/chat/completions"
+    for endpoint in (
+        "http://127.0.0.1:1234",
+        "http://127.0.0.1:1234/",
+        "http://127.0.0.1:1234/v1",
+        "http://127.0.0.1:1234/v1/",
+    ):
+        assert chat_completions_url(endpoint) == expected
+
+
+def test_chat_completions_url_keeps_a_base_path() -> None:
+    from manga_autopilot.services.llm_provider import chat_completions_url
+
+    assert (
+        chat_completions_url("https://gateway.example/llm")
+        == "https://gateway.example/llm/v1/chat/completions"
+    )
+
+
+async def test_a_200_error_body_is_reported_not_swallowed(aiohttp_client) -> None:
+    """An OpenAI-compatible server can answer 200 with an error body."""
+    from aiohttp import web
+
+    from manga_autopilot.services.llm_provider import LLMSettings, OpenAICompatibleProvider
+
+    async def handler(request: web.Request) -> web.Response:
+        return web.json_response({"error": "Unexpected endpoint or method."})
+
+    app = web.Application()
+    app.router.add_post("/v1/chat/completions", handler)
+    client = await aiohttp_client(app)
+    endpoint = f"http://127.0.0.1:{client.port}"
+
+    provider = OpenAICompatibleProvider(
+        LLMSettings(type="openai_compatible", endpoint=endpoint, model="m")
+    )
+
+    with pytest.raises(ValueError, match="no choices"):
+        await provider.complete("hello")
+
+
+async def test_an_empty_reasoning_response_names_the_token_budget(aiohttp_client) -> None:
+    from aiohttp import web
+
+    from manga_autopilot.services.llm_provider import LLMSettings, OpenAICompatibleProvider
+
+    async def handler(request: web.Request) -> web.Response:
+        return web.json_response(
+            {
+                "choices": [
+                    {
+                        "finish_reason": "length",
+                        "message": {"content": "", "reasoning_content": "x" * 900},
+                    }
+                ]
+            }
+        )
+
+    app = web.Application()
+    app.router.add_post("/v1/chat/completions", handler)
+    client = await aiohttp_client(app)
+
+    provider = OpenAICompatibleProvider(
+        LLMSettings(
+            type="openai_compatible",
+            endpoint=f"http://127.0.0.1:{client.port}",
+            model="m",
+            max_tokens=256,
+        )
+    )
+
+    with pytest.raises(ValueError, match="max_tokens"):
+        await provider.complete("hello")

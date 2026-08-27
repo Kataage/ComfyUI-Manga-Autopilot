@@ -30,6 +30,19 @@ log = logging.getLogger(__name__)
 ProviderType = Literal["local", "ollama", "openai_compatible", "manual"]
 
 
+def chat_completions_url(endpoint: str) -> str:
+    """Return the chat-completions URL for `endpoint`.
+
+    Accepts a base URL with or without a trailing ``/v1``. Appending a second
+    one produced ``/v1/v1/chat/completions``, which LM Studio answers with
+    HTTP 200 and an error body rather than a 404.
+    """
+    base = endpoint.rstrip("/")
+    if base.endswith("/v1"):
+        return base + "/chat/completions"
+    return base + "/v1/chat/completions"
+
+
 def json_schema_response_format(
     name: str,
     schema: Mapping[str, Any],
@@ -171,7 +184,7 @@ class OpenAICompatibleProvider(LLMProvider):
     ) -> str:
         if not self.settings.endpoint:
             raise RuntimeError("OpenAICompatibleProvider requires an endpoint")
-        url = self.settings.endpoint.rstrip("/") + "/v1/chat/completions"
+        url = chat_completions_url(self.settings.endpoint)
         headers = {"Content-Type": "application/json"}
         if self.settings.api_key:
             headers["Authorization"] = f"Bearer {self.settings.api_key}"
@@ -196,7 +209,11 @@ class OpenAICompatibleProvider(LLMProvider):
                 data = await resp.json()
         choices = data.get("choices") or []
         if not choices:
-            return ""
+            # An OpenAI-compatible server may answer HTTP 200 with an error
+            # body: LM Studio does exactly that for an unknown path, so a
+            # doubled "/v1" used to surface as an empty completion.
+            detail = data.get("error") or data
+            raise ValueError(f"{url} returned no choices: {detail!r}"[:500])
         choice = choices[0]
         message = choice.get("message", {})
         content = message.get("content") or ""
@@ -364,6 +381,7 @@ def _validate_semantics(
 
 
 __all__ = [
+    "chat_completions_url",
     "LLMSettings",
     "LLMProvider",
     "ManualProvider",
