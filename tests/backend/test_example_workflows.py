@@ -155,7 +155,11 @@ async def test_example_registry_comfy_executor_e2e(tmp_path: Path) -> None:
     assert len(client.submitted) == 1
     submitted_graph = client.submitted[0]
     assert submitted_graph["6"]["inputs"]["text"] == "1girl, masterpiece"
-    assert submitted_graph["7"]["inputs"]["text"] == "lowres, bad anatomy"
+    # The negative reaching the sampler is negative_full(): the prompt's own
+    # negatives plus the application's text/watermark bans.
+    negative = submitted_graph["7"]["inputs"]["text"]
+    assert negative.endswith("lowres, bad anatomy")
+    assert "watermark" in negative
     assert submitted_graph["3"]["inputs"]["seed"] == 42
     assert submitted_graph["5"]["inputs"]["width"] == 832
     assert submitted_graph["5"]["inputs"]["height"] == 1216
@@ -293,3 +297,43 @@ def test_anima_example_passes_preflight_against_its_own_node_set(tmp_path: Path)
     )
 
     assert report.errors == ()
+
+
+async def test_executor_sends_the_application_bans_in_the_negative_prompt(
+    tmp_path: Path,
+) -> None:
+    """The text/watermark bans must reach the sampler, not just the snapshot.
+
+    ``PromptSpec.negative_full()`` is the documented "what the sampler sees"
+    accessor and the run snapshot records it, so the executor has to send it.
+    Sending bare ``negative`` dropped the bans and made snapshots disagree with
+    what was actually rendered.
+    """
+    from manga_autopilot.services.prompt_builder import MANGA_NEGATIVE
+
+    registry = WorkflowRegistry.open(tmp_path)
+    registry.register(_anima_payload())
+    client = _FakeComfyClient()
+    executor = ComfyExecutor(client=client, registry=registry, workflow_id="anima_turbo")
+
+    await executor.submit(
+        PanelExecutionRequest(
+            project_id="p1",
+            page_id="page_0001",
+            panel_id="p1_01",
+            candidate_id="p1_01_c00",
+            prompt=PromptSpec(
+                positive="1girl", negative="extra arms", seed=1, width=960, height=1280
+            ),
+            workflow_id="anima_turbo",
+            seed=1,
+            width=960,
+            height=1280,
+        )
+    )
+
+    negative = client.submitted[-1]["6"]["inputs"]["text"]
+    assert "extra arms" in negative
+    assert "watermark" in negative
+    assert "speech text in image" in negative
+    assert "speech text in image" in MANGA_NEGATIVE

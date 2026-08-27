@@ -668,7 +668,11 @@ class ComfyExecutor:
             workflow.bindings,
             {
                 "positive_prompt": request.prompt.positive,
-                "negative_prompt": request.prompt.negative or "",
+                # negative_full() is what the sampler is meant to see: the
+                # application's text/watermark bans plus the prompt's own
+                # negatives. Sending bare `negative` silently dropped the bans
+                # and made run snapshots disagree with what was rendered.
+                "negative_prompt": request.prompt.negative_full(),
                 "seed": request.seed,
                 "width": request.effective_width,
                 "height": request.effective_height,
