@@ -319,11 +319,40 @@ for the two higher-CFG profiles. Both fixes are still correct.
 Suite after both fixes: `1032 passed, 15 skipped`, `ruff check .` clean,
 `git diff --check` clean.
 
+## Prompt safety follow-up (2026-08-27)
+
+The CFG 1 finding raised the obvious next question: if the negative prompt is
+inert for Turbo, how does a strict run suppress anything? The answer is not a
+profile-level "positive suppression" list, and that matters enough to record.
+
+A diffusion model renders the noun regardless of the grammar around it. Anima was
+observed rendering a bikini in all 28 scenes of a run whose text read "the bikini
+has been fully removed"; deleting the word outright was the only fix. So moving
+bans into the positive prompt as "no text, no watermark" would make things worse,
+not better - it is a second, separate failure from the CFG 1 one, and it happens
+at any CFG.
+
+What was implemented instead (`7556e87`): `AnimaPromptBuilder` lints the rendered
+positive prompt and warns, naming each negation. `AnimaPromptBuilder(
+reject_negations=True)` raises instead. `find_negations(text)` is public.
+
+Checked against the recorded reproduction: the failing phrasing is flagged, its
+documented fix passes clean, the shipped example workflow's prompt passes clean,
+and ordinary vocabulary (`snow`, `notebook`, `nostalgic`) is not flagged.
+
+What was deliberately NOT implemented: a `positive_suppression` field on the
+profile. There is no scene-independent affirmative phrasing that reliably
+suppresses text or watermarks, and inventing one without experimental evidence
+would be guessing. Finding such phrasings is prompt-design work that needs real
+generations, and it belongs with the quality iteration below.
+
+Suite: `1038 passed, 15 skipped`, `ruff check .` clean, `git diff --check` clean.
+
 ## What is not done
 
 The plan is complete, the suite is green, and one panel has been rendered for real. Still outstanding, each needing explicit user approval:
 
-1. **Live LM Studio acceptance** with a real planner model (the plan names Qwen3.5-9B). Nothing has been downloaded or loaded. The strict path has never been driven by a real planner; the live render above used hand-written semantic segments.
+1. **Live LM Studio acceptance** with a real planner model. `qwen3.5-9b` (6.55 GB) is **already installed locally** - checked with `lms ls` on 2026-08-27 - so this needs a load, not a download. Loading it is GPU/VRAM work and still needs the user to approve it. The strict path has never been driven by a real planner; the live render above used hand-written semantic segments.
 2. **A full page and a full run.** One panel is proven end to end; a multi-page run through the review gates with real artwork is not.
 3. **Quality iteration** on real output - prompt wording, profile choice, layout catalogue - which is unpredictable in duration. The CFG 1 finding means Turbo prompts have to carry suppression positively, which is a prompt-design task, not a code task.
 
