@@ -37,6 +37,7 @@ from manga_autopilot.services.generation_job import (
     PanelExecutionRequest,
     run_panels_sequentially,
 )
+from manga_autopilot.services.generation_profiles import load_builtin_profile
 from manga_autopilot.services.llm_provider import LLMProvider, LLMSettings
 from manga_autopilot.services.prompt_builder import PromptSpec
 from manga_autopilot.services.review_gate import (
@@ -618,6 +619,22 @@ async def test_the_route_path_pauses_at_every_gate_and_resumes_over_rest(
     # 4. Final artwork: the remaining page rendered too.
     await _wait_for_gate(client, "proj-route", ARTWORK_FINAL)
     assert {call.page_id for call in executor.calls} == {"page_0001", "page_0002"}
+
+    # The profile owns every technical field, and the prompt was rendered
+    # deterministically rather than asked for. A strict run that quietly fell
+    # back to the LLM-driven PromptBuilder would fail here.
+    profile = load_builtin_profile("anima_turbo")
+    for call in executor.calls:
+        assert call.prompt.steps == profile.generation.steps
+        assert call.prompt.cfg == profile.generation.cfg
+        assert call.prompt.sampler == profile.generation.sampler
+        assert call.prompt.scheduler == profile.generation.scheduler
+        assert (call.prompt.width, call.prompt.height) == (960, 1280)
+        assert call.prompt.positive.startswith("masterpiece, best quality")
+    # Seeds are stable per panel, so regenerating reproduces the same image.
+    seeds = {call.panel_id: call.prompt.seed for call in executor.calls}
+    assert all(seed > 0 for seed in seeds.values())
+    assert len(set(seeds.values())) == len(seeds), "each panel gets its own seed"
 
     await client.post("/manga_autopilot/api/projects/proj-route/reviews/artwork_final/approve")
 

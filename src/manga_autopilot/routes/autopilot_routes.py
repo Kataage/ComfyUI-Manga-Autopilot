@@ -594,14 +594,47 @@ def _make_generate_panels(
             # A strict run persists each panel before submitting the next, so an
             # interruption resumes instead of re-rendering, and it never
             # substitutes a fabricated prompt for one the planner could not build.
+            #
+            # Prompts are rendered deterministically from the panel plan and the
+            # profile - no LLM call, and no technical field the profile does not
+            # own. That is the whole point of the Anima profiles.
+            from manga_autopilot.services.anima_prompt_builder import (
+                AnimaPromptBuilder,
+                panel_aspect,
+                segments_from_panel_plan,
+                stable_panel_seed,
+            )
+            from manga_autopilot.services.character_service import CharacterService
             from manga_autopilot.services.review_gate import run_with_early_artwork_review
+
+            profile = _anima_profile(run)
+            if profile is None:
+                raise RuntimeError(
+                    f"strict run {run.run_id} has no resolvable generation profile"
+                )
+            anima_builder = AnimaPromptBuilder()
+            characters = {c.id: c for c in CharacterService.for_project(storage_root, project_id).list()}
+            base_seed = run.input.get("seed")
+
+            def _anima_prompt(record: PanelRecord) -> PromptSpec:
+                seed = (
+                    int(base_seed)
+                    if base_seed is not None
+                    else stable_panel_seed(project_id, record.panel_id)
+                )
+                return anima_builder.render(
+                    segments_from_panel_plan(record.plan, characters),
+                    profile,
+                    seed=seed,
+                    panel_size=panel_aspect(record, profile),
+                )
 
             async def _generate(batch: list[PanelRecord]) -> list[Any]:
                 return await run_panels_sequentially(
                     records=batch,
                     loop=loop,
                     executor=executor,
-                    prompt_for=lambda record: builder.build(record.plan),
+                    prompt_for=_anima_prompt,
                     workflow_id=str(run.input.get("workflow_id") or workflow_id),
                     project_id=project_id,
                     persist=lambda _batch: _write_panel_records(project_root, records),

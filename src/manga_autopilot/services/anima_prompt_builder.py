@@ -7,16 +7,20 @@ solely from the profile, so a rerun of the same panel is byte-identical.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import re
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
+from typing import Any
 
 from manga_autopilot.models.generation_profile import (
     PROFILE_OWNED_FIELDS,
     GenerationProfile,
     SemanticPromptSegments,
 )
+from manga_autopilot.models.page import PanelPlan
+from manga_autopilot.models.panel import PanelRecord
 from manga_autopilot.services.generation_profiles import (
     resolve_default_resolution,
     resolve_panel_resolution,
@@ -215,9 +219,68 @@ class AnimaPromptBuilder:
             )
 
 
+def stable_panel_seed(project_id: str, panel_id: str) -> int:
+    """Return a seed that depends only on which panel of which project this is.
+
+    Regenerating the same panel therefore reproduces the same image, which is
+    what makes a run snapshot worth keeping. Callers that want a different draw
+    pass their own seed.
+    """
+    digest = hashlib.sha256(f"{project_id}/{panel_id}".encode()).digest()
+    return int.from_bytes(digest[:4], "big") % (2**31 - 1) + 1
+
+
+def segments_from_panel_plan(
+    plan: PanelPlan,
+    characters: Mapping[str, Any] | None = None,
+) -> SemanticPromptSegments:
+    """Turn a planned panel into semantic segments for `AnimaPromptBuilder`.
+
+    Character identity goes into `identity` and `must_keep` so it survives
+    truncation by the text encoder. Nothing technical is read from the plan:
+    steps, CFG, sampler, scheduler, and the dimensions belong to the profile.
+    """
+    records = characters or {}
+    identity: list[str] = []
+    must_keep: list[str] = []
+    for character_id in plan.characters:
+        record = records.get(character_id)
+        if record is None:
+            # An unknown id still names someone; keep it rather than dropping
+            # the only continuity signal the plan gave us.
+            identity.append(character_id)
+            continue
+        if getattr(record, "consistency_prompt", ""):
+            identity.append(record.consistency_prompt)
+        must_keep.extend(record.must_keep_combined())
+
+    camera = [value for value in (plan.shot, plan.camera_angle) if value]
+    return SemanticPromptSegments(
+        identity=identity,
+        must_keep=must_keep,
+        subject=[value for value in (plan.purpose,) if value],
+        action=[plan.action] if plan.action else [],
+        camera=camera,
+        emotion=[plan.emotion] if plan.emotion else [],
+        background=[plan.background] if plan.background else [],
+    )
+
+
+def panel_aspect(record: PanelRecord, profile: GenerationProfile) -> tuple[float, float]:
+    """Return the panel's aspect, falling back to the profile's default."""
+    layout = record.layout
+    if layout is not None and layout.width > 0 and layout.height > 0:
+        return (layout.width, layout.height)
+    policy = profile.resolution
+    return (policy.default_aspect_width, policy.default_aspect_height)
+
+
 __all__ = [
     "NEGATION_PATTERNS",
     "SCORE_TAG_PATTERN",
     "AnimaPromptBuilder",
     "find_negations",
+    "panel_aspect",
+    "segments_from_panel_plan",
+    "stable_panel_seed",
 ]
