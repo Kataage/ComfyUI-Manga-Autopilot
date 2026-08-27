@@ -127,6 +127,30 @@ Verified against `comfy/samplers.py` in ComfyUI 0.30.0 on 2026-08-27, and
 observed in a live one-panel render: background signage text appeared despite
 `text` and `watermark` being in the negative prompt.
 
+### Never negate: delete the noun instead
+
+A diffusion model renders the noun regardless of the grammar around it, so
+negation in the **positive** prompt backfires too. This is a separate failure
+from the CFG 1 one above and happens at any CFG.
+
+Observed on Anima: a scene reading "the bikini has been fully removed" rendered
+a bikini in all 28 scenes. Deleting the word entirely was the only fix.
+
+| Don't write | Write instead |
+|---|---|
+| `no longer wearing the dress` | `her bare shoulders are visible` |
+| `the hat has been removed` | `her hair is uncovered` |
+| `without glasses` | `her bare eyes are visible` |
+| `no signage` | `a plain concrete wall` |
+
+`AnimaPromptBuilder` lints the rendered positive prompt and logs a warning
+naming each negation it finds. `AnimaPromptBuilder(reject_negations=True)`
+raises instead, for callers that would rather fail than render the wrong thing.
+`find_negations(text)` exposes the same check.
+
+Word boundaries keep ordinary vocabulary out of the results, so `snow`,
+`notebook`, and `nostalgic` are not findings.
+
 ## Review gates
 
 | Gate | When | What it protects |

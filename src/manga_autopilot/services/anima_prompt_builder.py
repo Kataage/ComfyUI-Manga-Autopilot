@@ -27,6 +27,44 @@ log = logging.getLogger(__name__)
 
 SCORE_TAG_PATTERN = re.compile(r"^score_\S*$", re.IGNORECASE)
 
+#: Phrasings that try to remove something by naming it.
+#:
+#: Diffusion models render the noun regardless of the grammar around it, and at
+#: CFG 1 there is no negative branch to fall back on either. Observed on Anima:
+#: a scene reading "the bikini has been fully removed" rendered a bikini in all
+#: 28 scenes, and deleting the noun outright was the only thing that fixed it.
+#: The fix is always to describe the wanted state without naming the unwanted
+#: thing - "her bare shoulders are visible", not "no longer wearing the dress".
+NEGATION_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"\bno\s+\w+", re.IGNORECASE),
+    re.compile(r"\bnot\s+\w+", re.IGNORECASE),
+    re.compile(r"\bwithout\s+\w+", re.IGNORECASE),
+    re.compile(r"\bno\s+longer\b", re.IGNORECASE),
+    re.compile(r"\b\w+\s+(?:has|have)\s+been\s+removed\b", re.IGNORECASE),
+    re.compile(r"\bremoved\b", re.IGNORECASE),
+    re.compile(r"\bfree\s+of\s+\w+", re.IGNORECASE),
+    re.compile(r"\babsent\b", re.IGNORECASE),
+    re.compile(r"\blacking\s+\w+", re.IGNORECASE),
+)
+
+
+def find_negations(text: str) -> list[str]:
+    """Return the negation phrasings in `text`, in order, without duplicates.
+
+    Word boundaries keep ordinary vocabulary out of the results: ``snow``,
+    ``notebook``, and ``nostalgic`` are not findings.
+    """
+    found: list[str] = []
+    seen: set[str] = set()
+    for pattern in NEGATION_PATTERNS:
+        for match in pattern.finditer(text):
+            phrase = match.group(0).strip()
+            key = phrase.casefold()
+            if key not in seen:
+                seen.add(key)
+                found.append(phrase)
+    return found
+
 
 def _split_terms(values: Iterable[str]) -> list[str]:
     terms: list[str] = []
@@ -51,6 +89,8 @@ class AnimaPromptBuilder:
     """Render semantic segments into a profile-owned `PromptSpec`."""
 
     separator: str = ", "
+    reject_negations: bool = False
+    """Raise instead of warning when the positive prompt tries to negate something."""
 
     def render(
         self,
@@ -100,13 +140,16 @@ class AnimaPromptBuilder:
             self._normalise([*profile.negative_defaults, *segments.negative], profile)
         )
 
+        positive_text = _join(positive)
+        self._check_negations(positive_text, profile)
+
         if panel_size is None:
             resolution = resolve_default_resolution(profile.resolution)
         else:
             resolution = resolve_panel_resolution(*panel_size, profile.resolution)
 
         return PromptSpec(
-            positive=_join(positive),
+            positive=positive_text,
             negative=_join(negative),
             character_prompt=_join(self._dedupe([*identity, *must_keep])),
             background_prompt=_join(background),
@@ -123,6 +166,25 @@ class AnimaPromptBuilder:
             sampler=profile.generation.sampler,
             scheduler=profile.generation.scheduler,
         )
+
+    def _check_negations(self, positive: str, profile: GenerationProfile) -> None:
+        """Flag phrasing that will render the very thing it tries to remove.
+
+        Raises:
+            ValueError: `reject_negations` is set and the prompt contains one.
+        """
+        found = find_negations(positive)
+        if not found:
+            return
+        detail = ", ".join(repr(item) for item in found)
+        message = (
+            f"positive prompt for profile {profile.id} contains negation phrasing "
+            f"({detail}); the named subject will be rendered anyway - describe the "
+            "wanted state without naming the unwanted thing"
+        )
+        if self.reject_negations:
+            raise ValueError(message)
+        log.warning("%s", message)
 
     def _normalise(self, values: Iterable[str], profile: GenerationProfile) -> list[str]:
         terms = _split_terms(values)
@@ -153,4 +215,9 @@ class AnimaPromptBuilder:
             )
 
 
-__all__ = ["AnimaPromptBuilder", "SCORE_TAG_PATTERN"]
+__all__ = [
+    "NEGATION_PATTERNS",
+    "SCORE_TAG_PATTERN",
+    "AnimaPromptBuilder",
+    "find_negations",
+]

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import pytest
+
 from manga_autopilot.models.generation_profile import SemanticPromptSegments
 from manga_autopilot.services.anima_prompt_builder import AnimaPromptBuilder
 from manga_autopilot.services.generation_profiles import load_builtin_profile
@@ -180,3 +182,66 @@ def test_rendering_is_deterministic_for_the_same_inputs() -> None:
     second = AnimaPromptBuilder().render(segments, profile, seed=11, panel_size=(1, 1))
 
     assert first.model_dump() == second.model_dump()
+
+
+# ---------------------------------------------------------- negation lint
+#
+# Diffusion models render the noun regardless of the grammar around it, and at
+# CFG 1 there is no negative branch to fall back on. Verified on Anima: a scene
+# saying "the bikini has been fully removed" rendered a bikini in all 28 scenes;
+# deleting the noun entirely fixed it.
+
+
+def test_negations_in_the_positive_prompt_are_detected() -> None:
+    from manga_autopilot.services.anima_prompt_builder import find_negations
+
+    found = find_negations("1girl, no text, without glasses, the hat has been removed")
+
+    assert "no text" in found
+    assert any("without" in item for item in found)
+    assert any("removed" in item for item in found)
+
+
+def test_ordinary_words_containing_negations_are_not_flagged() -> None:
+    from manga_autopilot.services.anima_prompt_builder import find_negations
+
+    assert find_negations("snow, notebook, nostalgic, another, cannot-be-a-word") == []
+
+
+def test_a_clean_prompt_has_no_findings() -> None:
+    from manga_autopilot.services.anima_prompt_builder import find_negations
+
+    assert find_negations("1girl, black bob hair, plain wall background") == []
+
+
+def test_render_warns_about_negations_but_still_produces_a_prompt(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    import logging
+
+    profile = load_builtin_profile("anima_turbo")
+    segments = SemanticPromptSegments(subject=["1girl"], background=["no signage"])
+
+    with caplog.at_level(logging.WARNING):
+        result = AnimaPromptBuilder().render(segments, profile, seed=1)
+
+    assert "no signage" in result.positive
+    assert "no signage" in caplog.text
+    assert "negation" in caplog.text.lower()
+
+
+def test_a_builder_can_be_told_to_reject_negations() -> None:
+    profile = load_builtin_profile("anima_turbo")
+    segments = SemanticPromptSegments(subject=["1girl"], background=["without signage"])
+
+    with pytest.raises(ValueError, match="negation"):
+        AnimaPromptBuilder(reject_negations=True).render(segments, profile, seed=1)
+
+
+def test_rejecting_negations_leaves_a_clean_prompt_alone() -> None:
+    profile = load_builtin_profile("anima_turbo")
+    segments = SemanticPromptSegments(subject=["1girl"], background=["plain wall"])
+
+    result = AnimaPromptBuilder(reject_negations=True).render(segments, profile, seed=1)
+
+    assert "plain wall" in result.positive
