@@ -485,12 +485,55 @@ lines are the planner's own.
 
 Suite: `1079 passed, 15 skipped`, `ruff check .` clean, `git diff --check` clean.
 
+## Character drift: the identity never reached the prompt (2026-08-28)
+
+Hair and eye colour changed between panels of the same page. The run snapshot
+settled it in one read: every rendered prompt ran
+
+```
+masterpiece, best quality, score_7, safe, <purpose>, <background>, <camera>, <emotion>, anime, manga
+```
+
+with **no identity and no must_keep terms at all**. Not weak adherence - nothing
+to adhere to.
+
+The character records were detailed and correct ("Messy black hair with a
+slightly damp texture from the rain, Sharp, tired grey eyes...", one per
+character). Every panel's `characters` list was empty, so
+`segments_from_panel_plan` had nothing to look up.
+
+Why it was empty: the panel prompt's rules listed the fields to fill -
+`panelNumber, purpose, shot, action, emotion`, plus optional dialogue and sfx -
+and **never mentioned `characters`**. Semantic validation only rejects *unknown*
+ids, so an empty list passes trivially; the repair loop can even satisfy an
+unknown-character error by deleting the ids.
+
+This is the same shape as the layout defect from the day before: a field
+required downstream that nothing upstream asked for.
+
+Fixed in `f6aaab9`:
+
+- The panel prompt now asks for the ids, drawn from the Active Characters roster
+  that was already being supplied as context.
+- A strict panel that names nobody while characters exist logs a warning saying
+  its appearance is unanchored, instead of rendering a stranger in silence.
+
+The existing unknown-id guard is unchanged and covered by a test, so the fix
+cannot be satisfied by inventing ids either.
+
+**Not yet verified on hardware.** The change is covered by tests, but a live run
+to confirm the identity terms actually appear in rendered prompts has not been
+made: at the time of writing the GPU held a model the user had loaded
+themselves, and this session does not evict a user-owned instance. The check is
+one live run: read `runs/*/snapshot.json` and confirm each panel's `positive`
+begins with the character's appearance before the scene description.
+
 ## What is not done
 
 The plan is complete, the suite is green, and one panel has been rendered for real. Still outstanding, each needing explicit user approval:
 
 1. **Live LM Studio acceptance** with a real planner model. `qwen3.5-9b` (6.55 GB) is **already installed locally** - checked with `lms ls` on 2026-08-27 - so this needs a load, not a download. Loading it is GPU/VRAM work and still needs the user to approve it. The strict path has never been driven by a real planner; the live render above used hand-written semantic segments.
-2. **Character consistency.** Hair and eye colour drift between panels of the same page. The `identity` and `must_keep` segments are built from the character records and do reach the prompt, so this is not obviously a wiring problem - but it has not been investigated, and CFG 1 weakening prompt adherence is one plausible cause among several. This is the last known visible defect in the output.
+2. **Confirm the identity fix on hardware.** `f6aaab9` should put the character appearance at the front of every panel prompt. One live run, then read the snapshot, settles it. Everything else in the output pipeline has been verified end to end.
 3. **Quality iteration** on real output - prompt wording, profile choice, layout catalogue - which is unpredictable in duration. The CFG 1 finding means Turbo prompts have to carry suppression positively, which is a prompt-design task, not a code task.
 
 Also left open deliberately: the route's preflight gate steps aside with a warning when the application has no `manga_comfy_client` or `manga_workflow_registry`. Whether a strict run should hard-fail when it cannot preflight is a product decision, not a bug to fix silently.
