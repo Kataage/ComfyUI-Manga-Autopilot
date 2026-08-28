@@ -546,7 +546,11 @@ The plan is complete, the suite is green, and one panel has been rendered for re
 2. **Nothing known is broken in the output pipeline.** Every defect found by live running has been fixed and confirmed on hardware. What remains is tuning, not repair: planner latency (66.8s to >900s for the same prompt, the dominant cost), how much dialogue the planner writes (three of nine panels), and whether establishing shots should carry any character anchor at all.
 3. **Quality iteration** on real output - prompt wording, profile choice, layout catalogue - which is unpredictable in duration. The CFG 1 finding means Turbo prompts have to carry suppression positively, which is a prompt-design task, not a code task.
 
-4. **The review UI has never run in a browser.** `web/review_editor.js` is covered by Node-executed tests of its pure helpers and by structural contract checks, but `mountReviewEditor` has never been loaded in ComfyUI's actual sidebar. Everything it does with the DOM is unexercised, and so is the Reviews tab wiring in `index.js`.
+4. **The review UI runs, verified in a browser (2026-08-28).** `mountReviewEditor` was driven against a stubbed backend in a real browser: it mounts, lists the gates with their statuses, marks the blocking one, shows that gate's own form fields, posts approve with the typed note, advances as the board changes, and ends on "Every review is approved." with the form and buttons gone. The request log read `GET -> POST {note} -> GET` as intended.
+
+   That run found a defect the structural tests could not: a decided gate put its note in `title`, which becomes the accessible name, so a screen reader heard "premise reads fine" instead of "Story: Approved". Fixed in `284868d` with an `aria-label` carrying both.
+
+   Still not exercised: the module inside ComfyUI's own sidebar. The harness proves the module; it does not prove the extension loads in ComfyUI's frontend bundle.
 
 Also left open deliberately: the route's preflight gate steps aside with a warning when the application has no `manga_comfy_client` or `manga_workflow_registry`. Whether a strict run should hard-fail when it cannot preflight is a product decision, not a bug to fix silently.
 
