@@ -24,7 +24,8 @@ then "What is not done". Nothing else in this file is needed to pick up work.
 
 State as of 2026-08-28:
 
-- 24 commits on `codex/anima-mvp`, **none pushed**. Working tree clean.
+- Every commit on `codex/anima-mvp` is local; **nothing has been pushed**.
+  `git status -sb` gives the current count. Working tree clean.
 - `1094 passed, 15 skipped`; `ruff check .` clean; `git diff --check` clean.
 - No `TODO`/`FIXME` in `src/` or `web/`.
 
@@ -580,8 +581,8 @@ and tuning.
 
 ### Needs a decision
 
-1. **Nothing is pushed.** 24 commits sit on `codex/anima-mvp` locally. Whether
-   they go to the remote, and whether this becomes a PR, is the user's call.
+1. **Nothing is pushed.** The whole branch is local. Whether it goes to the
+   remote, and whether this becomes a PR, is the user's call.
 2. **Preflight that cannot run.** The route's gate steps aside with a warning
    when the application has no `manga_comfy_client` or `manga_workflow_registry`.
    Whether a strict run should hard-fail instead is a product decision, left
