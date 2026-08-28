@@ -383,12 +383,78 @@ fake planner had not supplied one.
 
 Suite: `1045 passed, 15 skipped`, `ruff check .` clean, `git diff --check` clean.
 
+## Full live run, and what it cost to get there (2026-08-27/28)
+
+A two-page project now runs end to end on real hardware: real planner, real GPU,
+real HTTP routes, all four review gates approved over REST.
+
+```
+plan_story    -> 「最後の配達」2 pages
+plan_panels   -> 9 panels (a repair fixed panel order [1,4,3,2,5])
+planner unloaded before generation, VRAM handed back
+page 1        -> 5 panels rendered, early artwork gate blocked
+page 2        -> 4 panels rendered
+COMPLETED, with page PNGs, webtoon slices and a PDF
+```
+
+Two full runs completed: 197.2s and 1597.5s. The difference is the planner, not
+the pipeline - see the timing note below.
+
+### Every defect this exposed
+
+Nine live defects, each committed with a test. Seven were things that were built,
+tested, and never called from `src/`:
+
+| Commit | Defect |
+|---|---|
+| `1ba21d0` | `negative_full()` never reached ComfyUI, so the text/watermark bans were dropped and snapshots disagreed with what rendered |
+| `ef2a5c3` | At CFG 1 ComfyUI skips the negative branch entirely; `anima_turbo`'s negatives are inert |
+| `377e321` | `define_characters` passed a `CharacterSpec` where a `Character` was required; the bare `except` hid it and a strict run silently had no characters |
+| `b3ce2d8` | `AnimaPromptBuilder` was never called from `src/`; the strict route still used the LLM-driven builder, so the profile did not own the technical fields |
+| `8503fbb` | Four at once: `lms` output decoded with the Windows ANSI code page; LM Studio addresses models by identifier so requesting the model key JIT-loads a second copy; the orchestrator waited at a gate after the step had failed; an empty reasoning response was reported as "could not extract JSON from ''" |
+| `86699ab` | `llm.endpoint` ending in `/v1` produced `/v1/v1/...`, which LM Studio answers 200 with an error body, surfacing as an empty completion |
+| `a8c2ac8` | `PAGES_PLANNED` and `PANELS_PLANNED` were missing from the failure map, so a planning failure left the run walking on to ask for review of artwork that was never made. The planner had also never been told which layouts exist, so it invented ids that validation then rejected |
+| `43e2572` | A whole sentence was read as a character's hair or eye colour |
+| `be7af23` | An unreachable ComfyUI reported only `FAILED_PANEL_GENERATION` |
+| `ed58f61` | `RunSnapshotWriter` and `FingerprintCache` were never called from `src/`; a completed run left no `snapshot.json` |
+| `c326104` | Neither provider set a timeout, so aiohttp's 300s default applied; a bare `TimeoutError` stringifies to "" |
+
+The pattern worth remembering: **a component with tests is not a component in
+use.** `grep -rn "<name>" src/` after adding a public entry point is cheap.
+
+### Both new warnings fired on real data
+
+- `prompt.negative_inert_at_cfg1` on every strict Turbo run.
+- The negation lint caught the planner writing `No words` into a panel
+  description - exactly the phrasing that renders the thing it forbids.
+
+### Timing measured on this machine (RTX 5070 Ti)
+
+| Step | Time |
+|---|---|
+| Panel render | ~12s each, 9 panels in ~35s |
+| Planner load / unload | 6-11s |
+| Story plan (gemma-4-12b) | 66.8s, 230.9s, and 651.2s across runs |
+| Story plan (qwen3.5-9b) | 296.7s, with 14,021 characters of reasoning |
+
+Planner latency is the dominant cost and varies by an order of magnitude between
+identical runs. `llm.timeout_sec` defaults to 900 for this reason; the 651.2s run
+would have failed under aiohttp's 300s default.
+
+### The snapshot, verified on disk
+
+`runs/{run_id}/snapshot.json`, 10,388 bytes: the four model SHA-256 fingerprints,
+all nine rendered prompts with seeds and dimensions, the profile and workflow
+hashes, the environment, the LLM settings - and no credentials. Fingerprints
+need `comfyui.install_root`; resolution reads `extra_model_paths.yaml`, because
+a Desktop install keeps nothing under `models/`.
+
 ## What is not done
 
 The plan is complete, the suite is green, and one panel has been rendered for real. Still outstanding, each needing explicit user approval:
 
 1. **Live LM Studio acceptance** with a real planner model. `qwen3.5-9b` (6.55 GB) is **already installed locally** - checked with `lms ls` on 2026-08-27 - so this needs a load, not a download. Loading it is GPU/VRAM work and still needs the user to approve it. The strict path has never been driven by a real planner; the live render above used hand-written semantic segments.
-2. **A full run with real artwork.** One panel is proven against the real GPU, and a two-page run is proven through the real routes with a fake executor. The two have not been combined: no multi-page run has produced real images.
+2. **Quality, not plumbing.** The plumbing is proven end to end. Two things are visibly wrong in the output: speech bubbles render empty (lettering places them but no text lands), and character appearance drifts between panels - hair and eye colour change within a single page. Neither is a wiring problem; both need prompt and lettering work against real output.
 3. **Quality iteration** on real output - prompt wording, profile choice, layout catalogue - which is unpredictable in duration. The CFG 1 finding means Turbo prompts have to carry suppression positively, which is a prompt-design task, not a code task.
 
 Also left open deliberately: the route's preflight gate steps aside with a warning when the application has no `manga_comfy_client` or `manga_workflow_registry`. Whether a strict run should hard-fail when it cannot preflight is a product decision, not a bug to fix silently.
