@@ -1267,6 +1267,15 @@ def _seed_input_from_project(
 
     The request body still wins, so an explicit start payload can override what
     the project holds.
+
+    Deliberately narrow. The restart path also restores ``page_count``,
+    ``candidate_count``, ``max_retries``, ``threshold`` and ``title`` from
+    ``project.json``, so start and restart still disagree about those. Closing
+    that gap here is not a cleanup: the project defaults (``candidate_count``
+    4, ``max_retry_per_panel`` 5, ``quality_threshold`` 0.78) differ from the
+    ones start falls back to (1, 1, 0.5), so seeding them would quadruple the
+    candidates generated for every caller that omits them. That is a cost
+    decision, not a wiring fix.
     """
     from manga_autopilot.services.project_manager import ProjectManager
 

@@ -764,3 +764,68 @@ def test_no_strict_bubble_carries_the_placeholder(tmp_path: Path) -> None:
     bubbles = _run_lettering(tmp_path, profile_id="anima_turbo")
 
     assert all(b.text != PLACEHOLDER_DIALOGUE for b in bubbles)
+
+
+async def test_strict_mode_comes_from_the_project_not_the_start_body(
+    aiohttp_client, tmp_path: Path
+) -> None:
+    """`docs/anima_mvp.md` configures the profile and licence on the project.
+
+    The start body here carries only `page_count`, which the fake planner needs
+    and which start still takes from the body alone. `generation_profile_id`
+    and `license_acknowledged` are deliberately absent: they are set the
+    documented way, with `PATCH /projects/{id}`.
+
+    Before the run input was seeded from the project, this produced the Anima
+    review gates - the review coordinator reads the project - while
+    `_is_anima_run` read `run.input` and returned False. Strict mode stayed off
+    and preflight never ran, so the gates made it look like strict mode was on
+    when it was not.
+    """
+
+    executor = FakeComfy()
+    app = web.Application()
+    register_all(app, storage_root=str(tmp_path))
+    app["manga_llm_provider"] = _RouteFakeLLM()
+    app["manga_panel_executor"] = executor
+    client = await aiohttp_client(app)
+
+    created = await client.post(
+        "/manga_autopilot/api/projects",
+        json={"name": "documented setup", "id": "proj-doc"},
+    )
+    assert created.status in (200, 201)
+
+    patched = await client.patch(
+        "/manga_autopilot/api/projects/proj-doc",
+        json={"generation_profile_id": "anima_turbo", "license_acknowledged": True},
+    )
+    assert patched.status == 200
+
+    started = await client.post(
+        "/manga_autopilot/api/projects/proj-doc/autopilot/start",
+        json={"idea": "a hero crosses a field", "page_count": 2, "threshold": 0.0,
+              "candidate_count": 1},
+    )
+    assert started.status == 202
+
+    # Strict mode is on: the run pauses at Story and queues nothing.
+    await _wait_for_gate(client, "proj-doc", STORY)
+    assert executor.calls == []
+
+    approved = await client.post(
+        "/manga_autopilot/api/projects/proj-doc/reviews/story/approve"
+    )
+    assert approved.status == 200
+
+    # Storyboard is the strict gate that holds image generation back.
+    await _wait_for_gate(client, "proj-doc", STORYBOARD)
+    assert executor.calls == [], "no image may be queued before Storyboard approval"
+
+    await client.post("/manga_autopilot/api/projects/proj-doc/reviews/storyboard/approve")
+
+    # Reaching artwork means preflight passed, which means the licence
+    # acknowledgement set on the project reached it. An unacknowledged licence
+    # fails the run at PANELS_GENERATING instead.
+    await _wait_for_gate(client, "proj-doc", ARTWORK_EARLY)
+    assert executor.calls, "the executor should have run once artwork is under review"

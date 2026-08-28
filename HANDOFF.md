@@ -679,10 +679,27 @@ Both fixes were confirmed to be load-bearing by reverting them: removing the
 seeding call fails that E2E test, and disabling the capability gate fails eight
 preflight tests.
 
-Not covered: nothing asserts the end-to-end path for a start with **no body at
-all**. `_seed_input_from_project` is unit-tested and the E2E covers a body that
-carries the profile, but the documented "configure the project, then start"
-sequence is not exercised as one flow.
+`test_strict_mode_comes_from_the_project_not_the_start_body` pins it: the
+profile and licence are set only by `PATCH`, and the run still enters strict
+mode, pauses at every gate and passes preflight. Removing the seeding call
+fails it.
+
+**The scope stops deliberately, and there is a live consequence.** The restart
+path also restores `page_count`, `candidate_count`, `max_retries`, `threshold`
+and `title` from `project.json`; start still restores none of them. Seeding
+them is not a cleanup - the project defaults (`candidate_count` 4,
+`max_retry_per_panel` 5, `quality_threshold` 0.78) differ from the ones start
+falls back to (1, 1, 0.5), so it would quadruple the candidates generated for
+every caller that omits them. That is a GPU cost decision.
+
+The consequence is that `page_count` still reaches a run **only** through the
+start body. A project started exactly as `docs/anima_mvp.md` describes - no
+body - plans against `page_count` 1, so any story plan with more than one page
+dies at `FAILED_STORY_PLANNING` with "expected 1 pages, received 2". This was
+observed, not reasoned: an earlier version of the test above did start with no
+body and failed that way. So the documented sequence cannot currently produce a
+multi-page run. Fixing it means deciding what start should take from the
+project, which is the same cost decision.
 
 ## Loaded by ComfyUI, end to end (2026-08-28)
 
