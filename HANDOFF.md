@@ -449,12 +449,48 @@ hashes, the environment, the LLM settings - and no credentials. Fingerprints
 need `comfyui.install_root`; resolution reads `extra_model_paths.yaml`, because
 a Desktop install keeps nothing under `models/`.
 
+## Speech bubbles, and one violated constraint (2026-08-28)
+
+The completed run's pages showed correctly drawn bubbles containing nothing.
+Two separate causes, both now fixed.
+
+### The text was never drawn (`9533265`)
+
+`ImageDraw.text` was called with no `font=`, so Pillow used its built-in bitmap
+face: no CJK glyphs, and the requested size ignored. The `FontSpec` (family,
+size, colour) was modelled, persisted in `bubbles.json`, and never handed to the
+renderer - the fourth built-tested-unwired component found this week.
+
+`services/fonts.py` resolves a family to a real file: a caller-supplied
+directory first, then the platform font directories, then any CJK-capable face
+so Japanese still renders. Two layout defects surfaced once glyphs appeared:
+vertical text sat on the bounding box edge and spilled outside the ellipse, and
+text longer than the box was cut off (a bubble sized for two characters rendered
+the three-character line as two). Text is now centred inside the ellipse and
+shrinks to fit, with a readable floor before truncation.
+
+### Six of nine bubbles were invented (`f3a4798`)
+
+The lettering hook gave every panel without planned dialogue a hardcoded line,
+commented "so the page is never bare". The live planner had written dialogue for
+three of nine panels; the other six carried that line, unrelated to the art.
+
+HANDOFF already stated the constraint - "No invented dialogue fallback in strict
+Anima lettering" - so this was a violated decision, not a quality judgement. A
+strict run now leaves a silent panel silent; generic projects keep the
+placeholder, promoted to a named constant.
+
+Replaying lettering on the finished run: 9 bubbles became 3, and the surviving
+lines are the planner's own.
+
+Suite: `1079 passed, 15 skipped`, `ruff check .` clean, `git diff --check` clean.
+
 ## What is not done
 
 The plan is complete, the suite is green, and one panel has been rendered for real. Still outstanding, each needing explicit user approval:
 
 1. **Live LM Studio acceptance** with a real planner model. `qwen3.5-9b` (6.55 GB) is **already installed locally** - checked with `lms ls` on 2026-08-27 - so this needs a load, not a download. Loading it is GPU/VRAM work and still needs the user to approve it. The strict path has never been driven by a real planner; the live render above used hand-written semantic segments.
-2. **Quality, not plumbing.** The plumbing is proven end to end. Two things are visibly wrong in the output: speech bubbles render empty (lettering places them but no text lands), and character appearance drifts between panels - hair and eye colour change within a single page. Neither is a wiring problem; both need prompt and lettering work against real output.
+2. **Character consistency.** Hair and eye colour drift between panels of the same page. The `identity` and `must_keep` segments are built from the character records and do reach the prompt, so this is not obviously a wiring problem - but it has not been investigated, and CFG 1 weakening prompt adherence is one plausible cause among several. This is the last known visible defect in the output.
 3. **Quality iteration** on real output - prompt wording, profile choice, layout catalogue - which is unpredictable in duration. The CFG 1 finding means Turbo prompts have to carry suppression positively, which is a prompt-design task, not a code task.
 
 Also left open deliberately: the route's preflight gate steps aside with a warning when the application has no `manga_comfy_client` or `manga_workflow_registry`. Whether a strict run should hard-fail when it cannot preflight is a product decision, not a bug to fix silently.
