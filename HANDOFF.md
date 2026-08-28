@@ -542,9 +542,11 @@ The user's own LM Studio model was resident throughout and was left loaded:
 
 The plan is complete, the suite is green, and one panel has been rendered for real. Still outstanding, each needing explicit user approval:
 
-1. **Live LM Studio acceptance** with a real planner model. `qwen3.5-9b` (6.55 GB) is **already installed locally** - checked with `lms ls` on 2026-08-27 - so this needs a load, not a download. Loading it is GPU/VRAM work and still needs the user to approve it. The strict path has never been driven by a real planner; the live render above used hand-written semantic segments.
+1. **Nothing is pushed.** 21 commits sit on `codex/anima-mvp` locally. Whether they go to the remote, and whether this becomes a PR, is the user's call.
 2. **Nothing known is broken in the output pipeline.** Every defect found by live running has been fixed and confirmed on hardware. What remains is tuning, not repair: planner latency (66.8s to >900s for the same prompt, the dominant cost), how much dialogue the planner writes (three of nine panels), and whether establishing shots should carry any character anchor at all.
 3. **Quality iteration** on real output - prompt wording, profile choice, layout catalogue - which is unpredictable in duration. The CFG 1 finding means Turbo prompts have to carry suppression positively, which is a prompt-design task, not a code task.
+
+4. **The review UI has never run in a browser.** `web/review_editor.js` is covered by Node-executed tests of its pure helpers and by structural contract checks, but `mountReviewEditor` has never been loaded in ComfyUI's actual sidebar. Everything it does with the DOM is unexercised, and so is the Reviews tab wiring in `index.js`.
 
 Also left open deliberately: the route's preflight gate steps aside with a warning when the application has no `manga_comfy_client` or `manga_workflow_registry`. Whether a strict run should hard-fail when it cannot preflight is a product decision, not a bug to fix silently.
 
