@@ -25,13 +25,21 @@ then "What is not done". Nothing else in this file is needed to pick up work.
 
 State as of 2026-08-28:
 
-- `origin/codex/anima-mvp` carries the first 14 commits; the **26 commits
-  after those are local only**. `git status -sb` gives the current count.
-  (An earlier version of this file said nothing had been pushed. That was
-  wrong: `git merge-base --is-ancestor origin/codex/anima-mvp HEAD` succeeds
-  and `git rev-list --count origin/main..origin/codex/anima-mvp` is 14. Both
-  read the fetched ref, so run `git ls-remote` before relying on it.)
-  Working tree clean.
+- **Pushed to a fork, PR open.** `koudai715-code` has only `READ` on
+  `Kataage/ComfyUI-Manga-Autopilot`, so the branch lives on the fork
+  `koudai715-code/ComfyUI-Manga-Autopilot` (remote `fork`, which the branch
+  now tracks) and
+  https://github.com/Kataage/ComfyUI-Manga-Autopilot/pull/219 carries all 48
+  commits into `main`. `origin` still points at the upstream. Working tree
+  clean.
+
+  A correction, because this file got it wrong in both directions on
+  2026-08-28: a `refs/remotes/origin/codex/anima-mvp` ref existed at
+  `fd269e8` and looked like 14 pushed commits. It was a leftover from the
+  *old* origin - the remote was repointed from a local path to GitHub during
+  the 2026-08-27 rescue, and the stale tracking ref survived the change.
+  `git remote prune origin` removed it. Never conclude what a remote holds
+  from a fetched ref; ask the remote.
 - `1094 passed, 15 skipped`; `ruff check .` clean; `git diff --check` clean.
 - No `TODO`/`FIXME` in `src/` or `web/`.
 
@@ -587,10 +595,16 @@ and tuning.
 
 ### Needs a decision
 
-1. **29 commits are unpushed.** `origin/codex/anima-mvp` holds the first 14;
-   everything after is local. Whether the rest goes to the remote, and whether
-   this becomes a PR, is the user's call.
-2. ~~Preflight that cannot run.~~ **Settled 2026-08-28.** The question assumed
+1. **CI has never run on this branch, and neither approval is ours to give.**
+   The upstream run for PR #219 is `action_required` - GitHub holds workflow
+   runs from a first-time fork contributor until a maintainer approves, and we
+   have only `READ`. The fork has no workflows registered either: GitHub does
+   not enable them on a fork until someone opens its Actions tab and confirms.
+   Until one of those happens, the only evidence is the local suite.
+2. **The tag.** `v0.1.0-rc1` is already tagged and sits on `main`; this branch
+   declares `0.1.0-rc2`. Tagging happens on `main` after the PR merges, which
+   is the upstream's call.
+3. ~~Preflight that cannot run.~~ **Settled 2026-08-28.** The question assumed
    a binary that does not exist: only two of the eight checks need
    `/object_info`. Preflight now runs the other six whatever the wiring, and a
    missing client is not itself a failure - `manga_remote_executor` is a
