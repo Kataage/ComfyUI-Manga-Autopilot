@@ -41,6 +41,10 @@ if TYPE_CHECKING:
 
 log = logging.getLogger(__name__)
 
+#: Stand-in line for generic projects that planned no dialogue. Strict Anima
+#: runs leave a silent panel silent instead.
+PLACEHOLDER_DIALOGUE = "行くぞ"
+
 ROUTE_PREFIX = "/manga_autopilot/api/projects/{project_id}/autopilot"
 
 
@@ -867,6 +871,7 @@ def _make_lettering(
     def _hook(run: AutopilotRun) -> dict[str, Any]:
         records = _read_panel_records(project_root)
         bubble_count = 0
+        strict = _is_anima_run(run)
 
         for record in records:
             dialogues = record.plan.dialogue if record.plan else []
@@ -892,18 +897,24 @@ def _make_lettering(
                         order=idx,
                     )
                     bubbles.append(bubble)
+            elif strict:
+                # A strict run never invents dialogue. A panel the planner left
+                # silent stays silent: six of nine panels in a live run were
+                # given a hardcoded line that had nothing to do with the art.
+                log.debug("no dialogue planned for %s; leaving it silent", record.panel_id)
             else:
-                # Fallback: at least one bubble so the page is never bare.
-                bubble = SpeechBubble(
-                    id=f"{record.panel_id}_b00",
-                    panel_id=record.panel_id,
-                    type="normal",
-                    text="行くぞ",
-                    width=160.0,
-                    height=80.0,
-                    order=0,
+                # Generic projects keep the placeholder so a page is never bare.
+                bubbles.append(
+                    SpeechBubble(
+                        id=f"{record.panel_id}_b00",
+                        panel_id=record.panel_id,
+                        type="normal",
+                        text=PLACEHOLDER_DIALOGUE,
+                        width=160.0,
+                        height=80.0,
+                        order=0,
+                    )
                 )
-                bubbles.append(bubble)
 
             # Compute placements using the panel layout (if available).
             panel_layout = record.layout

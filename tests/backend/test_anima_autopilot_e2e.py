@@ -691,3 +691,76 @@ async def test_a_rejection_over_rest_stops_the_route_run(
 
     await asyncio.sleep(0.3)
     assert executor.calls == [], "a rejected story must never reach the executor"
+
+
+# ------------------------------------------------- strict lettering invents nothing
+#
+# A completed live run produced nine bubbles, six of which read the same
+# hardcoded line while the planner had left those panels silent. HANDOFF states
+# the constraint outright: no invented dialogue fallback in strict Anima
+# lettering.
+
+
+def _lettering_records(tmp_path: Path) -> list[PanelRecord]:
+    from manga_autopilot.models.page import Dialogue
+
+    spoken = PanelRecord(
+        panel_id="p1_01",
+        page_number=1,
+        plan=PanelPlan(
+            panel_number=1,
+            purpose="beat",
+            shot="medium",
+            dialogue=[Dialogue(speaker="Hero", text="やっと届いた", type="speech")],
+        ),
+    )
+    silent = PanelRecord(
+        panel_id="p1_02",
+        page_number=1,
+        plan=PanelPlan(panel_number=2, purpose="beat", shot="wide"),
+    )
+    write_panel_records(tmp_path / "panels.json", [spoken, silent])
+    return [spoken, silent]
+
+
+def _run_lettering(tmp_path: Path, *, profile_id: str) -> list:
+    from manga_autopilot.routes.autopilot_routes import _make_lettering
+    from manga_autopilot.services.autopilot import AutopilotRun, AutopilotStateMachine
+    from manga_autopilot.services.bubble_service import BubbleService
+
+    _lettering_records(tmp_path / "projects" / "proj-letter")
+    app = web.Application()
+    hook = _make_lettering(app, "proj-letter", tmp_path)
+    run = AutopilotRun(
+        project_id="proj-letter",
+        machine=AutopilotStateMachine(project_id="proj-letter"),
+        input={"generation_profile_id": profile_id} if profile_id else {},
+    )
+    hook(run)
+    service = BubbleService(project_root=tmp_path / "projects" / "proj-letter")
+    return service.list_bubbles()
+
+
+def test_a_strict_run_leaves_a_silent_panel_silent(tmp_path: Path) -> None:
+    bubbles = _run_lettering(tmp_path, profile_id="anima_turbo")
+
+    assert [b.panel_id for b in bubbles] == ["p1_01"]
+    assert [b.text for b in bubbles] == ["やっと届いた"]
+
+
+def test_a_generic_run_keeps_its_placeholder(tmp_path: Path) -> None:
+    from manga_autopilot.routes.autopilot_routes import PLACEHOLDER_DIALOGUE
+
+    bubbles = _run_lettering(tmp_path, profile_id="")
+
+    assert {b.panel_id for b in bubbles} == {"p1_01", "p1_02"}
+    silent = next(b for b in bubbles if b.panel_id == "p1_02")
+    assert silent.text == PLACEHOLDER_DIALOGUE
+
+
+def test_no_strict_bubble_carries_the_placeholder(tmp_path: Path) -> None:
+    from manga_autopilot.routes.autopilot_routes import PLACEHOLDER_DIALOGUE
+
+    bubbles = _run_lettering(tmp_path, profile_id="anima_turbo")
+
+    assert all(b.text != PLACEHOLDER_DIALOGUE for b in bubbles)
