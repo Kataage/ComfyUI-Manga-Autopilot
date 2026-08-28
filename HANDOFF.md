@@ -521,12 +521,22 @@ Fixed in `f6aaab9`:
 The existing unknown-id guard is unchanged and covered by a test, so the fix
 cannot be satisfied by inventing ids either.
 
-**Not yet verified on hardware.** The change is covered by tests, but a live run
-to confirm the identity terms actually appear in rendered prompts has not been
-made: at the time of writing the GPU held a model the user had loaded
-themselves, and this session does not evict a user-owned instance. The check is
-one live run: read `runs/*/snapshot.json` and confirm each panel's `positive`
-begins with the character's appearance before the scene description.
+**Not yet verified on hardware.** The change is covered by tests, but no live
+run has confirmed the identity terms reach a rendered prompt. Two attempts:
+
+1. Deferred - the GPU held a model the user had loaded themselves, and this
+   session does not evict a user-owned instance.
+2. Abandoned at the story gate after 900s with `plan_story` still in flight; the
+   user's own model was loaded and generating by then, so the planner was
+   competing for the GPU. No `story.json` was written.
+
+Story planning has now been measured at 66.8s, 230.9s, 651.2s and >900s across
+runs of the same two-page prompt. Anything that waits on it needs a limit well
+past `llm.timeout_sec`, and a run is only worth starting when the GPU is idle.
+
+The check itself is one live run: read `runs/*/snapshot.json` and confirm each
+panel's `positive` begins with the character's appearance before the scene
+description.
 
 ## What is not done
 
