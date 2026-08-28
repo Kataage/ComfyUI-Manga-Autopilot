@@ -1,6 +1,6 @@
 # Claude Code handoff: Anima Manga Autopilot MVP
 
-Updated: 2026-08-27 JST (Claude Code, Tasks 1-8 complete + first live render)
+Updated: 2026-08-28 JST (Claude Code, plan complete and proven end to end on hardware)
 
 ## Objective
 
@@ -12,7 +12,41 @@ The user accepted the recommended choices from the prior grilling session and as
 
 `docs/superpowers/plans/2026-08-26-anima-mvp.md`
 
-Every task in that plan is done. The remaining work is live acceptance, which needs explicit approval; see "What is not done".
+Every task in that plan is done, and the pipeline has been proven end to end on
+real hardware: a two-page manga planned by a real LLM, rendered on the GPU,
+driven through all four review gates over the HTTP API, and exported as pages, a
+webtoon strip and a PDF.
+
+**Start here on resuming.** Read "Start of the next session" immediately below,
+then "What is not done". Nothing else in this file is needed to pick up work.
+
+## Start of the next session
+
+State as of 2026-08-28:
+
+- 24 commits on `codex/anima-mvp`, **none pushed**. Working tree clean.
+- `1094 passed, 15 skipped`; `ruff check .` clean; `git diff --check` clean.
+- No `TODO`/`FIXME` in `src/` or `web/`.
+
+Verify it still holds before changing anything:
+
+```powershell
+cd 'C:\Claude Code\comfyui-manga-autopilot'
+git status --short
+$env:TEMP='<a temp dir you can write to>'; $env:TMP=$env:TEMP
+.\.venv\Scripts\python.exe -m pytest tests/backend -q -p no:cacheprovider
+.\.venv\Scripts\python.exe -m ruff check .
+```
+
+The `.venv` works at this path; do not move it. Point `TEMP`/`TMP` at a
+directory the running agent can write to, or `tmp_path` fixtures fail with
+`PermissionError`.
+
+Live runs need ComfyUI on `127.0.0.1:8188` and LM Studio on `127.0.0.1:1234`.
+Check `lms ps --json` first: if a model the user loaded is resident, leave it
+alone and wait rather than evicting it. The reusable live-run harness is not in
+the repository - it lived in the session scratchpad - so a new session that
+wants one will need to write it again from the recipe in "Full live run".
 
 ## Repository and Git state
 
@@ -540,19 +574,62 @@ The user's own LM Studio model was resident throughout and was left loaded:
 
 ## What is not done
 
-The plan is complete, the suite is green, and one panel has been rendered for real. Still outstanding, each needing explicit user approval:
+Nothing here is a known defect. Every problem found by running the thing has been
+fixed and confirmed on hardware. What is left is a decision, a gap in coverage,
+and tuning.
 
-1. **Nothing is pushed.** 21 commits sit on `codex/anima-mvp` locally. Whether they go to the remote, and whether this becomes a PR, is the user's call.
-2. **Nothing known is broken in the output pipeline.** Every defect found by live running has been fixed and confirmed on hardware. What remains is tuning, not repair: planner latency (66.8s to >900s for the same prompt, the dominant cost), how much dialogue the planner writes (three of nine panels), and whether establishing shots should carry any character anchor at all.
-3. **Quality iteration** on real output - prompt wording, profile choice, layout catalogue - which is unpredictable in duration. The CFG 1 finding means Turbo prompts have to carry suppression positively, which is a prompt-design task, not a code task.
+### Needs a decision
 
-4. **The review UI runs, verified in a browser (2026-08-28).** `mountReviewEditor` was driven against a stubbed backend in a real browser: it mounts, lists the gates with their statuses, marks the blocking one, shows that gate's own form fields, posts approve with the typed note, advances as the board changes, and ends on "Every review is approved." with the form and buttons gone. The request log read `GET -> POST {note} -> GET` as intended.
+1. **Nothing is pushed.** 24 commits sit on `codex/anima-mvp` locally. Whether
+   they go to the remote, and whether this becomes a PR, is the user's call.
+2. **Preflight that cannot run.** The route's gate steps aside with a warning
+   when the application has no `manga_comfy_client` or `manga_workflow_registry`.
+   Whether a strict run should hard-fail instead is a product decision, left
+   open deliberately rather than settled quietly.
 
-   That run found a defect the structural tests could not: a decided gate put its note in `title`, which becomes the accessible name, so a screen reader heard "premise reads fine" instead of "Story: Approved". Fixed in `284868d` with an `aria-label` carrying both.
+### Gap in coverage
 
-   Still not exercised: the module inside ComfyUI's own sidebar. The harness proves the module; it does not prove the extension loads in ComfyUI's frontend bundle.
+3. **The extension has never been loaded by ComfyUI itself.** `review_editor.js`
+   was driven in a browser and works (see "Review editor, verified in a
+   browser"), but nothing has confirmed that ComfyUI's frontend bundle loads
+   `web/index.js` and shows the Reviews tab. Confirming it means installing this
+   checkout into ComfyUI's `custom_nodes` and restarting - a change to the
+   user's ComfyUI, so ask first.
 
-Also left open deliberately: the route's preflight gate steps aside with a warning when the application has no `manga_comfy_client` or `manga_workflow_registry`. Whether a strict run should hard-fail when it cannot preflight is a product decision, not a bug to fix silently.
+### Tuning, not repair
+
+4. **Planner latency dominates.** The same two-page plan measured 66.8s, 230.9s,
+   420.4s, 651.2s and over 900s; panel rendering is ~12s each by comparison.
+   Most of the time is chain of thought that is discarded. Each run now records
+   `planner.reasoning_ratio` in its snapshot, so the next run's own numbers can
+   settle whether a non-reasoning planner is worth switching to. `docs/anima_mvp.md`
+   has the measurements and the guidance.
+5. **The planner writes little dialogue** - three of nine panels in the last run.
+   Prompt design, not code; inventing the rest is explicitly forbidden.
+6. **Establishing shots carry no character anchor**, by design, and currently
+   warn. Whether they should is worth deciding once more pages exist.
+7. **Turbo suppression must be phrased positively.** At CFG 1 the negative prompt
+   is not evaluated at all, and negation in the positive prompt renders the very
+   thing it names. No scene-independent phrasing has been found; that needs
+   experiments against real output.
+
+## Review editor, verified in a browser (2026-08-28)
+
+`mountReviewEditor` was driven against a stubbed backend in a real browser. It
+mounts, lists the gates with their statuses, marks the blocking one, shows that
+gate's own form fields, posts approve with the typed note, advances as the board
+changes, and ends on "Every review is approved." with the form and buttons gone.
+The request log read `GET -> POST {note} -> GET`.
+
+That run found a defect the structural tests could not reach: a decided gate put
+its note in `title`, which becomes the accessible name, so a screen reader heard
+"premise reads fine" instead of "Story: Approved". The visible text was correct
+throughout, which is exactly why nothing else caught it. Fixed in `284868d` with
+an `aria-label` carrying both, and pinned by a test.
+
+The harness was a scratchpad page importing the module over a local static
+server, with `fetchImpl` stubbed - no ComfyUI, no backend, no GPU. Rebuilding it
+takes a few minutes and touches nothing in the repository.
 
 ## Verified Anima configuration evidence
 
@@ -618,9 +695,9 @@ Task 8 should fix the tests or test fixtures with `tmp_path`, normalized persist
 
 ## Remaining sequence
 
-All eight tasks are implemented, verified, and committed. The next steps are the
-live ones listed under "What is not done", and each needs the user to approve it
-first.
+All eight tasks are implemented, verified, committed, and proven on hardware.
+Everything that remains is listed under "What is not done"; none of it is a
+known defect.
 
 ## Standing approvals (2026-08-26)
 
