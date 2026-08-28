@@ -216,9 +216,15 @@ export function mountReviewEditor(container, opts = {}) {
       const item = el("li", "manga-autopilot-review-gate");
       item.dataset.gate = gate.gate;
       item.dataset.status = gate.status;
-      item.textContent = `${gate.label}: ${gate.statusLabel}`;
+      const summary = `${gate.label}: ${gate.statusLabel}`;
+      item.textContent = summary;
       if (gate.isBlocking) item.classList.add("is-blocking");
-      if (gate.note) item.title = gate.note;
+      if (gate.note) {
+        // `title` alone becomes the accessible name and hides the gate and its
+        // status from a screen reader, which then hears only the note.
+        item.title = gate.note;
+        item.setAttribute("aria-label", `${summary}. ${gate.note}`);
+      }
       statusList.appendChild(item);
     }
 

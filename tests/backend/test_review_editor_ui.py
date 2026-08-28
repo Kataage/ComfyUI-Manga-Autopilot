@@ -295,3 +295,24 @@ def test_the_review_editor_only_talks_to_the_review_routes() -> None:
     )
     assert "method: \"POST\"" in code
     assert "DELETE" not in code
+
+
+# ------------------------------------------------ accessible name of a decided gate
+#
+# Driving the module in a browser showed a decided gate announcing only its
+# note: `title` becomes the accessible name and hid "Story: Approved" from a
+# screen reader, which heard just "premise reads fine".
+
+
+def test_a_decided_gate_keeps_its_name_in_the_accessible_label() -> None:
+    code = _code_only(_source())
+
+    assert "aria-label" in code
+    # The label carries the summary and the note, not the note alone.
+    assert "${summary}. ${gate.note}" in code
+
+
+def test_the_summary_is_still_the_visible_text() -> None:
+    code = _code_only(_source())
+
+    assert "item.textContent = summary" in code
