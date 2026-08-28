@@ -4,7 +4,7 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
-## Unreleased
+## 0.1.0-rc2
 
 Strict Anima support, and the defects that only appeared once the
 pipeline was run against real hardware and loaded by ComfyUI itself.

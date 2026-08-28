@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "comfyui-manga-autopilot"
-version = "0.1.0-rc1"
+version = "0.1.0-rc2"
 description = "ComfyUI extension for end-to-end automated manga / Webtoon production."
 readme = "README.md"
 license = { file = "LICENSE" }
