@@ -587,8 +587,9 @@ and tuning.
 
 ### Needs a decision
 
-1. **Nothing is pushed.** The whole branch is local. Whether it goes to the
-   remote, and whether this becomes a PR, is the user's call.
+1. **29 commits are unpushed.** `origin/codex/anima-mvp` holds the first 14;
+   everything after is local. Whether the rest goes to the remote, and whether
+   this becomes a PR, is the user's call.
 2. **Preflight that cannot run.** The route's gate steps aside with a warning
    when the application has no `manga_comfy_client` or `manga_workflow_registry`.
    Whether a strict run should hard-fail instead is a product decision, left
@@ -603,20 +604,27 @@ and tuning.
    rest of the workspace - Page Editor, Character Manager, Progress and Export
    Center were never opened against a real project, because that needs a
    project to exist.
+4. **The documented install path is still unverified.** `README.md` and
+   `docs/install.md` tell the user to run `pip install -e .`; the live test used
+   a junction and no editable install, because the running venv already had
+   every dependency. Nothing has confirmed that the documented route works.
+5. **The extension is still installed** in the running ComfyUI as a junction.
+   Whether it stays is the user's call; "Loaded by ComfyUI, end to end" has the
+   removal command.
 
 ### Tuning, not repair
 
-4. **Planner latency dominates.** The same two-page plan measured 66.8s, 230.9s,
+6. **Planner latency dominates.** The same two-page plan measured 66.8s, 230.9s,
    420.4s, 651.2s and over 900s; panel rendering is ~12s each by comparison.
    Most of the time is chain of thought that is discarded. Each run now records
    `planner.reasoning_ratio` in its snapshot, so the next run's own numbers can
    settle whether a non-reasoning planner is worth switching to. `docs/anima_mvp.md`
    has the measurements and the guidance.
-5. **The planner writes little dialogue** - three of nine panels in the last run.
+7. **The planner writes little dialogue** - three of nine panels in the last run.
    Prompt design, not code; inventing the rest is explicitly forbidden.
-6. **Establishing shots carry no character anchor**, by design, and currently
+8. **Establishing shots carry no character anchor**, by design, and currently
    warn. Whether they should is worth deciding once more pages exist.
-7. **Turbo suppression must be phrased positively.** At CFG 1 the negative prompt
+9. **Turbo suppression must be phrased positively.** At CFG 1 the negative prompt
    is not evaluated at all, and negation in the positive prompt renders the very
    thing it names. No scene-independent phrasing has been found; that needs
    experiments against real output.
