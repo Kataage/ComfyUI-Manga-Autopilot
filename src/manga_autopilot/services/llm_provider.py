@@ -13,6 +13,7 @@ Provides:
 from __future__ import annotations
 
 import abc
+import asyncio
 import json
 import logging
 import os
@@ -64,6 +65,14 @@ class LLMSettings(BaseModel):
     api_key_env: str | None = None
     temperature: float = Field(default=0.7, ge=0.0, le=2.0)
     max_tokens: int = Field(default=2048, ge=64, le=32768)
+    timeout_sec: int = Field(default=900, ge=1, le=7200)
+    """How long to wait for one completion.
+
+    aiohttp defaults to 300s, which a local reasoning model can exceed on a
+    single planning call: measured at 297s for a two-page story plan, so the
+    default was close enough to trip intermittently - and the timeout surfaced
+    as an exception with an empty message.
+    """
 
     @model_validator(mode="after")
     def _check_endpoint(self) -> LLMSettings:
@@ -165,10 +174,16 @@ class OllamaProvider(LLMProvider):
             payload["system"] = system
         if schema is not None:
             payload["format"] = schema
-        async with aiohttp.ClientSession() as session:
-            async with session.post(url, json=payload) as resp:
-                resp.raise_for_status()
-                data = await resp.json()
+        timeout = aiohttp.ClientTimeout(total=self.settings.timeout_sec)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            try:
+                async with session.post(url, json=payload) as resp:
+                    resp.raise_for_status()
+                    data = await resp.json()
+            except asyncio.TimeoutError as exc:
+                raise TimeoutError(
+                    f"{url} did not answer within {self.settings.timeout_sec}s"
+                ) from exc
         return data.get("response", "")
 
 
@@ -203,10 +218,19 @@ class OpenAICompatibleProvider(LLMProvider):
                 "manga_autopilot_response",
                 schema,
             )
-        async with aiohttp.ClientSession() as session:
-            async with session.post(url, json=payload, headers=headers) as resp:
-                resp.raise_for_status()
-                data = await resp.json()
+        timeout = aiohttp.ClientTimeout(total=self.settings.timeout_sec)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            try:
+                async with session.post(url, json=payload, headers=headers) as resp:
+                    resp.raise_for_status()
+                    data = await resp.json()
+            except asyncio.TimeoutError as exc:
+                # A bare TimeoutError stringifies to "", which is how this
+                # surfaced in a live run: "plan_story failed:" and nothing else.
+                raise TimeoutError(
+                    f"{url} did not answer within {self.settings.timeout_sec}s; "
+                    "a reasoning model may need a longer llm.timeout_sec"
+                ) from exc
         choices = data.get("choices") or []
         if not choices:
             # An OpenAI-compatible server may answer HTTP 200 with an error

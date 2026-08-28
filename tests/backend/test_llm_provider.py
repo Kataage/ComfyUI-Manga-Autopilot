@@ -254,3 +254,45 @@ async def test_an_empty_reasoning_response_names_the_token_budget(aiohttp_client
 
     with pytest.raises(ValueError, match="max_tokens"):
         await provider.complete("hello")
+
+
+async def test_a_timeout_says_so_instead_of_raising_an_empty_error(aiohttp_client) -> None:
+    """A live run reported 'plan_story failed:' with nothing after the colon.
+
+    aiohttp's default 300s total timeout expired on a slow local reasoning
+    model, and a bare TimeoutError stringifies to the empty string.
+    """
+    import asyncio as _asyncio
+
+    from aiohttp import web
+
+    from manga_autopilot.services.llm_provider import LLMSettings, OpenAICompatibleProvider
+
+    async def handler(request: web.Request) -> web.Response:
+        await _asyncio.sleep(5)
+        return web.json_response({"choices": []})
+
+    app = web.Application()
+    app.router.add_post("/v1/chat/completions", handler)
+    client = await aiohttp_client(app)
+
+    provider = OpenAICompatibleProvider(
+        LLMSettings(
+            type="openai_compatible",
+            endpoint=f"http://127.0.0.1:{client.port}",
+            model="m",
+            timeout_sec=1,
+        )
+    )
+
+    with pytest.raises(TimeoutError) as excinfo:
+        await provider.complete("hello")
+
+    assert str(excinfo.value), "the error must not be empty"
+    assert "1s" in str(excinfo.value)
+
+
+def test_the_default_timeout_clears_aiohttps_own(aiohttp_client) -> None:
+    from manga_autopilot.services.llm_provider import LLMSettings
+
+    assert LLMSettings().timeout_sec > 300

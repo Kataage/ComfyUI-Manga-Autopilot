@@ -81,6 +81,9 @@ class LLMSettings(BaseModel):
     model: str = "qwen2.5:7b-instruct"
     temperature: float = 0.7
     max_tokens: int = 4096
+    timeout_sec: int = 900
+    """How long to wait for one completion. A local reasoning model can spend
+    minutes on a single planning call, well past aiohttp's 300s default."""
 
 
 class LMStudioSettings(BaseModel):
