@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -114,6 +114,76 @@ def _anima_candidate_count(run: AutopilotRun) -> int:
 def _anima_technical_retry_count(run: AutopilotRun) -> int:
     profile = _anima_profile(run)
     return profile.technical_retry_count if profile is not None else 1
+
+
+def _write_run_snapshot(
+    app: Application,
+    run: AutopilotRun,
+    *,
+    project_root: Path,
+    project_id: str,
+    profile: Any,
+    workflow_id: str,
+    prompts: Mapping[str, Any],
+) -> None:
+    """Record everything needed to reproduce this run.
+
+    Failing to write a snapshot must never fail a run that has already produced
+    images, so this logs and moves on. Model fingerprints are only included when
+    ``comfyui.install_root`` is configured, since ComfyUI reports model names but
+    not their paths.
+    """
+    from manga_autopilot.services.model_fingerprint import fingerprint_profile_models
+    from manga_autopilot.services.run_snapshot import (
+        EnvironmentSnapshot,
+        LLMSettingsSnapshot,
+        PanelPromptSnapshot,
+        RunSnapshot,
+        RunSnapshotWriter,
+        hash_json_document,
+        log_prompt_digest,
+    )
+
+    try:
+        registry = app.get("manga_workflow_registry")
+        workflow = None
+        if registry is not None:
+            try:
+                workflow = registry.get(workflow_id)
+            except Exception as exc:  # noqa: BLE001 - the prompts still matter
+                log.warning(
+                    "run snapshot has no workflow hash: %s could not be read (%s)",
+                    workflow_id,
+                    exc,
+                )
+        panels = [
+            PanelPromptSnapshot.from_prompt_spec(panel_id, spec)
+            for panel_id, spec in prompts.items()
+        ]
+
+        llm = None
+        provider = app.get("manga_llm_provider")
+        settings = getattr(provider, "settings", None)
+        if settings is not None:
+            llm = LLMSettingsSnapshot.from_mapping(settings.model_dump(mode="json"))
+
+        snapshot = RunSnapshot(
+            run_id=run.run_id,
+            project_id=project_id,
+            generation_profile_id=profile.id,
+            profile_hash=hash_json_document(profile.model_dump(mode="json")),
+            workflow_hash=hash_json_document((workflow.api_graph or {}) if workflow else {}),
+            models=fingerprint_profile_models(profile, app.get("manga_comfyui_install_root")),
+            llm=llm,
+            environment=EnvironmentSnapshot.capture(),
+            panels=panels,
+        )
+        path = RunSnapshotWriter(project_root).write(snapshot)
+        for panel in panels:
+            log_prompt_digest(log, panel)
+        log.info("wrote %s for run %s", path.name, run.run_id)
+    except Exception as exc:  # noqa: BLE001 - a snapshot is never worth a failed run
+        log.warning("could not write the run snapshot for %s: %s", run.run_id, exc)
 
 
 def _open_review_coordinator(app: Application, project_id: str, storage_root: Path):
@@ -636,18 +706,22 @@ def _make_generate_panels(
             characters = {c.id: c for c in CharacterService.for_project(storage_root, project_id).list()}
             base_seed = run.input.get("seed")
 
+            rendered_prompts: dict[str, PromptSpec] = {}
+
             def _anima_prompt(record: PanelRecord) -> PromptSpec:
                 seed = (
                     int(base_seed)
                     if base_seed is not None
                     else stable_panel_seed(project_id, record.panel_id)
                 )
-                return anima_builder.render(
+                spec = anima_builder.render(
                     segments_from_panel_plan(record.plan, characters),
                     profile,
                     seed=seed,
                     panel_size=panel_aspect(record, profile),
                 )
+                rendered_prompts[record.panel_id] = spec
+                return spec
 
             async def _generate(batch: list[PanelRecord]) -> list[Any]:
                 return await run_panels_sequentially(
@@ -674,6 +748,16 @@ def _make_generate_panels(
                     coordinator=coordinator,
                     on_wait=lambda gate: run.log_event("review_awaiting", {"gate": gate}),
                 )
+            _write_run_snapshot(
+                app,
+                run,
+                project_root=project_root,
+                project_id=project_id,
+                profile=profile,
+                workflow_id=str(run.input.get("workflow_id") or workflow_id),
+                prompts=rendered_prompts,
+            )
+
             blocked = [r for r in results if r.status in {"failed", "rejected"}]
             if blocked:
                 raise RuntimeError(

@@ -651,6 +651,28 @@ async def test_the_route_path_pauses_at_every_gate_and_resumes_over_rest(
     assert board["blocking_gate"] is None
     assert [board["gates"][g]["status"] for g in REVIEW_GATES] == ["approved"] * 4
 
+    # A run that produced images must also be reproducible: the snapshot records
+    # the rendered prompts, the seeds, and the profile and workflow hashes.
+    snapshots = sorted(
+        (tmp_path / "projects" / "proj-route" / "runs").glob("*/snapshot.json")
+    )
+    assert snapshots, "the run wrote no snapshot"
+    document = json.loads(snapshots[-1].read_text(encoding="utf-8"))
+    assert document["generation_profile_id"] == "anima_turbo"
+    assert len(document["profile_hash"]) == 64
+    # The test app registers no workflow, so the hash is of an empty graph;
+    # the prompts are what make the snapshot worth keeping.
+    assert len(document["workflow_hash"]) == 64
+    assert {p["panel_id"] for p in document["panels"]} == {
+        call.panel_id for call in executor.calls
+    }
+    for panel in document["panels"]:
+        assert panel["positive"].startswith("masterpiece, best quality")
+        assert (panel["width"], panel["height"]) == (960, 1280)
+        assert len(panel["prompt_hash"]) == 64
+    # Credentials never reach a snapshot.
+    assert "api_key" not in snapshots[-1].read_text(encoding="utf-8")
+
 
 async def test_a_rejection_over_rest_stops_the_route_run(
     aiohttp_client, tmp_path: Path

@@ -34,6 +34,14 @@ class ComfyUISettings(BaseModel):
     timeout_sec: int = 600
     use_websocket: bool = True
     client_id: str = "manga_autopilot_client"
+    install_root: str = ""
+    """Local path to the ComfyUI install, for model fingerprints.
+
+    ComfyUI reports model names but not their paths, so without this a run
+    snapshot records no digests. Both ``models/`` and
+    ``extra_model_paths.yaml`` are consulted. Setting it makes each run hash the weights it
+    used, which costs a few seconds per distinct file.
+    """
     auth_token_env: str = ""
     """Name of the environment variable holding the ComfyUI token.
 
