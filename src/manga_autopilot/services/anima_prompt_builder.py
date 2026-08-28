@@ -243,6 +243,17 @@ def segments_from_panel_plan(
     records = characters or {}
     identity: list[str] = []
     must_keep: list[str] = []
+    if records and not plan.characters:
+        # A panel that names no one renders with no appearance anchor at all,
+        # which is how a live run produced nine panels whose hair and eye colour
+        # drifted freely. The planner is asked for these ids; when it returns
+        # none, say so rather than rendering a stranger.
+        log.warning(
+            "panel %s names no character; %d are defined, so its appearance is "
+            "unanchored and will drift",
+            plan.panel_number,
+            len(records),
+        )
     for character_id in plan.characters:
         record = records.get(character_id)
         if record is None:

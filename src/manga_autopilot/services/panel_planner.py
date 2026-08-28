@@ -129,6 +129,8 @@ PROMPT_TEMPLATE = """あなたは漫画の演出家です。
 - 出力はJSONのみ
 - パネル数は {panel_count}
 - 各パネルに panelNumber, purpose, shot, action, emotion を含める
+- characters には、そのコマに登場する人物の id を Active Characters から選んで列挙する
+  （id は Active Characters に載っているものだけを使う。人物が写らないコマだけ空配列）
 - 必要なら dialogue / sfx を追加する
 - 1吹き出し 40 文字以内を目安
 

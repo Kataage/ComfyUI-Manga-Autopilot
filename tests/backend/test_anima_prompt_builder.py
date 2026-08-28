@@ -3,6 +3,7 @@ from __future__ import annotations
 import pytest
 
 from manga_autopilot.models.generation_profile import SemanticPromptSegments
+from manga_autopilot.models.page import PanelPlan
 from manga_autopilot.services.anima_prompt_builder import AnimaPromptBuilder
 from manga_autopilot.services.generation_profiles import load_builtin_profile
 
@@ -245,3 +246,120 @@ def test_rejecting_negations_leaves_a_clean_prompt_alone() -> None:
     result = AnimaPromptBuilder(reject_negations=True).render(segments, profile, seed=1)
 
     assert "plain wall" in result.positive
+
+
+# ------------------------------------------------- character identity reaches the prompt
+#
+# A live run rendered nine panels whose hair and eye colour drifted freely. The
+# character records were detailed and correct; every panel's `characters` list
+# was empty, so no appearance ever reached the image prompt. The panel prompt
+# had never asked for the field, and validation only rejects *unknown* ids - an
+# empty list passes trivially.
+
+
+class _Record:
+    def __init__(self, consistency_prompt: str, must_keep: list[str]) -> None:
+        self.consistency_prompt = consistency_prompt
+        self._must_keep = must_keep
+
+    def must_keep_combined(self) -> list[str]:
+        return list(self._must_keep)
+
+
+def test_identity_and_must_keep_reach_the_segments() -> None:
+    from manga_autopilot.services.anima_prompt_builder import segments_from_panel_plan
+
+    plan = PanelPlan(
+        panel_number=1, purpose="beat", shot="medium", characters=["courier_01"]
+    )
+    records = {"courier_01": _Record("messy black hair, grey eyes", ["navy trench coat"])}
+
+    segments = segments_from_panel_plan(plan, records)
+
+    assert segments.identity == ["messy black hair, grey eyes"]
+    assert segments.must_keep == ["navy trench coat"]
+
+
+def test_identity_leads_the_rendered_prompt() -> None:
+    from manga_autopilot.services.anima_prompt_builder import (
+        AnimaPromptBuilder,
+        segments_from_panel_plan,
+    )
+    from manga_autopilot.services.generation_profiles import load_builtin_profile
+
+    plan = PanelPlan(
+        panel_number=1,
+        purpose="establishing",
+        shot="wide",
+        background="a rainy street",
+        characters=["courier_01"],
+    )
+    records = {"courier_01": _Record("messy black hair, grey eyes", ["navy trench coat"])}
+
+    spec = AnimaPromptBuilder().render(
+        segments_from_panel_plan(plan, records),
+        load_builtin_profile("anima_turbo"),
+        seed=1,
+    )
+
+    assert "messy black hair" in spec.positive
+    assert "navy trench coat" in spec.positive
+    # Identity precedes the scene, so truncation drops decoration first.
+    assert spec.positive.index("messy black hair") < spec.positive.index("a rainy street")
+
+
+def test_a_panel_naming_nobody_is_warned_about(caplog) -> None:
+    import logging
+
+    from manga_autopilot.services.anima_prompt_builder import segments_from_panel_plan
+
+    plan = PanelPlan(panel_number=3, purpose="beat", shot="wide")
+    records = {"courier_01": _Record("messy black hair", [])}
+
+    with caplog.at_level(logging.WARNING):
+        segments = segments_from_panel_plan(plan, records)
+
+    assert segments.identity == []
+    assert "names no character" in caplog.text
+    assert "drift" in caplog.text
+
+
+def test_a_project_without_characters_is_not_warned_about(caplog) -> None:
+    import logging
+
+    from manga_autopilot.services.anima_prompt_builder import segments_from_panel_plan
+
+    with caplog.at_level(logging.WARNING):
+        segments_from_panel_plan(PanelPlan(panel_number=1, purpose="beat"), {})
+
+    assert "names no character" not in caplog.text
+
+
+def test_the_panel_prompt_asks_for_character_ids() -> None:
+    """The field is required downstream; it has to be requested upstream."""
+    from manga_autopilot.services.panel_planner import PanelPlanner
+
+    planner = PanelPlanner(
+        provider=object(),
+        panel_count=2,
+        active_characters=[{"id": "courier_01", "appearance": "black hair"}],
+    )
+
+    prompt = planner.build_prompt({"page_number": 1, "summary": "x", "panel_count": 2})
+
+    assert "characters" in prompt
+    assert "Active Characters" in prompt
+    assert "courier_01" in prompt
+
+
+def test_an_unknown_character_id_is_still_rejected() -> None:
+    """The existing guard must survive: ids have to come from the roster."""
+    from manga_autopilot.services.semantic_validation import validate_panel_sequence
+
+    issues = validate_panel_sequence(
+        [{"panelNumber": 1, "characters": ["ghost_99"]}],
+        expected_count=1,
+        character_ids={"courier_01"},
+    )
+
+    assert any(issue.code == "unknown_character" for issue in issues)
