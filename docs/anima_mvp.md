@@ -254,6 +254,52 @@ downloaded, loaded, or queued during the check.
 Set `comfyui.auth_token_env` in `config.yaml` to the **name** of an environment
 variable holding the token. The token itself is never stored in configuration.
 
+## Choosing a planner
+
+Planner latency dominates a strict run. Panel rendering is roughly 12s each on
+an RTX 5070 Ti; planning the same two-page story took anywhere from 66.8s to
+over 900s across runs of the identical prompt.
+
+The cause is chain of thought. A reasoning model writes into
+`reasoning_content` before it fills `content`, and that text is discarded.
+Measured on 2026-08-27/28:
+
+| Model | Trivial prompt | Two-page plan | Reasoning |
+|---|---|---|---|
+| `qwen3.5-9b` | 23.8s, 978 chars | 296.7s | 14,021 chars |
+| `gemma-4-12b-it-uncensored` | 13.0s, 699 chars | 43.1s - 651.2s | 1,343+ chars |
+| `google/gemma-4-12b-qat` | 3.9s, **0 chars** | not measured | none |
+
+Two things follow:
+
+- **Prefer a model that does not reason** for planning. The planner's job is to
+  fill a JSON schema, and the schema already constrains the shape.
+- **Reasoning expands to fill the budget.** The same model produced 978
+  characters of reasoning at `max_tokens=512` and 2,651 at 2048. Raising
+  `llm.max_tokens` to accommodate a long plan also buys more chain of thought.
+
+LM Studio's model metadata does not distinguish reasoning models: every model on
+the test machine advertised the same `capabilities: ['tool_use']`, including one
+measured producing 14,021 characters of reasoning. Measure, do not read the
+label.
+
+### Measuring it yourself
+
+Every completion is logged with its latency and reasoning length, and each run
+snapshot carries the totals:
+
+```json
+"planner": {
+  "calls": 6, "seconds": 1210.4,
+  "reasoning_chars": 38120, "content_chars": 4210,
+  "reasoning_ratio": 0.901
+}
+```
+
+`reasoning_ratio` is the share of generated text that was thrown away. A ratio
+near 0.9 means nine tenths of the planner's time bought nothing that reached the
+page, and a non-reasoning model would finish the same work far sooner.
+
 ## Managed LM Studio (opt-in)
 
 Disabled by default. With `lm_studio.manage_lifecycle` enabled, Manga Autopilot

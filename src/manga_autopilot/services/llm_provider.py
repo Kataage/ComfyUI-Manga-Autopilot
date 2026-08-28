@@ -18,6 +18,7 @@ import json
 import logging
 import os
 import re
+import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Literal
@@ -87,6 +88,50 @@ class LLMSettings(BaseModel):
         return os.environ.get(self.api_key_env)
 
 
+@dataclass
+class CompletionStats:
+    """What the planner actually cost, accumulated across a run.
+
+    Planner latency dominates a strict run and varies by an order of magnitude
+    between identical prompts - 66.8s to over 900s were measured for the same
+    two-page plan. Most of that is a reasoning model writing chain of thought
+    that is then discarded, so without recording it the cost is invisible: the
+    only symptom is a run that sometimes takes half an hour.
+    """
+
+    calls: int = 0
+    seconds: float = 0.0
+    reasoning_chars: int = 0
+    content_chars: int = 0
+
+    def record(
+        self,
+        *,
+        seconds: float,
+        content: str = "",
+        reasoning: str = "",
+    ) -> None:
+        self.calls += 1
+        self.seconds += seconds
+        self.content_chars += len(content or "")
+        self.reasoning_chars += len(reasoning or "")
+
+    @property
+    def reasoning_ratio(self) -> float:
+        """Share of generated characters spent on chain of thought."""
+        total = self.reasoning_chars + self.content_chars
+        return self.reasoning_chars / total if total else 0.0
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "calls": self.calls,
+            "seconds": round(self.seconds, 1),
+            "reasoning_chars": self.reasoning_chars,
+            "content_chars": self.content_chars,
+            "reasoning_ratio": round(self.reasoning_ratio, 3),
+        }
+
+
 class LLMProvider(abc.ABC):
     """Abstract async LLM provider."""
 
@@ -94,6 +139,27 @@ class LLMProvider(abc.ABC):
 
     def __init__(self, settings: LLMSettings) -> None:
         self.settings = settings
+        self.stats = CompletionStats()
+
+    def _record(self, started: float, content: str, reasoning: str = "") -> None:
+        """Log and accumulate what one completion cost."""
+        elapsed = time.monotonic() - started
+        self.stats.record(seconds=elapsed, content=content, reasoning=reasoning)
+        if reasoning:
+            log.info(
+                "%s answered in %.1fs: %d content chars after %d of reasoning",
+                self.settings.model or "the model",
+                elapsed,
+                len(content or ""),
+                len(reasoning),
+            )
+        else:
+            log.info(
+                "%s answered in %.1fs: %d content chars",
+                self.settings.model or "the model",
+                elapsed,
+                len(content or ""),
+            )
 
     @abc.abstractmethod
     async def complete(
@@ -175,6 +241,7 @@ class OllamaProvider(LLMProvider):
         if schema is not None:
             payload["format"] = schema
         timeout = aiohttp.ClientTimeout(total=self.settings.timeout_sec)
+        started = time.monotonic()
         async with aiohttp.ClientSession(timeout=timeout) as session:
             try:
                 async with session.post(url, json=payload) as resp:
@@ -184,7 +251,9 @@ class OllamaProvider(LLMProvider):
                 raise TimeoutError(
                     f"{url} did not answer within {self.settings.timeout_sec}s"
                 ) from exc
-        return data.get("response", "")
+        content = data.get("response", "")
+        self._record(started, content)
+        return content
 
 
 class OpenAICompatibleProvider(LLMProvider):
@@ -219,6 +288,7 @@ class OpenAICompatibleProvider(LLMProvider):
                 schema,
             )
         timeout = aiohttp.ClientTimeout(total=self.settings.timeout_sec)
+        started = time.monotonic()
         async with aiohttp.ClientSession(timeout=timeout) as session:
             try:
                 async with session.post(url, json=payload, headers=headers) as resp:
@@ -241,6 +311,8 @@ class OpenAICompatibleProvider(LLMProvider):
         choice = choices[0]
         message = choice.get("message", {})
         content = message.get("content") or ""
+        reasoning = message.get("reasoning_content") or ""
+        self._record(started, content, reasoning)
         if not content and choice.get("finish_reason") == "length":
             # A reasoning model spends max_tokens on `reasoning_content` before
             # it writes any answer. Reporting "could not extract JSON from ''"

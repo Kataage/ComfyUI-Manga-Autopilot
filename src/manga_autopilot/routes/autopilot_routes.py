@@ -142,6 +142,7 @@ def _write_run_snapshot(
         EnvironmentSnapshot,
         LLMSettingsSnapshot,
         PanelPromptSnapshot,
+        PlannerCostSnapshot,
         RunSnapshot,
         RunSnapshotWriter,
         hash_json_document,
@@ -166,10 +167,22 @@ def _write_run_snapshot(
         ]
 
         llm = None
+        planner = None
         provider = app.get("manga_llm_provider")
         settings = getattr(provider, "settings", None)
         if settings is not None:
             llm = LLMSettingsSnapshot.from_mapping(settings.model_dump(mode="json"))
+        stats = getattr(provider, "stats", None)
+        if stats is not None:
+            planner = PlannerCostSnapshot(**stats.to_dict())
+            log.info(
+                "planner cost for %s: %d call(s), %.1fs, %.0f%% of generated text "
+                "was discarded reasoning",
+                run.run_id,
+                planner.calls,
+                planner.seconds,
+                planner.reasoning_ratio * 100,
+            )
 
         snapshot = RunSnapshot(
             run_id=run.run_id,
@@ -179,6 +192,7 @@ def _write_run_snapshot(
             workflow_hash=hash_json_document((workflow.api_graph or {}) if workflow else {}),
             models=fingerprint_profile_models(profile, app.get("manga_comfyui_install_root")),
             llm=llm,
+            planner=planner,
             environment=EnvironmentSnapshot.capture(),
             panels=panels,
         )

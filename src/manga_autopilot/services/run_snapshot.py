@@ -153,6 +153,24 @@ class LLMSettingsSnapshot(BaseModel):
         return cls(**{k: v for k, v in scrubbed.items() if k in known})
 
 
+class PlannerCostSnapshot(BaseModel):
+    """What the planner cost this run, so two runs can be compared.
+
+    Planner latency dominates a strict run and swings by an order of magnitude
+    for the same prompt. `reasoning_ratio` is the share of generated characters
+    spent on chain of thought that is then discarded - the number that decides
+    whether a faster model is worth switching to.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    calls: int = 0
+    seconds: float = 0.0
+    reasoning_chars: int = 0
+    content_chars: int = 0
+    reasoning_ratio: float = 0.0
+
+
 class EnvironmentSnapshot(BaseModel):
     """Runtime the run executed on."""
 
@@ -237,6 +255,7 @@ class RunSnapshot(BaseModel):
     workflow_hash: str = ""
     models: list[ModelFingerprint] = Field(default_factory=list)
     llm: LLMSettingsSnapshot | None = None
+    planner: PlannerCostSnapshot | None = None
     environment: EnvironmentSnapshot = Field(default_factory=EnvironmentSnapshot)
     panels: list[PanelPromptSnapshot] = Field(default_factory=list)
 
@@ -313,6 +332,7 @@ __all__ = [
     "SNAPSHOT_FILENAME",
     "EnvironmentSnapshot",
     "LLMSettingsSnapshot",
+    "PlannerCostSnapshot",
     "PanelPromptSnapshot",
     "RunSnapshot",
     "RunSnapshotWriter",
