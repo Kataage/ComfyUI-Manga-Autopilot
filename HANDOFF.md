@@ -521,29 +521,29 @@ Fixed in `f6aaab9`:
 The existing unknown-id guard is unchanged and covered by a test, so the fix
 cannot be satisfied by inventing ids either.
 
-**Not yet verified on hardware.** The change is covered by tests, but no live
-run has confirmed the identity terms reach a rendered prompt. Two attempts:
+**Verified on hardware (2026-08-28).** A live two-page run with the fix:
 
-1. Deferred - the GPU held a model the user had loaded themselves, and this
-   session does not evict a user-owned instance.
-2. Abandoned at the story gate after 900s with `plan_story` still in flight; the
-   user's own model was loaded and generating by then, so the planner was
-   competing for the GPU. No `story.json` was written.
+- Panels naming a character: **6 of 9**, up from 0 of 9. The three that name
+  nobody are establishing shots and a prop close-up, which is correct.
+- Every one of those six rendered prompts now opens with the appearance:
+  `Messy, dark navy hair soaked by rain..., Tired grey eyes...` before the
+  scene description, exactly as the segment order intends.
+- The new warning fired for the three unanchored panels, naming them.
+- Visually the courier is the same person across panels: same dark navy hair,
+  grey eyes, black trench coat and brown leather satchel, and the satchel
+  matches its own close-up panel. The recipient is likewise stable across the
+  three panels she appears in.
 
-Story planning has now been measured at 66.8s, 230.9s, 651.2s and >900s across
-runs of the same two-page prompt. Anything that waits on it needs a limit well
-past `llm.timeout_sec`, and a run is only worth starting when the GPU is idle.
-
-The check itself is one live run: read `runs/*/snapshot.json` and confirm each
-panel's `positive` begins with the character's appearance before the scene
-description.
+Run: 1720.3s end to end, `COMPLETED`, nine panels, pages/webtoon/PDF exported.
+The user's own LM Studio model was resident throughout and was left loaded:
+`LM Studio after: ['google/gemma-4-12b-qat']`.
 
 ## What is not done
 
 The plan is complete, the suite is green, and one panel has been rendered for real. Still outstanding, each needing explicit user approval:
 
 1. **Live LM Studio acceptance** with a real planner model. `qwen3.5-9b` (6.55 GB) is **already installed locally** - checked with `lms ls` on 2026-08-27 - so this needs a load, not a download. Loading it is GPU/VRAM work and still needs the user to approve it. The strict path has never been driven by a real planner; the live render above used hand-written semantic segments.
-2. **Confirm the identity fix on hardware.** `f6aaab9` should put the character appearance at the front of every panel prompt. One live run, then read the snapshot, settles it. Everything else in the output pipeline has been verified end to end.
+2. **Nothing known is broken in the output pipeline.** Every defect found by live running has been fixed and confirmed on hardware. What remains is tuning, not repair: planner latency (66.8s to >900s for the same prompt, the dominant cost), how much dialogue the planner writes (three of nine panels), and whether establishing shots should carry any character anchor at all.
 3. **Quality iteration** on real output - prompt wording, profile choice, layout catalogue - which is unpredictable in duration. The CFG 1 finding means Turbo prompts have to carry suppression positively, which is a prompt-design task, not a code task.
 
 Also left open deliberately: the route's preflight gate steps aside with a warning when the application has no `manga_comfy_client` or `manga_workflow_registry`. Whether a strict run should hard-fail when it cannot preflight is a product decision, not a bug to fix silently.
