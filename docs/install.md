@@ -35,6 +35,23 @@ The install pulls in `aiohttp`, `pydantic`, `PyYAML`, `Pillow`, and
 pip install -e ".[dev]"
 ```
 
+**Use ComfyUI's own interpreter, not whichever `pip` is on `PATH`.** A
+portable or desktop ComfyUI ships its own Python, and installing into a
+different one leaves ComfyUI without the dependencies. ComfyUI already has
+`aiohttp`, `pydantic`, `PyYAML` and `Pillow`; `jsonschema` is the one it
+does not, and without it `register_all()` raises `ModuleNotFoundError` at
+startup. The sidebar tab still renders in that state, so the extension
+looks installed while every HTTP route is absent - check the ComfyUI
+console for `Failed to register Manga Autopilot routes`.
+
+```bash
+# example: ComfyUI Desktop on Windows
+"%LOCALAPPDATA%\Comfy-Desktop\ComfyUI-Installs\<name>\standalone-env\python.exe" -m pip install -e .
+```
+
+Installing through ComfyUI-Manager instead runs `requirements.txt`, which
+carries the same dependency set.
+
 ## 4. Restart ComfyUI
 
 The custom node registers an HTTP API under

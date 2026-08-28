@@ -1,6 +1,7 @@
 # Claude Code handoff: Anima Manga Autopilot MVP
 
-Updated: 2026-08-28 JST (Claude Code, plan complete and proven end to end on hardware)
+Updated: 2026-08-28 JST (Claude Code; plan complete and proven end to end on
+hardware, ComfyUI load path traced statically)
 
 ## Objective
 
@@ -24,8 +25,13 @@ then "What is not done". Nothing else in this file is needed to pick up work.
 
 State as of 2026-08-28:
 
-- Every commit on `codex/anima-mvp` is local; **nothing has been pushed**.
-  `git status -sb` gives the current count. Working tree clean.
+- `origin/codex/anima-mvp` carries the first 14 commits; the **26 commits
+  after those are local only**. `git status -sb` gives the current count.
+  (An earlier version of this file said nothing had been pushed. That was
+  wrong: `git merge-base --is-ancestor origin/codex/anima-mvp HEAD` succeeds
+  and `git rev-list --count origin/main..origin/codex/anima-mvp` is 14. Both
+  read the fetched ref, so run `git ls-remote` before relying on it.)
+  Working tree clean.
 - `1094 passed, 15 skipped`; `ruff check .` clean; `git diff --check` clean.
 - No `TODO`/`FIXME` in `src/` or `web/`.
 
@@ -590,12 +596,16 @@ and tuning.
 
 ### Gap in coverage
 
-3. **The extension has never been loaded by ComfyUI itself.** `review_editor.js`
-   was driven in a browser and works (see "Review editor, verified in a
-   browser"), but nothing has confirmed that ComfyUI's frontend bundle loads
-   `web/index.js` and shows the Reviews tab. Confirming it means installing this
-   checkout into ComfyUI's `custom_nodes` and restarting - a change to the
-   user's ComfyUI, so ask first.
+3. **The extension has never been loaded by ComfyUI itself.** Narrowed on
+   2026-08-28 without installing anything: the loader, the static route, the
+   `/extensions` listing and the frontend's `registerSidebarTab` were traced
+   against the ComfyUI installed on this machine, and the package imports
+   cleanly under ComfyUI's own interpreter. See "ComfyUI load path, traced
+   against the installed ComfyUI". What remains unproven is only the runtime
+   half: that the frontend fetches and imports the files and the tab appears.
+   Confirming it means installing this checkout into ComfyUI's `custom_nodes`,
+   installing the dependencies with ComfyUI's interpreter, and restarting - a
+   change to the user's ComfyUI, so ask first.
 
 ### Tuning, not repair
 
@@ -613,6 +623,90 @@ and tuning.
    is not evaluated at all, and negation in the positive prompt renders the very
    thing it names. No scene-independent phrasing has been found; that needs
    experiments against real output.
+
+## ComfyUI load path, traced against the installed ComfyUI (2026-08-28)
+
+Nothing was installed and ComfyUI was not restarted. The checks below read the
+ComfyUI on this machine and ran this repository's `__init__.py` under
+*ComfyUI's own interpreter*, which is enough to settle most of the question
+that the "extension has never been loaded" gap was really asking.
+
+The installation, for whoever does the live test:
+
+- Install: `C:\Users\kouda\AppData\Local\Comfy-Desktop\ComfyUI-Installs\Koudai`
+- ComfyUI `0.30.2`, frontend package `comfyui_frontend_package 1.45.21`
+- Interpreter: `<install>\standalone-env\python.exe` (Python 3.13.12)
+- `custom_nodes` holds only the stock `example_node.py.example` and
+  `websocket_image_save.py`
+- Config: `%APPDATA%\Comfy Desktop\installations.json`; models, input and
+  output live under `...\Comfy-Desktop\ComfyUI-Shared`
+
+What the trace establishes:
+
+1. `nodes.py:2270` computes `os.path.abspath(os.path.join(module_dir,
+   WEB_DIRECTORY))`. Our `WEB_DIRECTORY` is absolute, which `os.path.join`
+   passes through unchanged, and the directory exists - so
+   `EXTENSION_WEB_DIRS[<folder name>]` gets set.
+2. `server.py:1243` mounts `web.static('/extensions/<folder name>', dir)` and
+   `server.py:356` lists **every** `.js` under that directory recursively. All
+   six files in `web/` are therefore imported by the frontend, not just
+   `index.js`. That is harmless here: only `index.js` has a module-scope side
+   effect (`app.registerExtension`), and the five mount modules resolve to the
+   same URLs `index.js` imports, so each is evaluated once.
+3. `NODE_CLASS_MAPPINGS` is an empty dict by design. `load_custom_node` tests
+   it for `is not None`, not truth, so the empty mapping still returns `True`.
+4. The frontend bundle has `extensionManager.registerSidebarTab`, and its
+   sidebar component supports `type: 'custom'` with `extension.render(el)` -
+   exactly the shape `web/index.js` registers.
+5. Running the repo-root `__init__.py` the way `load_custom_node` does, under
+   ComfyUI's own interpreter, imports cleanly: `IMPORT OK`, `WEB_DIRECTORY`
+   resolves, `isdir` is `True`.
+
+What the trace found broken (see the next section): route registration dies in
+that interpreter because `jsonschema` is not installed in it.
+
+Still unproven, and only a real install can prove it: that ComfyUI's frontend
+actually fetches and imports the listed files at runtime, and that the tab
+appears in the sidebar.
+
+One trap, from reading the loader: do **not** add `web = "web"` under a
+`[tool.comfy]` section in `pyproject.toml`. `nodes.py:2264` would then also
+register the same directory under the *project* name
+(`comfyui-manga-autopilot`) alongside the *folder* name
+(`ComfyUI-Manga-Autopilot`), the frontend would import `index.js` twice under
+two URLs, and `app.registerExtension` would run twice for one extension.
+
+## jsonschema is missing from ComfyUI's environment (2026-08-28)
+
+`jsonschema` is the one runtime dependency ComfyUI does not ship. Its own
+`requirements.txt` declares `aiohttp`, `pyyaml`, `Pillow` and `pydantic`, and
+`importlib.util.find_spec` under `standalone-env\python.exe` confirms those
+four resolve and `jsonschema` does not.
+
+`services/llm_provider.py` imports `Draft202012Validator` at module scope, so
+under that interpreter:
+
+```
+from manga_autopilot.routes import register_all   -> OK
+register_all(app, storage_root=...)               -> ModuleNotFoundError: jsonschema
+```
+
+The import of `routes` succeeds; the failure happens inside `register_all`,
+where `routes/__init__.py:158` pulls in `autopilot_routes`. That is caught by
+`attach_routes_to_prompt_server`, which logs `Failed to register Manga
+Autopilot routes` and returns `False` - so it is not silent, but the sidebar
+tab still renders. The extension would look installed while every HTTP route
+was absent.
+
+The repository had no `requirements.txt`, which is the file ComfyUI and
+ComfyUI-Manager actually install; `pyproject.toml` is not read by either. Added
+in this session, with `tests/backend/test_comfyui_requirements.py` holding it
+to `[project].dependencies` and failing if a new module-scope third-party
+import in `src/` has no requirement behind it. Both tests were confirmed to
+fail when `jsonschema` is removed from the file.
+
+`docs/install.md` and `docs/install.ja.md` now say to install with ComfyUI's
+own interpreter and name the symptom to look for in the console.
 
 ## Review editor, verified in a browser (2026-08-28)
 
@@ -726,8 +820,11 @@ Granted by the user in the Claude Code session that implemented Tasks 4 and 5:
 
 ## Suggested first command in Claude Code
 
+The repository moved on 2026-08-27; this used to point at the deleted Codex
+sandbox.
+
 ```powershell
-Set-Location 'C:\Users\kouda\Documents\Codex\2026-08-26\new-chat\work\ComfyUI-Manga-Autopilot'
+Set-Location 'C:\Claude Code\comfyui-manga-autopilot'
 git status --short
 git log --oneline -4
 Get-Content -LiteralPath HANDOFF.md -Encoding utf8
