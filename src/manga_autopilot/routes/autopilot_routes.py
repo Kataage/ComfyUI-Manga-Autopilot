@@ -255,10 +255,15 @@ async def _run_anima_preflight(
 ) -> None:
     """Block a strict Anima run whose environment is not ready.
 
-    The check needs a live ``/object_info`` snapshot. When the application has no
-    ComfyUI client - the in-process test wiring and fake executors - there is
-    nothing to check against, so the gate logs and steps aside rather than
-    failing a run it cannot actually assess.
+    Only two of the eight checks need a live ``/object_info`` snapshot. When the
+    application has no ComfyUI client - a remote executor, a shared executor, or
+    the in-process test wiring - those two are held back and the other six still
+    run. Stepping aside entirely used to take the licence acknowledgement and the
+    remote-endpoint auth check down with them, which is exactly the kind of
+    silence strict mode exists to prevent.
+
+    A missing client is not by itself a failure: ``manga_remote_executor`` is a
+    supported deployment with no local ComfyUI to interrogate.
     """
     from manga_autopilot.services.generation_profiles import load_builtin_profile
     from manga_autopilot.services.preflight import (
@@ -268,31 +273,32 @@ async def _run_anima_preflight(
     )
 
     client = app.get("manga_comfy_client")
-    if client is None:
-        log.warning(
-            "skipping Anima preflight for %s: no ComfyUI client is configured",
-            run.run_id,
-        )
-        return
-
     registry = app.get("manga_workflow_registry")
-    if registry is None:
-        log.warning("skipping Anima preflight for %s: no workflow registry", run.run_id)
-        return
+
+    capabilities: ComfyCapabilities | None = None
+    workflow = None
+    if client is not None and registry is not None:
+        workflow = registry.get(workflow_id)
+        try:
+            object_info = await client.get_object_info()
+        except Exception as exc:  # noqa: BLE001 - re-raised with the cause named
+            # "FAILED_PANEL_GENERATION" on its own sends the reader hunting through
+            # prompts and workflows for a problem that is just a stopped server.
+            base_url = getattr(client, "base_url", "the configured endpoint")
+            raise RuntimeError(
+                f"ComfyUI at {base_url} is not reachable, so nothing can be generated: "
+                f"{type(exc).__name__}: {exc}"
+            ) from exc
+        capabilities = ComfyCapabilities.from_object_info(object_info)
+    else:
+        log.info(
+            "anima preflight for %s runs without /object_info: client=%s registry=%s",
+            run.run_id,
+            "set" if client is not None else "unset",
+            "set" if registry is not None else "unset",
+        )
 
     profile = load_builtin_profile(str(run.input["generation_profile_id"]))
-    workflow = registry.get(workflow_id)
-    try:
-        object_info = await client.get_object_info()
-    except Exception as exc:  # noqa: BLE001 - re-raised with the cause named
-        # "FAILED_PANEL_GENERATION" on its own sends the reader hunting through
-        # prompts and workflows for a problem that is just a stopped server.
-        base_url = getattr(client, "base_url", "the configured endpoint")
-        raise RuntimeError(
-            f"ComfyUI at {base_url} is not reachable, so nothing can be generated: "
-            f"{type(exc).__name__}: {exc}"
-        ) from exc
-    capabilities = ComfyCapabilities.from_object_info(object_info)
 
     request = PreflightRequest(
         profile=profile,
@@ -1245,6 +1251,40 @@ def _default_hooks_for_project(
     )
 
 
+def _seed_input_from_project(
+    storage_root: Path, project_id: str, input_payload: Mapping[str, Any]
+) -> dict[str, Any]:
+    """Fill the run input from the project's persisted settings.
+
+    ``docs/anima_mvp.md`` tells the user to select the profile and acknowledge
+    the licence with ``PATCH /projects/{id}``. Those land on the project, but
+    strict mode, the preflight and the licence check all read ``run.input``,
+    which was built from the start request body alone. A project configured
+    exactly as documented and started with no body therefore got the Anima
+    review gates - those read the project - while strict mode stayed off and
+    preflight never ran. The documented sentence "Preflight refuses to generate
+    until this is set" was not true.
+
+    The request body still wins, so an explicit start payload can override what
+    the project holds.
+    """
+    from manga_autopilot.services.project_manager import ProjectManager
+
+    try:
+        project = ProjectManager(storage_root).load(project_id)
+    except Exception as exc:  # noqa: BLE001 - a missing project is not fatal here
+        log.debug("could not read project settings for %s: %s", project_id, exc)
+        return dict(input_payload)
+
+    seeded: dict[str, Any] = {}
+    if project.generation_profile_id:
+        seeded["generation_profile_id"] = project.generation_profile_id
+    if project.license_acknowledged:
+        seeded["license_acknowledged"] = True
+    seeded.update(input_payload)
+    return seeded
+
+
 async def _payload(request: web.Request) -> dict[str, Any]:
     try:
         body = await request.json()
@@ -1273,6 +1313,7 @@ async def start(request: web.Request) -> web.Response:
         raise web.HTTPInternalServerError(text="manga_storage_root is not configured")
 
     ensure_project_paths(storage_root, project_id)
+    input_payload = _seed_input_from_project(storage_root, project_id, input_payload)
 
     ctrl = _controller(request.app)
     hooks = _default_hooks_for_project(request.app, project_id, storage_root)

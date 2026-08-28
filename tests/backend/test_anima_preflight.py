@@ -8,6 +8,7 @@ from manga_autopilot.models.generation_profile import ResolutionPolicy
 from manga_autopilot.models.workflow import WorkflowDefinition
 from manga_autopilot.services.generation_profiles import load_builtin_profile
 from manga_autopilot.services.preflight import (
+    CAPABILITIES_UNAVAILABLE,
     AnimaPreflight,
     ComfyCapabilities,
     PreflightError,
@@ -437,3 +438,71 @@ async def test_an_unreachable_comfyui_is_named_in_the_error(tmp_path: Path) -> N
         await _run_anima_preflight(
             app, run, project_root=tmp_path, workflow_id="anima_turbo"
         )
+
+
+# ------------------------------------------- running without a live ComfyUI
+
+
+def test_without_capabilities_the_other_six_checks_still_run(tmp_path: Path) -> None:
+    """A missing `/object_info` must not take the whole preflight down with it.
+
+    ``manga_remote_executor`` is a supported deployment with no local ComfyUI to
+    interrogate. Stepping aside entirely used to drop the licence and endpoint
+    checks too, which have nothing to do with `/object_info`.
+    """
+
+    report = AnimaPreflight(None).run(_request(tmp_path, workflow=None))
+
+    assert CAPABILITIES_UNAVAILABLE in report.codes()
+    assert report.ok, f"nothing should block a well-formed request: {report.issues}"
+    # The two capability checks are the only ones held back.
+    assert not any(code.startswith("model.") for code in report.codes())
+    assert not any(code.startswith("workflow.") for code in report.codes())
+
+
+def test_without_capabilities_the_licence_gate_still_blocks(tmp_path: Path) -> None:
+    """The licence check is the one this most needs to keep.
+
+    ``docs/anima_mvp.md`` promises "Preflight refuses to generate until this is
+    set". Before this, any run without a ComfyUI client skipped that promise.
+    """
+
+    report = AnimaPreflight(None).run(
+        _request(tmp_path, workflow=None, license_acknowledged=False)
+    )
+
+    assert "license.not_acknowledged" in report.codes()
+    assert not report.ok
+    with pytest.raises(PreflightError):
+        report.raise_if_blocked()
+
+
+def test_without_capabilities_a_remote_endpoint_without_auth_still_blocks(
+    tmp_path: Path,
+) -> None:
+    report = AnimaPreflight(None).run(
+        _request(
+            tmp_path,
+            workflow=None,
+            comfy_base_url="http://10.0.0.5:8188",
+            allow_remote_comfyui=True,
+            comfy_auth_configured=False,
+        )
+    )
+
+    assert "comfy.remote_without_auth" in report.codes()
+    assert not report.ok
+
+
+def test_a_workflow_without_capabilities_is_still_not_checked(tmp_path: Path) -> None:
+    """Both halves are needed; a workflow alone cannot be verified."""
+
+    report = AnimaPreflight(None).run(_request(tmp_path))
+
+    assert CAPABILITIES_UNAVAILABLE in report.codes()
+
+
+def test_capabilities_present_still_reports_no_unavailable_marker(tmp_path: Path) -> None:
+    report = _preflight().run(_request(tmp_path))
+
+    assert CAPABILITIES_UNAVAILABLE not in report.codes()

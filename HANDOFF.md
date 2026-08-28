@@ -590,10 +590,12 @@ and tuning.
 1. **29 commits are unpushed.** `origin/codex/anima-mvp` holds the first 14;
    everything after is local. Whether the rest goes to the remote, and whether
    this becomes a PR, is the user's call.
-2. **Preflight that cannot run.** The route's gate steps aside with a warning
-   when the application has no `manga_comfy_client` or `manga_workflow_registry`.
-   Whether a strict run should hard-fail instead is a product decision, left
-   open deliberately rather than settled quietly.
+2. ~~Preflight that cannot run.~~ **Settled 2026-08-28.** The question assumed
+   a binary that does not exist: only two of the eight checks need
+   `/object_info`. Preflight now runs the other six whatever the wiring, and a
+   missing client is not itself a failure - `manga_remote_executor` is a
+   supported deployment with no local ComfyUI to interrogate. See "Preflight,
+   and the settings that never reached it".
 
 ### Gap in coverage
 
@@ -628,6 +630,59 @@ and tuning.
    is not evaluated at all, and negation in the positive prompt renders the very
    thing it names. No scene-independent phrasing has been found; that needs
    experiments against real output.
+
+## Preflight, and the settings that never reached it (2026-08-28)
+
+The open question was "should a strict run hard-fail when preflight cannot
+run?" Reading the code first dissolved most of it, and turned up a defect the
+question was hiding.
+
+**Only two of the eight checks need a live server.** Classified from the AST of
+`AnimaPreflight`:
+
+| Check | Needs `/object_info` |
+|---|---|
+| `_check_endpoint`, `_check_license`, `_check_negative_prompt_reachability` | no |
+| `_check_resolution`, `_check_references`, `_check_output_dir` | no |
+| `_check_models`, `_check_workflow` | yes |
+
+The gate used to return early when `manga_comfy_client` was absent, which took
+the licence acknowledgement and the remote-endpoint auth check down with the two
+that genuinely could not run. `AnimaPreflight.capabilities` is now
+`ComfyCapabilities | None`; with `None` it runs the six and records
+`comfy.capabilities_unavailable` as a warning.
+
+Hard-failing on a missing client would have been wrong. `panel_routes._executor`
+resolves four executors in order, and only the fourth uses
+`manga_comfy_client` + `manga_workflow_registry`; `manga_remote_executor` (the
+Modal GPU bridge) is a documented deployment where there is no local ComfyUI.
+
+**The defect.** `docs/anima_mvp.md` tells the user to `PATCH /projects/{id}`
+with `generation_profile_id` and `license_acknowledged`, and states "Preflight
+refuses to generate until this is set". Both land on the project. But
+`_is_anima_run`, strict mode and the preflight all read `run.input`, and
+`run.input = dict(input_payload or {})` was built from the start request body
+alone. The review coordinator *does* read the project (`autopilot_routes.py`
+`_open_review_coordinator`), so a project configured exactly as documented and
+started with no body got the Anima review gates while strict mode stayed off and
+preflight never ran. The documented promise did not hold. Another instance of
+the pattern in "tested but unwired".
+
+`_seed_input_from_project` now fills the run input from the project's persisted
+settings before the run starts; an explicit start body still wins.
+
+The proof is that `test_anima_autopilot_e2e.py` needed no change. It already
+acknowledged the licence the documented way - `PATCH` on the project - and
+passed the profile in the start body. Once preflight stopped stepping aside, the
+run failed with `license.not_acknowledged`; once the seeding landed, it passed.
+Both fixes were confirmed to be load-bearing by reverting them: removing the
+seeding call fails that E2E test, and disabling the capability gate fails eight
+preflight tests.
+
+Not covered: nothing asserts the end-to-end path for a start with **no body at
+all**. `_seed_input_from_project` is unit-tested and the E2E covers a body that
+carries the profile, but the documented "configure the project, then start"
+sequence is not exercised as one flow.
 
 ## Loaded by ComfyUI, end to end (2026-08-28)
 

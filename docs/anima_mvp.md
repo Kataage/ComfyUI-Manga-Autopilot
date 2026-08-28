@@ -47,8 +47,13 @@ PATCH /manga_autopilot/api/projects/{project_id}
 {"license_acknowledged": true}
 ```
 
-Preflight refuses to generate until this is set. This project never accepts the
-licence on your behalf.
+Preflight refuses to generate until this is set - including when there is no
+local ComfyUI to interrogate. This project never accepts the licence on your
+behalf.
+
+The autopilot start request seeds its input from the project, so what you set
+here reaches the run without repeating it. A `POST .../autopilot/start` body
+still wins over the project when it names the same field.
 
 ### 3. Choose a profile
 
@@ -250,9 +255,26 @@ downloaded, loaded, or queued during the check.
 | `workflow.technical_field_unbound` | warning | The workflow does not bind `steps`/`cfg`/... so the profile cannot enforce them |
 | `resolution.aspect_clamped` | warning | A panel aspect had to be clamped |
 | `prompt.negative_inert_at_cfg1` | warning | The profile renders at CFG 1, where the negative prompt has no effect |
+| `comfy.capabilities_unavailable` | warning | No `/object_info` was available, so the model and workflow checks did not run |
 
 Set `comfyui.auth_token_env` in `config.yaml` to the **name** of an environment
 variable holding the token. The token itself is never stored in configuration.
+
+## Preflight without a live ComfyUI
+
+Six of preflight's eight checks never touch `/object_info`: the endpoint and its
+authentication, the licence acknowledgement, the CFG-1 negative prompt warning,
+the resolution policy, the character references, and the output directory. Only
+the model files and the workflow bindings need a live server.
+
+So a run with no ComfyUI client - `manga_remote_executor`, a shared executor, or
+the in-process test wiring - still gets those six. The report carries
+`comfy.capabilities_unavailable` as a warning to record that the other two could
+not run.
+
+A missing client is not itself a failure. `manga_remote_executor` is a supported
+deployment with no local ComfyUI to interrogate, and failing it would break a
+configuration that works.
 
 ## Choosing a planner
 

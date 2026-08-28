@@ -139,7 +139,7 @@ class PreflightRequest:
     """Everything preflight needs. No credential value is ever passed in."""
 
     profile: GenerationProfile
-    workflow: WorkflowDefinition
+    workflow: WorkflowDefinition | None
     output_dir: Path
     comfy_base_url: str = "http://127.0.0.1:8188"
     allow_remote_comfyui: bool = False
@@ -158,11 +158,23 @@ def is_loopback(base_url: str) -> bool:
     return host.startswith("127.")
 
 
+#: Emitted when the two checks that need a live `/object_info` could not run.
+CAPABILITIES_UNAVAILABLE = "comfy.capabilities_unavailable"
+
+
 @dataclass
 class AnimaPreflight:
-    """Run every strict-Anima readiness check against a capability snapshot."""
+    """Run every strict-Anima readiness check that this environment allows.
 
-    capabilities: ComfyCapabilities
+    `capabilities` is `None` when no ComfyUI client is wired up - a remote
+    executor, a shared executor, or the in-process test wiring. Six of the eight
+    checks never touch `/object_info`, so they still run; only the model and
+    workflow checks are held back, and the report says so rather than going
+    quiet. Silence would let the licence acknowledgement and the remote-auth
+    check disappear along with them.
+    """
+
+    capabilities: ComfyCapabilities | None
 
     def run(self, request: PreflightRequest) -> PreflightReport:
         """Return a report. This never raises for a failed check; call `raise_if_blocked`."""
@@ -170,8 +182,19 @@ class AnimaPreflight:
         issues.extend(self._check_endpoint(request))
         issues.extend(self._check_license(request))
         issues.extend(self._check_negative_prompt_reachability(request))
-        issues.extend(self._check_models(request))
-        issues.extend(self._check_workflow(request))
+        if self.capabilities is not None and request.workflow is not None:
+            issues.extend(self._check_models(request))
+            issues.extend(self._check_workflow(request))
+        else:
+            issues.append(
+                PreflightIssue(
+                    CAPABILITIES_UNAVAILABLE,
+                    "no ComfyUI /object_info snapshot is available, so the model "
+                    "files and the workflow bindings were not verified; every "
+                    "other check still ran",
+                    WARNING,
+                )
+            )
         issues.extend(self._check_resolution(request))
         issues.extend(self._check_references(request))
         issues.extend(self._check_output_dir(request))
@@ -429,6 +452,7 @@ __all__ = [
     "ERROR",
     "LORA_FIELDS",
     "TECHNICAL_BINDING_KEYS",
+    "CAPABILITIES_UNAVAILABLE",
     "TEXT_ENCODER_FIELDS",
     "UNET_FIELDS",
     "VAE_FIELDS",
