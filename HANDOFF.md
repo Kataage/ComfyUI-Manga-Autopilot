@@ -1,7 +1,7 @@
 # Claude Code handoff: Anima Manga Autopilot MVP
 
-Updated: 2026-08-28 JST (Claude Code; plan complete and proven end to end on
-hardware, ComfyUI load path traced statically)
+Updated: 2026-08-28 JST (Claude Code; plan complete, proven end to end on
+hardware, and now loaded by ComfyUI itself)
 
 ## Objective
 
@@ -596,16 +596,13 @@ and tuning.
 
 ### Gap in coverage
 
-3. **The extension has never been loaded by ComfyUI itself.** Narrowed on
-   2026-08-28 without installing anything: the loader, the static route, the
-   `/extensions` listing and the frontend's `registerSidebarTab` were traced
-   against the ComfyUI installed on this machine, and the package imports
-   cleanly under ComfyUI's own interpreter. See "ComfyUI load path, traced
-   against the installed ComfyUI". What remains unproven is only the runtime
-   half: that the frontend fetches and imports the files and the tab appears.
-   Confirming it means installing this checkout into ComfyUI's `custom_nodes`,
-   installing the dependencies with ComfyUI's interpreter, and restarting - a
-   change to the user's ComfyUI, so ask first.
+3. ~~The extension has never been loaded by ComfyUI itself.~~ **Closed
+   2026-08-28.** Installed into the running ComfyUI, restarted, and driven in
+   the browser down to a real HTTP round trip. See "Loaded by ComfyUI, end to
+   end". It found two defects, both fixed. What is still untested there is the
+   rest of the workspace - Page Editor, Character Manager, Progress and Export
+   Center were never opened against a real project, because that needs a
+   project to exist.
 
 ### Tuning, not repair
 
@@ -624,89 +621,111 @@ and tuning.
    thing it names. No scene-independent phrasing has been found; that needs
    experiments against real output.
 
-## ComfyUI load path, traced against the installed ComfyUI (2026-08-28)
+## Loaded by ComfyUI, end to end (2026-08-28)
 
-Nothing was installed and ComfyUI was not restarted. The checks below read the
-ComfyUI on this machine and ran this repository's `__init__.py` under
-*ComfyUI's own interpreter*, which is enough to settle most of the question
-that the "extension has never been loaded" gap was really asking.
+The coverage gap is closed. The extension was installed into the ComfyUI that
+actually runs on this machine, ComfyUI was restarted, and the whole chain was
+exercised in the browser.
 
-The installation, for whoever does the live test:
+**Two ComfyUI installations exist here; only one runs.** Getting this wrong
+wasted a cycle, so it is written down:
 
-- Install: `C:\Users\kouda\AppData\Local\Comfy-Desktop\ComfyUI-Installs\Koudai`
-- ComfyUI `0.30.2`, frontend package `comfyui_frontend_package 1.45.21`
-- Interpreter: `<install>\standalone-env\python.exe` (Python 3.13.12)
-- `custom_nodes` holds only the stock `example_node.py.example` and
-  `websocket_image_save.py`
-- Config: `%APPDATA%\Comfy Desktop\installations.json`; models, input and
-  output live under `...\Comfy-Desktop\ComfyUI-Shared`
+| | Running | Not running |
+|---|---|---|
+| Managed by | Stability Matrix | Comfy Desktop |
+| ComfyUI | `%LOCALAPPDATA%\Comfy-Desktop\Data\Packages\ComfyUI` (0.30.0) | `%LOCALAPPDATA%\Comfy-Desktop\ComfyUI-Installs\Koudai\ComfyUI` (0.30.2) |
+| Interpreter | `<pkg>\venv\Scripts\python.exe` (3.12.10) | `<install>\standalone-env\python.exe` (3.13.12) |
+| Frontend | `comfyui_frontend_package 1.47.11` | `1.45.21` |
+| `custom_nodes` | ~30 packs (`comfyui-custom-scripts`, `ComfyUI-Anima-Resolution`, ...) | stock only |
 
-What the trace establishes:
+The directory named `Comfy-Desktop\Data` is a *Stability Matrix* data root -
+it holds `StabilityMatrix.db`, `Packages`, `Assets`. `installations.json`
+under `%APPDATA%\Comfy Desktop` describes the **other**, idle installation.
+Identify the live one from the running process, not from config files:
 
-1. `nodes.py:2270` computes `os.path.abspath(os.path.join(module_dir,
-   WEB_DIRECTORY))`. Our `WEB_DIRECTORY` is absolute, which `os.path.join`
-   passes through unchanged, and the directory exists - so
-   `EXTENSION_WEB_DIRS[<folder name>]` gets set.
-2. `server.py:1243` mounts `web.static('/extensions/<folder name>', dir)` and
-   `server.py:356` lists **every** `.js` under that directory recursively. All
-   six files in `web/` are therefore imported by the frontend, not just
-   `index.js`. That is harmless here: only `index.js` has a module-scope side
-   effect (`app.registerExtension`), and the five mount modules resolve to the
-   same URLs `index.js` imports, so each is evaluated once.
-3. `NODE_CLASS_MAPPINGS` is an empty dict by design. `load_custom_node` tests
-   it for `is not None`, not truth, so the empty mapping still returns `True`.
-4. The frontend bundle has `extensionManager.registerSidebarTab`, and its
-   sidebar component supports `type: 'custom'` with `extension.render(el)` -
-   exactly the shape `web/index.js` registers.
-5. Running the repo-root `__init__.py` the way `load_custom_node` does, under
-   ComfyUI's own interpreter, imports cleanly: `IMPORT OK`, `WEB_DIRECTORY`
-   resolves, `isdir` is `True`.
-
-What the trace found broken (see the next section): route registration dies in
-that interpreter because `jsonschema` is not installed in it.
-
-Still unproven, and only a real install can prove it: that ComfyUI's frontend
-actually fetches and imports the listed files at runtime, and that the tab
-appears in the sidebar.
-
-One trap, from reading the loader: do **not** add `web = "web"` under a
-`[tool.comfy]` section in `pyproject.toml`. `nodes.py:2264` would then also
-register the same directory under the *project* name
-(`comfyui-manga-autopilot`) alongside the *folder* name
-(`ComfyUI-Manga-Autopilot`), the frontend would import `index.js` twice under
-two URLs, and `app.registerExtension` would run twice for one extension.
-
-## jsonschema is missing from ComfyUI's environment (2026-08-28)
-
-`jsonschema` is the one runtime dependency ComfyUI does not ship. Its own
-`requirements.txt` declares `aiohttp`, `pyyaml`, `Pillow` and `pydantic`, and
-`importlib.util.find_spec` under `standalone-env\python.exe` confirms those
-four resolve and `jsonschema` does not.
-
-`services/llm_provider.py` imports `Draft202012Validator` at module scope, so
-under that interpreter:
-
-```
-from manga_autopilot.routes import register_all   -> OK
-register_all(app, storage_root=...)               -> ModuleNotFoundError: jsonschema
+```powershell
+(Get-CimInstance Win32_Process -Filter "ProcessId=$((Get-NetTCPConnection -LocalPort 8188 -State Listen).OwningProcess)").CommandLine
 ```
 
-The import of `routes` succeeds; the failure happens inside `register_all`,
-where `routes/__init__.py:158` pulls in `autopilot_routes`. That is caught by
-`attach_routes_to_prompt_server`, which logs `Failed to register Manga
-Autopilot routes` and returns `False` - so it is not silent, but the sidebar
-tab still renders. The extension would look installed while every HTTP route
-was absent.
+Installed as a directory junction, so edits in this repository are live in
+ComfyUI without copying:
 
-The repository had no `requirements.txt`, which is the file ComfyUI and
-ComfyUI-Manager actually install; `pyproject.toml` is not read by either. Added
-in this session, with `tests/backend/test_comfyui_requirements.py` holding it
-to `[project].dependencies` and failing if a new module-scope third-party
-import in `src/` has no requirement behind it. Both tests were confirmed to
-fail when `jsonschema` is removed from the file.
+```
+mklink /J "<pkg>\ComfyUI\custom_nodes\ComfyUI-Manga-Autopilot" "C:\Claude Code\comfyui-manga-autopilot"
+```
 
-`docs/install.md` and `docs/install.ja.md` now say to install with ComfyUI's
-own interpreter and name the symptom to look for in the console.
+No dependency had to be added: `jsonschema`, `aiohttp`, `pydantic`, `yaml` and
+`PIL` all resolve in that venv (`jsonschema` arrives via one of the other node
+packs). Restarted with `POST /api/v2/manager/reboot` after confirming the queue
+was `0/0`; it came back in well under a minute.
+
+What the running instance shows:
+
+- `GET /manga_autopilot/api/health` -> `{"ok": true, "service":
+  "manga_autopilot", "version": "0.1.0-rc1"}`
+- `GET /api/extensions` lists all six files under
+  `/extensions/ComfyUI-Manga-Autopilot/` - ComfyUI globs the web directory
+  recursively, so every `.js` is imported, not just `index.js`. Harmless here:
+  only `index.js` has a module-scope side effect, and the five mount modules
+  resolve to the URLs `index.js` already imports.
+- `app.extensionManager.sidebarTab.sidebarTabs` contains `manga-autopilot`
+  beside the five core tabs; its `type` is `custom` and its title is
+  `Manga Autopilot`.
+- Opening it mounts `.manga-autopilot-root` with all six views.
+- Setting a project id and opening Reviews issues
+  `GET /manga_autopilot/api/projects/smoke-check-nonexistent/reviews` -> 404
+  and renders `Could not load reviews: unknown project: ...`, which is the
+  backend's own message. Frontend, routes and backend are wired together
+  inside ComfyUI.
+
+Two defects only this could find, both fixed in `3ad0d94`: the Projects tab was
+unreachable behind its own guard, and the workspace was ~448px wide inside a
+312px panel that clips on the x axis, leaving the left edge cut off. After the
+fix the root sits at x=59 with `scrollWidth` 312 and every control lies inside
+the panel.
+
+Two notes for whoever drives this pane next:
+
+- Synthetic clicks do not land. A PrimeVue overlay (`p-blockui-mask`) is stuck
+  with both `-enter` and `-leave` classes because a pane that is not displayed
+  never composites, so the transition never ends. Drive the DOM directly
+  (`element.click()`), or display the pane. This is an artifact of the
+  automation surface, not of ComfyUI.
+- Do not send keystrokes to the canvas. With no field focused they are
+  ComfyUI shortcuts.
+
+The extension is still installed. Remove it with
+`rmdir "<pkg>\ComfyUI\custom_nodes\ComfyUI-Manga-Autopilot"` (a junction -
+`rmdir` removes the link, never the target) and restart.
+
+## requirements.txt, and what ComfyUI actually installs (2026-08-28)
+
+ComfyUI and ComfyUI-Manager install a node pack with its `requirements.txt`;
+neither reads `pyproject.toml`. This repository had no `requirements.txt`, so a
+ComfyUI without `jsonschema` would import the package fine and then fail inside
+`register_all` - `routes/__init__.py:158` pulls in `autopilot_routes`, which
+imports `Draft202012Validator` at module scope.
+`attach_routes_to_prompt_server` catches that, logs `Failed to register Manga
+Autopilot routes` and returns `False`, so it is not silent - but the sidebar
+tab still renders, and the extension would look installed with no HTTP API.
+
+ComfyUI's own `requirements.txt` declares `aiohttp`, `pyyaml`, `Pillow` and
+`pydantic`, and not `jsonschema`. The venv here happens to have it, so this
+machine would not have hit the failure; a clean ComfyUI would.
+
+Added in `e6b408b` with `tests/backend/test_comfyui_requirements.py`, which
+holds the file to `[project].dependencies` and fails if a module-scope
+third-party import in `src/` has no requirement behind it. Both tests were
+confirmed to fail with `jsonschema` removed from the file. `docs/install.md`
+and `docs/install.ja.md` now say to install with ComfyUI's own interpreter and
+name the symptom.
+
+One trap, from reading `nodes.py`: do **not** add `web = "web"` under a
+`[tool.comfy]` section in `pyproject.toml`. `nodes.py:2264` would then register
+the same directory under the *project* name (`comfyui-manga-autopilot`)
+alongside the *folder* name (`ComfyUI-Manga-Autopilot`), the frontend would
+import `index.js` twice under two URLs, and `app.registerExtension` would run
+twice for one extension.
 
 ## Review editor, verified in a browser (2026-08-28)
 
@@ -765,8 +784,10 @@ For deterministic resolution tests, the accepted expectations are:
 Read-only checks from 2026-08-26:
 
 - ComfyUI endpoint: `http://127.0.0.1:8188`
-- ComfyUI version: `0.30.0`
-- Python: `3.12.10`
+- ComfyUI version: `0.30.0` - this is the Stability Matrix package at
+  `%LOCALAPPDATA%\Comfy-Desktop\Data\Packages\ComfyUI`, not the idle Comfy
+  Desktop install; see "Loaded by ComfyUI, end to end"
+- Python: `3.12.10` (`<pkg>\venv\Scripts\python.exe`)
 - PyTorch: `2.13.0+cu130`
 - GPU: RTX 5070 Ti
 - Queue was `0/0`
