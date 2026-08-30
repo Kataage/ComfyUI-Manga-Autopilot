@@ -24,7 +24,38 @@ then "What is not done". Nothing else in this file is needed to pick up work.
 
 ## Start of the next session
 
-State as of 2026-08-30:
+State as of 2026-08-30, each line checked in the session that wrote it:
+
+- Branch `codex/anima-mvp` tracks `fork/codex/anima-mvp` and is **5 commits ahead,
+  unpushed**. `git rev-list --count fork/codex/anima-mvp..HEAD` gives the live count.
+- `1121 passed, 15 skipped`; `ruff check .` clean; `git diff --check` clean;
+  working tree clean.
+- No `TODO`/`FIXME` in `src/` or `web/`.
+- PR https://github.com/Kataage/ComfyUI-Manga-Autopilot/pull/219 is open against
+  upstream `main` and does **not** yet include those 5 commits.
+
+Verify it still holds before changing anything:
+
+```powershell
+cd 'C:\Claude Code\comfyui-manga-autopilot'
+git status --short
+git rev-list --count fork/codex/anima-mvp..HEAD
+$env:TEMP='<a temp dir you can write to>'; $env:TMP=$env:TEMP
+.\.venv\Scripts\python.exe -m pytest tests/backend -q -p no:cacheprovider
+.\.venv\Scripts\python.exe -m ruff check .
+```
+
+The `.venv` works at this path; do not move it. Point `TEMP`/`TMP` at a
+directory the running agent can write to, or `tmp_path` fixtures fail with
+`PermissionError`.
+
+Live runs need ComfyUI on `127.0.0.1:8188` and LM Studio on `127.0.0.1:1234`.
+There are two ComfyUI installs on this machine; the running one is the Stability
+Matrix build. Check `lms ps --json` first: if a model the user loaded is resident,
+leave it alone and wait rather than evicting it.
+
+Then read "What is not done". The dated "Session boundary" entries below are
+history - useful for why something was done, not needed to resume.
 
 ## Session boundary (2026-08-30)
 
@@ -35,9 +66,10 @@ instance, found by actually running it." below); both fixed, committed, and
 confirmed by a third run that completed end to end - see "Third live run:
 completed end to end (2026-08-30)".
 
-The branch is now 4 commits ahead of `fork/codex/anima-mvp`
-(`git rev-list --count fork/codex/anima-mvp..HEAD`), not yet pushed:
-2 fixes (`2fcfc52`, `0d7848c`) and 2 docs commits recording them. Local
+The branch moved ahead of `fork/codex/anima-mvp` without being pushed:
+2 fixes (`2fcfc52`, `0d7848c`) and the docs commits recording them. See
+"Start of the next session" for the current count rather than trusting a
+number written here. Local
 suite and `ruff check .` both green after each (see those sections for
 counts). Whether/when to push and update PR #219 is the user's call, per
 the standing approvals below.
@@ -62,29 +94,6 @@ included yet). `koudai715-code` has only `READ` on
   the 2026-08-27 rescue, and the stale tracking ref survived the change.
   `git remote prune origin` removed it. Never conclude what a remote holds
   from a fetched ref; ask the remote.
-- `1094 passed, 15 skipped`; `ruff check .` clean; `git diff --check` clean.
-- No `TODO`/`FIXME` in `src/` or `web/`.
-
-Verify it still holds before changing anything:
-
-```powershell
-cd 'C:\Claude Code\comfyui-manga-autopilot'
-git status --short
-$env:TEMP='<a temp dir you can write to>'; $env:TMP=$env:TEMP
-.\.venv\Scripts\python.exe -m pytest tests/backend -q -p no:cacheprovider
-.\.venv\Scripts\python.exe -m ruff check .
-```
-
-The `.venv` works at this path; do not move it. Point `TEMP`/`TMP` at a
-directory the running agent can write to, or `tmp_path` fixtures fail with
-`PermissionError`.
-
-Live runs need ComfyUI on `127.0.0.1:8188` and LM Studio on `127.0.0.1:1234`.
-Check `lms ps --json` first: if a model the user loaded is resident, leave it
-alone and wait rather than evicting it. The reusable live-run harness is not in
-the repository - it lived in the session scratchpad - so a new session that
-wants one will need to write it again from the recipe in "Full live run".
-
 ## Repository and Git state
 
 - Repository: `C:\Claude Code\comfyui-manga-autopilot` (relocated from the Codex sandbox on 2026-08-27; the `.venv` works at the new path)
