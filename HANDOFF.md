@@ -25,7 +25,12 @@ then "What is not done". Nothing else in this file is needed to pick up work.
 
 State as of 2026-08-28:
 
-- **Pushed to a fork, PR open.** `koudai715-code` has only `READ` on
+## Session boundary (2026-08-29 09:xx)
+
+Stopped before running the live test. All preparation is done; execution is the
+next step.
+
+**Pushed to a fork, PR open.** `koudai715-code` has only `READ` on
   `Kataage/ComfyUI-Manga-Autopilot`, so the branch lives on the fork
   `koudai715-code/ComfyUI-Manga-Autopilot` (remote `fork`, which the branch
   now tracks) and
@@ -838,6 +843,53 @@ an `aria-label` carrying both, and pinned by a test.
 The harness was a scratchpad page importing the module over a local static
 server, with `fetchImpl` stubbed - no ComfyUI, no backend, no GPU. Rebuilding it
 takes a few minutes and touches nothing in the repository.
+
+## `config.yaml` had no effect in a live ComfyUI install (2026-08-30)
+
+Preparing to resume the live test from the session boundary above, before
+touching the GPU: `_llm_provider` (`autopilot_routes.py`) reads
+`app["manga_llm_provider"]`, falling back to `app["manga_llm_settings"]`, and
+only then to `ManualProvider` - a no-op that returns `"{}"` for every
+planning call. `attach_routes_to_prompt_server` (`comfy_integration.py`),
+the only code path that runs inside a real ComfyUI, never set either key.
+`config.py`'s `load_config`/`discover_config_path` had no caller anywhere in
+`src/` outside their own module - another instance of "a component with
+tests is not a component in use" (see "Every defect this exposed" above).
+
+Contrast with `workflow_routes._comfy_client`: that one lazily builds a real
+`ComfyClient` pointed at `127.0.0.1:8188` the first time it's needed. Nothing
+equivalent existed for the LLM side, and no HTTP route could set it either -
+grepping every test file was the only way `app["manga_llm_provider"]` was
+ever assigned outside test fixtures.
+
+This means the two-page live run recorded above ("Full live run, and what it
+cost to get there") did not get its real LLM provider from anything in this
+repository. Whatever set it up lived in the session's scratchpad harness,
+never committed.
+
+**Fixed**: `comfy_integration.py` now builds a real provider from
+`config.yaml` (discovered next to the extension's own root, or
+`$MANGA_AUTOPILOT_CONFIG_PATH`) once at startup, bridging `config.py`'s
+`LLMSettings` (`provider`/`endpoint`/`model`, the `config.yaml` schema) to
+`services.llm_provider.LLMSettings` (`type`/`endpoint`/`model`, what
+`build_provider` actually consumes) - two separate models that nothing
+connected before. `lm_studio` is accepted as a friendlier alias for the
+generic `openai_compatible` type. With no `config.yaml` at all, the result is
+still `config.py`'s own documented default (Ollama at `127.0.0.1:11434`)
+rather than the silent no-op - a real attempt at what was already promised,
+not a new default. An existing `app["manga_llm_provider"]` (tests, or a
+future caller) is left untouched; a failure to build one is logged and never
+fatal, matching `attach_routes_to_prompt_server`'s existing contract.
+
+Six tests pin this in `test_comfyui_integration.py`: the Ollama default with
+no config, an `openai_compatible` config, the `lm_studio` alias, the
+`$MANGA_AUTOPILOT_CONFIG_PATH` override, that `attach_routes_to_prompt_server`
+now always leaves a real provider behind, and that it never clobbers one
+that was already set.
+
+A local, untracked `config.yaml` (now covered by `.gitignore`) points this
+machine's live ComfyUI at whatever LM Studio has loaded, for today's live
+test.
 
 ## Verified Anima configuration evidence
 
