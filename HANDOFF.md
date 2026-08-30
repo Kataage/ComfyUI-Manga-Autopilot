@@ -891,6 +891,21 @@ A local, untracked `config.yaml` (now covered by `.gitignore`) points this
 machine's live ComfyUI at whatever LM Studio has loaded, for today's live
 test.
 
+**A second instance, found by actually running it.** After that fix and a
+ComfyUI restart, a real two-page run planned successfully end to end
+(story, four characters, both pages, all seven panels) in under three
+minutes using the real LM Studio model - faster than any prior planner
+measurement, because `gemma4-12b-qat-uncensored-hauhaucs-balanced` produced
+no discarded reasoning. It then failed instantly at `generate_panels` with
+`HTTPServiceUnavailable`. Cause: `panel_routes._executor` requires
+`app["manga_comfy_client"]` to already exist and has no lazy default,
+unlike `workflow_routes._comfy_client`, and registering a workflow (the only
+setup step this session's harness had run) never touches that key - only
+`workflow_routes.test_run_workflow` does. Fixed the same way: build a real
+`ComfyClient` from `config.yaml`'s `comfyui:` section (or its documented
+`127.0.0.1:8188` default) once at startup, mirroring the LLM fix. Four more
+tests in `test_comfyui_integration.py`.
+
 ## Verified Anima configuration evidence
 
 The read-only local workflow was checked on 2026-08-26:
