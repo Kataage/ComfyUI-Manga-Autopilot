@@ -8,6 +8,7 @@ import pytest
 from aiohttp import web
 
 from manga_autopilot.comfy_integration import (
+    _build_comfy_client,
     _build_llm_provider,
     _default_config_path,
     _resolve_app_and_routes,
@@ -254,6 +255,64 @@ def test_attach_routes_wires_a_real_llm_provider(monkeypatch):
 
     assert attach_routes_to_prompt_server() is True
     assert isinstance(server.app["manga_llm_provider"], LLMProvider)
+
+
+def test_build_comfy_client_defaults_to_local_comfyui(tmp_path: Path):
+    from manga_autopilot.services.comfy_client import ComfyClient
+
+    client = _build_comfy_client(tmp_path / "does-not-exist.yaml")
+    assert isinstance(client, ComfyClient)
+    assert client.base_url == "http://127.0.0.1:8188"
+
+
+def test_build_comfy_client_reads_config(tmp_path: Path):
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        """
+comfyui:
+  base_url: http://192.168.1.20:8188
+  timeout_sec: 120
+"""
+    )
+    client = _build_comfy_client(config_path)
+    assert client.base_url == "http://192.168.1.20:8188"
+    assert client.timeout_sec == 120
+
+
+def test_attach_routes_wires_a_real_comfy_client(monkeypatch):
+    """Without this, a run reaches ``generate_panels`` and fails with
+    ``HTTPServiceUnavailable`` - observed live on 2026-08-30 (see
+    HANDOFF.md), because ``panel_routes._executor`` has no lazy default of
+    its own the way ``workflow_routes._comfy_client`` does."""
+
+    import sys
+    import types
+
+    from manga_autopilot.services.comfy_client import ComfyClient
+
+    server = _FakePromptServer()
+    fake_mod = types.ModuleType("server")
+    fake_mod.PromptServer = type("PromptServer", (), {"instance": server})
+    monkeypatch.setitem(sys.modules, "server", fake_mod)
+    monkeypatch.delenv("MANGA_AUTOPILOT_CONFIG_PATH", raising=False)
+
+    assert attach_routes_to_prompt_server() is True
+    assert isinstance(server.app["manga_comfy_client"], ComfyClient)
+
+
+def test_attach_routes_does_not_override_an_existing_comfy_client(monkeypatch):
+    import sys
+    import types
+
+    server = _FakePromptServer()
+    sentinel = object()
+    server.app["manga_comfy_client"] = sentinel
+    fake_mod = types.ModuleType("server")
+    fake_mod.PromptServer = type("PromptServer", (), {"instance": server})
+    monkeypatch.setitem(sys.modules, "server", fake_mod)
+
+    assert attach_routes_to_prompt_server() is True
+    assert server.app["manga_comfy_client"] is sentinel
 
 
 def test_attach_routes_does_not_override_an_existing_provider(monkeypatch):

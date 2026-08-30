@@ -109,6 +109,25 @@ def _build_llm_provider(config_path: Path | None):
     return build_provider(settings)
 
 
+def _build_comfy_client(config_path: Path | None):
+    """Build the ComfyUI client ``config.yaml``'s ``comfyui:`` section describes.
+
+    ``panel_routes._executor`` requires ``app["manga_comfy_client"]`` to
+    already be set - unlike ``workflow_routes._comfy_client``, it has no
+    lazy default of its own, so with nothing wired here a run reaches
+    ``generate_panels`` and fails with ``HTTPServiceUnavailable`` (observed
+    live on 2026-08-30, see HANDOFF.md). ``load_config(None)``'s default
+    (``http://127.0.0.1:8188``, matching ``workflow_routes``'s own
+    ``DEFAULT_COMFY_BASE_URL``) keeps this a no-op for the common case.
+    """
+
+    from manga_autopilot.config import load_config
+    from manga_autopilot.services.comfy_client import ComfyClient
+
+    cfg = load_config(config_path)
+    return ComfyClient(base_url=cfg.comfyui.base_url, timeout_sec=cfg.comfyui.timeout_sec)
+
+
 def attach_routes_to_prompt_server() -> bool:
     """Attach Manga Autopilot routes + context to ComfyUI's PromptServer.
 
@@ -158,6 +177,17 @@ def attach_routes_to_prompt_server() -> bool:
         except Exception:  # pragma: no cover - keep startup non-fatal
             log.exception("Failed to build LLM provider from config.yaml; "
                           "planning calls will use the manual no-op provider.")
+
+    if app is not None and app.get("manga_comfy_client") is None:
+        # Mirrors the LLM wiring above: without this, panel generation fails
+        # with HTTPServiceUnavailable the moment a run reaches it, because
+        # panel_routes._executor (unlike workflow_routes._comfy_client) has
+        # no lazy default of its own.
+        try:
+            app["manga_comfy_client"] = _build_comfy_client(_default_config_path())
+        except Exception:  # pragma: no cover - keep startup non-fatal
+            log.exception("Failed to build ComfyUI client from config.yaml; "
+                          "panel generation will fail until one is configured.")
 
     log.info(
         "Manga Autopilot routes attached to PromptServer (storage_root=%s).",
