@@ -1,7 +1,8 @@
 # Claude Code handoff: Anima Manga Autopilot MVP
 
-Updated: 2026-08-28 JST (Claude Code; plan complete, proven end to end on
-hardware, and now loaded by ComfyUI itself)
+Updated: 2026-08-30 JST (Claude Code; plan complete, proven end to end on
+hardware including a real LM Studio planner and real ComfyUI rendering
+inside a live install, not just the in-process test wiring)
 
 ## Objective
 
@@ -23,14 +24,30 @@ then "What is not done". Nothing else in this file is needed to pick up work.
 
 ## Start of the next session
 
-State as of 2026-08-28:
+State as of 2026-08-30:
+
+## Session boundary (2026-08-30)
+
+Resumed exactly where 2026-08-29 stopped ("before running the live test") and
+ran it. It failed twice on infrastructure that turned out to have never been
+wired for a live install (see "`config.yaml` had no effect..." and "A second
+instance, found by actually running it." below); both fixed, committed, and
+confirmed by a third run that completed end to end - see "Third live run:
+completed end to end (2026-08-30)".
+
+The branch is now 4 commits ahead of `fork/codex/anima-mvp`
+(`git rev-list --count fork/codex/anima-mvp..HEAD`), not yet pushed:
+2 fixes (`2fcfc52`, `0d7848c`) and 2 docs commits recording them. Local
+suite and `ruff check .` both green after each (see those sections for
+counts). Whether/when to push and update PR #219 is the user's call, per
+the standing approvals below.
 
 ## Session boundary (2026-08-29 09:xx)
 
-Stopped before running the live test. All preparation is done; execution is the
-next step.
+Stopped before running the live test - superseded by the entry above.
 
-**Pushed to a fork, PR open.** `koudai715-code` has only `READ` on
+**Pushed to a fork, PR open** (as of 2026-08-29; the 4 commits above are not
+included yet). `koudai715-code` has only `READ` on
   `Kataage/ComfyUI-Manga-Autopilot`, so the branch lives on the fork
   `koudai715-code/ComfyUI-Manga-Autopilot` (remote `fork`, which the branch
   now tracks) and
@@ -905,6 +922,51 @@ setup step this session's harness had run) never touches that key - only
 `ComfyClient` from `config.yaml`'s `comfyui:` section (or its documented
 `127.0.0.1:8188` default) once at startup, mirroring the LLM fix. Four more
 tests in `test_comfyui_integration.py`.
+
+## Third live run: completed end to end (2026-08-30)
+
+With both wiring fixes above in place and ComfyUI restarted, a two-page
+`anima_turbo` run completed in full: `story -> characters -> pages -> 7
+panels -> COMPLETED` in 3m28s (01:43:29 - 01:46:57 UTC), producing two page
+PNGs, a webtoon strip, and `manga.pdf` under the project's `exports/`, plus a
+`snapshot.json` recording all seven prompts, seeds, and the real planner
+cost (12 calls, 382s, 75.3% of generated text was discarded reasoning -
+`gemma4-12b-qat-uncensored-hauhaucs-balanced` still reasons some, just far
+less than the models measured earlier). No credentials in the snapshot,
+matching the documented guarantee.
+
+Two harness mistakes on the way there, neither a code defect:
+
+- The monitoring loop read `run.get("status")`; the API returns `state`.
+  With the wrong key it never noticed a run had already finished (twice),
+  and sat polling until its own timeout. Fixed in the scratchpad script,
+  not the repository - this was a bug in the throwaway harness, not
+  `routes.autopilot_routes`.
+- The start body needs an explicit `"workflow_id": "anima_turbo"`; omitting
+  it falls through to the generic `"anime_t2i_default"` placeholder
+  (`autopilot_routes._default_workflow_id`), which no registered workflow
+  answers to. `docs/anima_mvp.md` names the registry payload but never
+  says the start body must repeat its `workflow_id` - worth a line there
+  for whoever runs this next, though it did not block today's run once
+  understood.
+
+One earlier attempt (this session, before the workflow_id fix) also failed
+at `plan_pages` with `ValueError: layout 'layout_1' is not registered` -
+the planner inventing a layout id outside the registered catalog. Strict
+validation rejected it correctly (matches "Strict planning rejects an
+unregistered layout id" in `docs/anima_mvp.md`); the retry planned valid
+ids without any code change, so this reads as planner-output variance with
+this specific model, not a reproducible defect. Worth watching if it
+recurs.
+
+One a loose end from `completion_report`: `panels_total: 0, panels_passed:
+0` despite seven real rendered panels and two exported pages - a reporting
+field that never got the count, not a run that generated nothing.
+Unverified whether this predates today; not investigated further, kept
+here so it isn't mistaken for a fresh regression.
+
+The extension is still installed as a junction and `config.yaml` (gitignored,
+local to this machine) still points at whatever LM Studio has loaded.
 
 ## Verified Anima configuration evidence
 
