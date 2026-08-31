@@ -83,15 +83,15 @@ def test_webtoon_scene_break_adds_margin() -> None:
     assert with_break.height > plain.height
 
 
-def test_webtoon_slicer_no_op_when_under_max() -> None:
+def test_webtoon_slicer_no_op_when_under_max(tmp_path: Path) -> None:
     img = Image.new("RGB", (200, 1000), (255, 255, 255))
-    out = WebtoonSlicer(max_height=2000).slice(img, output_dir=Path("/tmp"))
+    out = WebtoonSlicer(max_height=2000).slice(img, output_dir=tmp_path)
     assert len(out) == 1
 
 
-def test_webtoon_slicer_splits() -> None:
+def test_webtoon_slicer_splits(tmp_path: Path) -> None:
     img = Image.new("RGB", (200, 5000), (255, 255, 255))
-    out = WebtoonSlicer(max_height=2000, output_prefix="x").slice(img, output_dir=Path("/tmp"))
+    out = WebtoonSlicer(max_height=2000, output_prefix="x").slice(img, output_dir=tmp_path)
     assert len(out) == 3
     for p in out:
         assert p.name.startswith("x_")

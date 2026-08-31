@@ -1,6 +1,6 @@
 # Claude Code handoff: Anima Manga Autopilot MVP
 
-Updated: 2026-08-30 JST (Claude Code; plan complete, proven end to end on
+Updated: 2026-08-31 JST (Codex; plan complete, proven end to end on
 hardware including a real LM Studio planner and real ComfyUI rendering
 inside a live install, not just the in-process test wiring)
 
@@ -24,15 +24,17 @@ then "What is not done". Nothing else in this file is needed to pick up work.
 
 ## Start of the next session
 
-State as of 2026-08-30, each line checked in the session that wrote it:
+Current state, rechecked on 2026-08-31:
 
-- Branch `codex/anima-mvp` tracks `fork/codex/anima-mvp` and is **5 commits ahead,
-  unpushed**. `git rev-list --count fork/codex/anima-mvp..HEAD` gives the live count.
-- `1121 passed, 15 skipped`; `ruff check .` clean; `git diff --check` clean;
-  working tree clean.
+- Branch `codex/anima-mvp` tracks `fork/codex/anima-mvp`. Confirm whether it is
+  ahead or behind with `git rev-list --left-right --count fork/codex/anima-mvp...HEAD`.
+- `1121 passed, 15 skipped`; `ruff check .` clean; `git diff --check` clean.
+- The Windows test-portability correction described in the 2026-08-31 session
+  boundary uses pytest's `tmp_path` instead of hard-coded POSIX `/tmp`.
 - No `TODO`/`FIXME` in `src/` or `web/`.
 - PR https://github.com/Kataage/ComfyUI-Manga-Autopilot/pull/219 is open against
-  upstream `main` and does **not** yet include those 5 commits.
+  upstream `main`; compare its fork branch with `fork/codex/anima-mvp` before
+  assuming its commit set.
 
 Verify it still holds before changing anything:
 
@@ -56,6 +58,23 @@ leave it alone and wait rather than evicting it.
 
 Then read "What is not done". The dated "Session boundary" entries below are
 history - useful for why something was done, not needed to resume.
+
+## Session boundary (2026-08-31)
+
+- **Worker / purpose:** Codex resumed the Task 4/MVP status check and ran the
+  non-GPU backend regression suite.
+- **Changed file:** `tests/backend/test_export.py`. Its two `WebtoonSlicer`
+  tests no longer hard-code POSIX `/tmp`; they use pytest's isolated `tmp_path`
+  fixture. On Windows, `/tmp` resolves to `C:\tmp` and caused a sandbox-host
+  `PermissionError`, unrelated to the slicer implementation.
+- **Validation:** focused export suite `22 passed`; backend suite `1121 passed,
+  15 skipped` in 78.36s; `ruff check .` passed; `git diff --check` passed.
+- **Unresolved scope:** the only skipped checks are opt-in real ComfyUI, Modal,
+  and S3/R2 E2E. Do not run them, load a model, or use GPU/external services
+  without fresh explicit approval.
+- **Git:** this correction is intentionally uncommitted; no commit or push was
+  requested. The next safe action is a diff review, then request commit/push
+  direction separately if the user wants to publish it.
 
 ## Session boundary (2026-08-30)
 
