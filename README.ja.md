@@ -477,6 +477,23 @@ Modal GPU ワーカーの運用安全保障：
 | `MANGA_AUTOPILOT_MODAL_MAX_CONCURRENT_JOBS` | `1` | 最大同時ジョブ数 |
 | `MANGA_AUTOPILOT_MODAL_REJECT_WHEN_BUSY` | `true` | 満杯時にリジェクト |
 
+## Anima MVP（strict モード）
+
+`generation_profile_id` が `anima_` で始まるプロジェクトは strict モードで動作します。
+技術パラメータ（steps / CFG / sampler / scheduler / 解像度）はすべて生成プロファイルが
+所有し、プロンプトは LLM 呼び出しなしで決定論的に生成されます。4 つのレビューゲートが
+実行を止め、Storyboard ゲートが承認されるまで画像は 1 枚もキューに入りません。
+それ以外のプロジェクトの挙動は従来どおりです。
+
+- 同梱プロファイルは `anima_base` / `anima_aesthetic` / `anima_turbo` の 3 種類
+- モデル重みと LoRA は同梱も自動ダウンロードもしません。各自でインストールし、
+  CircleStone Labs 非商用ライセンスに同意してください
+- `examples/workflows/anima_turbo.registry.json` はそのまま登録できる
+  1 コマ分の API 形式ワークフローです
+
+セットアップ・解像度ポリシー・レビュー API・無効化ルール・スナップショット・
+preflight コードは [`docs/anima_mvp.md`](docs/anima_mvp.md) を参照してください。
+
 ## ドキュメント
 
 - [`CHANGELOG.md`](CHANGELOG.md) — リリース履歴
@@ -485,6 +502,8 @@ Modal GPU ワーカーの運用安全保障：
 - [`docs/release/v1_release_checklist.md`](docs/release/v1_release_checklist.md) —
   リリース前チェックリスト
 - [`docs/quickstart.ja.md`](docs/quickstart.ja.md) - 最短手順
+- [`docs/anima_mvp.md`](docs/anima_mvp.md) - Anima strict モード: プロファイル、
+  レビューゲート、無効化、スナップショット、preflight
 - [`docs/install.ja.md`](docs/install.ja.md) - インストール
 - [`docs/workflow_binding.ja.md`](docs/workflow_binding.ja.md) - ワークフロー登録
 - [`docs/character_consistency.ja.md`](docs/character_consistency.ja.md) -

@@ -61,3 +61,7 @@ user_data/
 # Env
 .env
 .env.local
+
+# Local machine-specific overrides (LLM endpoint, model, etc.)
+/config.yaml
+/config.yml

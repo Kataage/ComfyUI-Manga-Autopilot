@@ -563,3 +563,33 @@ async def test_run_json_contains_artifact_summary(
     assert run_json["artifacts"]["generation_log.json"] is not None
     assert run_json["artifacts"]["manifest.json"] is not None
     assert run_json["artifacts"]["panels.json"] is not None
+
+
+# ------------------------------------------------- run snapshot (issue: Task 5)
+def test_run_snapshot_appears_in_the_artifact_summary(tmp_path: Path) -> None:
+    run_dir = tmp_path / "runs" / "run-x"
+    run_dir.mkdir(parents=True)
+    (run_dir / "snapshot.json").write_text("{}", encoding="utf-8")
+
+    summary = read_run_artifacts_summary(tmp_path, "run-x")
+
+    assert summary["snapshot.json"] == "runs/run-x/snapshot.json"
+
+
+def test_missing_run_snapshot_is_reported_as_none(tmp_path: Path) -> None:
+    (tmp_path / "runs" / "run-x").mkdir(parents=True)
+
+    assert read_run_artifacts_summary(tmp_path, "run-x")["snapshot.json"] is None
+
+
+def test_mirroring_preserves_an_existing_run_snapshot(tmp_path: Path) -> None:
+    run_dir = tmp_path / "runs" / "run-x"
+    run_dir.mkdir(parents=True)
+    (run_dir / "snapshot.json").write_text('{"run_id": "run-x"}', encoding="utf-8")
+    (tmp_path / "manifest.json").write_text("{}", encoding="utf-8")
+
+    mirror_latest_artifacts_to_run(tmp_path, "run-x")
+
+    assert json.loads((run_dir / "snapshot.json").read_text(encoding="utf-8")) == {
+        "run_id": "run-x"
+    }

@@ -17,7 +17,7 @@ import zipfile
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
-from typing import Literal
+from typing import ClassVar, Literal
 
 from PIL import Image
 
@@ -226,11 +226,29 @@ class PDFRenderer:
 # --------------------------------------------------------- Bundler
 @dataclass
 class ProjectBundler:
-    """Zip a project directory (spec 9.1 export)."""
+    """Zip a project directory (spec 9.1 export).
+
+    Two shapes are supported. A **backup** bundle (the default) carries the whole
+    project, including the run snapshots, job records, and backups needed to
+    reproduce a result. An **output-only** bundle carries just the finished
+    exports and the manifest, so a deliverable can be handed over without also
+    handing over the prompts that produced it.
+    """
 
     storage_root: Path
 
-    def bundle(self, project_id: str, output_path: str | Path) -> Path:
+    #: Everything an output-only bundle is allowed to contain.
+    OUTPUT_ONLY_DIRS: ClassVar[tuple[str, ...]] = ("exports",)
+    OUTPUT_ONLY_FILES: ClassVar[tuple[str, ...]] = ("manifest.json",)
+
+    def bundle(
+        self,
+        project_id: str,
+        output_path: str | Path,
+        *,
+        include_sources: bool = True,
+    ) -> Path:
+        """Zip the project. With ``include_sources=False`` only outputs are written."""
         project = project_paths(self.storage_root, project_id)
         if not project.root.exists():
             raise FileNotFoundError(project.root)
@@ -238,9 +256,19 @@ class ProjectBundler:
         out.parent.mkdir(parents=True, exist_ok=True)
         with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as zf:
             for path in sorted(project.root.rglob("*")):
-                if path.is_file():
-                    zf.write(path, arcname=str(path.relative_to(project.root)))
+                if not path.is_file():
+                    continue
+                relative = path.relative_to(project.root)
+                if not include_sources and not self._is_output(relative):
+                    continue
+                zf.write(path, arcname=str(relative))
         return out
+
+    def _is_output(self, relative: Path) -> bool:
+        """Return whether `relative` belongs in an output-only bundle."""
+        if len(relative.parts) == 1:
+            return relative.name in self.OUTPUT_ONLY_FILES
+        return relative.parts[0] in self.OUTPUT_ONLY_DIRS
 
 
 @dataclass
@@ -376,8 +404,17 @@ class ExportService:
         )
         return result.output_path
 
-    def zip(self, project_id: str, output_path: str | Path) -> Path:
-        return ProjectBundler(self.storage_root).bundle(project_id, output_path)
+    def zip(
+        self,
+        project_id: str,
+        output_path: str | Path,
+        *,
+        include_sources: bool = True,
+    ) -> Path:
+        """Bundle the project; pass ``include_sources=False`` for an output-only zip."""
+        return ProjectBundler(self.storage_root).bundle(
+            project_id, output_path, include_sources=include_sources
+        )
 
     def import_zip(self, zip_path: str | Path, project_id: str | None = None) -> Path:
         return ProjectImporter(self.storage_root).import_zip(zip_path, project_id)

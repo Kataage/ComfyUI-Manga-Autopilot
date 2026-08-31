@@ -65,6 +65,10 @@ async def test_planner_parses_valid_payload() -> None:
         "theme": "courage",
         "genre": "fantasy",
         "mood": "warm",
+        "storyBible": {
+            "world": "cat village",
+            "rules": ["cats speak at dusk"],
+        },
         "acts": [
             {
                 "id": "act-1",
@@ -82,6 +86,7 @@ async def test_planner_parses_valid_payload() -> None:
                 "emotionalGoal": "curiosity",
                 "visualGoal": "village",
                 "panelCount": 2,
+                "layoutId": "page_2_horizontal",
             },
             {
                 "pageNumber": 2,
@@ -99,6 +104,8 @@ async def test_planner_parses_valid_payload() -> None:
     assert plan.title == "Cat Hero"
     assert len(plan.pages) == 2
     assert plan.pages[0].page_number == 1
+    assert plan.pages[0].layout_id == "page_2_horizontal"
+    assert plan.story_bible.rules == ["cats speak at dusk"]
 
 
 async def test_planner_repairs_invalid_json() -> None:
@@ -148,7 +155,9 @@ async def test_dump_story_plan_round_trip() -> None:
 
 
 def test_prompt_template_substitutes_variables() -> None:
-    out = PROMPT_TEMPLATE.format(page_count=3, language="en", genre="sci-fi", idea="X")
+    out = PROMPT_TEMPLATE.format(
+        page_count=3, language="en", genre="sci-fi", layout_rules="", idea="X"
+    )
     assert "ページ数: 3" in out
     assert "言語: en" in out
     assert "ジャンル: sci-fi" in out
@@ -195,3 +204,39 @@ async def test_planner_with_real_openai_compatible_provider(openai_server) -> No
     planner = StoryPlanner(provider=OpenAICompatibleProvider(settings))
     plan = await planner.plan("An idea")
     assert plan.title == "Stub"
+
+
+# ----------------------------------------------- the planner needs the layout vocabulary
+#
+# A live run on 2026-08-27 planned layoutId "standard_linear" and "climax_focus".
+# Strict validation rejected both, correctly - but the planner had never been
+# told which ids exist, so the whole planning round trip was wasted.
+
+
+def test_the_prompt_lists_the_registered_layouts() -> None:
+    from manga_autopilot.services.page_templates import layout_catalog
+
+    planner = StoryPlanner(provider=object(), page_count=2, layouts=layout_catalog("page"))
+
+    prompt = planner.build_prompt("an idea")
+
+    for item in layout_catalog("page"):
+        assert item["layout_id"] in prompt
+        assert str(item["panel_count"]) in prompt
+
+
+def test_the_prompt_says_a_layout_may_be_omitted() -> None:
+    from manga_autopilot.services.page_templates import layout_catalog
+
+    planner = StoryPlanner(provider=object(), page_count=2, layouts=layout_catalog("page"))
+
+    assert "layoutId" in planner.build_prompt("an idea")
+
+
+def test_without_a_catalog_the_prompt_is_unchanged() -> None:
+    planner = StoryPlanner(provider=object(), page_count=2)
+
+    prompt = planner.build_prompt("an idea")
+
+    assert planner._layout_rules() == ""
+    assert "page_2_horizontal" not in prompt

@@ -17,6 +17,7 @@ from manga_autopilot.routes import register_all
 from manga_autopilot.services.export import (
     WEBTOON_MAX_HEIGHT,
     WEBTOON_WIDTH,
+    ExportService,
     PDFRenderer,
     ProjectBundler,
     ProjectImporter,
@@ -82,15 +83,15 @@ def test_webtoon_scene_break_adds_margin() -> None:
     assert with_break.height > plain.height
 
 
-def test_webtoon_slicer_no_op_when_under_max() -> None:
+def test_webtoon_slicer_no_op_when_under_max(tmp_path: Path) -> None:
     img = Image.new("RGB", (200, 1000), (255, 255, 255))
-    out = WebtoonSlicer(max_height=2000).slice(img, output_dir=Path("/tmp"))
+    out = WebtoonSlicer(max_height=2000).slice(img, output_dir=tmp_path)
     assert len(out) == 1
 
 
-def test_webtoon_slicer_splits() -> None:
+def test_webtoon_slicer_splits(tmp_path: Path) -> None:
     img = Image.new("RGB", (200, 5000), (255, 255, 255))
-    out = WebtoonSlicer(max_height=2000, output_prefix="x").slice(img, output_dir=Path("/tmp"))
+    out = WebtoonSlicer(max_height=2000, output_prefix="x").slice(img, output_dir=tmp_path)
     assert len(out) == 3
     for p in out:
         assert p.name.startswith("x_")
@@ -228,3 +229,59 @@ async def test_export_routes_pdf(client) -> None:
     body = {"page_pngs": []}
     r = await client.post("/manga_autopilot/api/projects/p1/export/pdf", json=body)
     assert r.status == 400
+
+
+# ------------------------------------------------- output-only vs backup bundle
+def _project_with_sources(tmp_path: Path) -> Path:
+    project_root = tmp_path / "projects" / "p2"
+    (project_root / "exports" / "pages").mkdir(parents=True)
+    (project_root / "runs" / "run-1").mkdir(parents=True)
+    (project_root / "jobs").mkdir()
+    (project_root / "backups").mkdir()
+    (project_root / "project.json").write_text(json.dumps({"id": "p2"}), encoding="utf-8")
+    (project_root / "manifest.json").write_text(json.dumps({"project_id": "p2"}), encoding="utf-8")
+    (project_root / "exports" / "pages" / "page_001.png").write_bytes(b"png")
+    (project_root / "runs" / "run-1" / "snapshot.json").write_text(
+        json.dumps({"panels": [{"positive": "1girl, black bob hair"}]}), encoding="utf-8"
+    )
+    (project_root / "jobs" / "job1.json").write_text(
+        json.dumps({"positive_prompt": "1girl, black bob hair"}), encoding="utf-8"
+    )
+    (project_root / "backups" / "project.json.bak").write_text("{}", encoding="utf-8")
+    return project_root
+
+
+def test_backup_bundle_keeps_reproducibility_material(tmp_path: Path) -> None:
+    _project_with_sources(tmp_path)
+    out = tmp_path / "backup.zip"
+
+    ProjectBundler(tmp_path).bundle("p2", out)
+
+    with zipfile.ZipFile(out) as zf:
+        names = set(zf.namelist())
+    assert "runs/run-1/snapshot.json" in names
+    assert "jobs/job1.json" in names
+    assert "backups/project.json.bak" in names
+
+
+def test_output_only_bundle_excludes_source_prompts(tmp_path: Path) -> None:
+    _project_with_sources(tmp_path)
+    out = tmp_path / "outputs.zip"
+
+    ProjectBundler(tmp_path).bundle("p2", out, include_sources=False)
+
+    with zipfile.ZipFile(out) as zf:
+        names = set(zf.namelist())
+        blob = b"".join(zf.read(name) for name in names)
+    assert names == {"exports/pages/page_001.png", "manifest.json"}
+    assert b"black bob hair" not in blob
+
+
+def test_export_service_offers_an_output_only_zip(tmp_path: Path) -> None:
+    _project_with_sources(tmp_path)
+    service = ExportService(tmp_path)
+
+    out = service.zip("p2", tmp_path / "outputs.zip", include_sources=False)
+
+    with zipfile.ZipFile(out) as zf:
+        assert "runs/run-1/snapshot.json" not in set(zf.namelist())

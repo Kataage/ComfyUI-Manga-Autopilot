@@ -37,6 +37,9 @@ class JobStatus(str, Enum):
 
     On retry: ... -> QA_CHECKING -> RETRYING -> QUEUED -> ...
     On terminal failure: any state -> FAILED / CANCELLED.
+
+    Strict Anima runs add AWAITING_REVIEW: a quality rejection stops there
+    and waits for the user instead of retrying automatically.
     """
 
     PENDING = "pending"
@@ -46,6 +49,7 @@ class JobStatus(str, Enum):
     FETCHING_RESULT = "fetching_result"
     QA_CHECKING = "qa_checking"
     RETRYING = "retrying"
+    AWAITING_REVIEW = "awaiting_review"
     COMPLETED = "completed"
     FAILED = "failed"
     CANCELLED = "cancelled"

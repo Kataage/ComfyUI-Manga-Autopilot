@@ -57,6 +57,14 @@ class ProjectPaths:
         return self.root / "story.json"
 
     @property
+    def story_bible_json(self) -> Path:
+        return self.root / "story_bible.json"
+
+    @property
+    def scene_state_json(self) -> Path:
+        return self.root / "scene_state.json"
+
+    @property
     def characters_json(self) -> Path:
         return self.root / "characters.json"
 
@@ -95,6 +103,11 @@ class ProjectPaths:
     @property
     def latest_run_id_txt(self) -> Path:
         return self.root / "latest_run_id.txt"
+
+    @property
+    def backups(self) -> Path:
+        """Timestamped copies taken before a document is migrated in place."""
+        return self.root / "backups"
 
     @property
     def runs(self) -> Path:

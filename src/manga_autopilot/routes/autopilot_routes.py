@@ -4,14 +4,15 @@ from __future__ import annotations
 
 import json
 import logging
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from aiohttp import web
 
-from manga_autopilot.models.page import PagePlan
+from manga_autopilot.models.bible import StoryBible
+from manga_autopilot.models.page import PagePlan, PanelPlan
 from manga_autopilot.models.panel import (
     PanelLayout,
     PanelRecord,
@@ -39,6 +40,10 @@ if TYPE_CHECKING:
     from aiohttp.web import Application
 
 log = logging.getLogger(__name__)
+
+#: Stand-in line for generic projects that planned no dialogue. Strict Anima
+#: runs leave a silent panel silent instead.
+PLACEHOLDER_DIALOGUE = "行くぞ"
 
 ROUTE_PREFIX = "/manga_autopilot/api/projects/{project_id}/autopilot"
 
@@ -91,6 +96,225 @@ def _default_workflow_id(app: Application) -> str:
     return "anime_t2i_default"
 
 
+def _anima_profile(run: AutopilotRun):
+    """Return the resolved profile for a strict run, or ``None`` if unknown."""
+    from manga_autopilot.services.generation_profiles import load_builtin_profile
+
+    try:
+        return load_builtin_profile(str(run.input.get("generation_profile_id") or ""))
+    except KeyError:
+        log.warning(
+            "unknown generation profile %r; falling back to generic defaults",
+            run.input.get("generation_profile_id"),
+        )
+        return None
+
+
+def _anima_candidate_count(run: AutopilotRun) -> int:
+    profile = _anima_profile(run)
+    return profile.candidate_count if profile is not None else 1
+
+
+def _anima_technical_retry_count(run: AutopilotRun) -> int:
+    profile = _anima_profile(run)
+    return profile.technical_retry_count if profile is not None else 1
+
+
+def _write_run_snapshot(
+    app: Application,
+    run: AutopilotRun,
+    *,
+    project_root: Path,
+    project_id: str,
+    profile: Any,
+    workflow_id: str,
+    prompts: Mapping[str, Any],
+) -> None:
+    """Record everything needed to reproduce this run.
+
+    Failing to write a snapshot must never fail a run that has already produced
+    images, so this logs and moves on. Model fingerprints are only included when
+    ``comfyui.install_root`` is configured, since ComfyUI reports model names but
+    not their paths.
+    """
+    from manga_autopilot.services.model_fingerprint import fingerprint_profile_models
+    from manga_autopilot.services.run_snapshot import (
+        EnvironmentSnapshot,
+        LLMSettingsSnapshot,
+        PanelPromptSnapshot,
+        PlannerCostSnapshot,
+        RunSnapshot,
+        RunSnapshotWriter,
+        hash_json_document,
+        log_prompt_digest,
+    )
+
+    try:
+        registry = app.get("manga_workflow_registry")
+        workflow = None
+        if registry is not None:
+            try:
+                workflow = registry.get(workflow_id)
+            except Exception as exc:  # noqa: BLE001 - the prompts still matter
+                log.warning(
+                    "run snapshot has no workflow hash: %s could not be read (%s)",
+                    workflow_id,
+                    exc,
+                )
+        panels = [
+            PanelPromptSnapshot.from_prompt_spec(panel_id, spec)
+            for panel_id, spec in prompts.items()
+        ]
+
+        llm = None
+        planner = None
+        provider = app.get("manga_llm_provider")
+        settings = getattr(provider, "settings", None)
+        if settings is not None:
+            llm = LLMSettingsSnapshot.from_mapping(settings.model_dump(mode="json"))
+        stats = getattr(provider, "stats", None)
+        if stats is not None:
+            planner = PlannerCostSnapshot(**stats.to_dict())
+            log.info(
+                "planner cost for %s: %d call(s), %.1fs, %.0f%% of generated text "
+                "was discarded reasoning",
+                run.run_id,
+                planner.calls,
+                planner.seconds,
+                planner.reasoning_ratio * 100,
+            )
+
+        snapshot = RunSnapshot(
+            run_id=run.run_id,
+            project_id=project_id,
+            generation_profile_id=profile.id,
+            profile_hash=hash_json_document(profile.model_dump(mode="json")),
+            workflow_hash=hash_json_document((workflow.api_graph or {}) if workflow else {}),
+            models=fingerprint_profile_models(profile, app.get("manga_comfyui_install_root")),
+            llm=llm,
+            planner=planner,
+            environment=EnvironmentSnapshot.capture(),
+            panels=panels,
+        )
+        path = RunSnapshotWriter(project_root).write(snapshot)
+        for panel in panels:
+            log_prompt_digest(log, panel)
+        log.info("wrote %s for run %s", path.name, run.run_id)
+    except Exception as exc:  # noqa: BLE001 - a snapshot is never worth a failed run
+        log.warning("could not write the run snapshot for %s: %s", run.run_id, exc)
+
+
+def _open_review_coordinator(app: Application, project_id: str, storage_root: Path):
+    """Build the review coordinator for a run and publish it for the review API.
+
+    A project with no Anima profile gets an empty policy, so every gate reports
+    approved and the pipeline never pauses.
+    """
+    from manga_autopilot.routes.review_routes import register_coordinator
+    from manga_autopilot.services.project_manager import ProjectManager
+    from manga_autopilot.services.review_gate import (
+        ReviewCoordinator,
+        ReviewPolicy,
+        ReviewStore,
+    )
+
+    profile_id = ""
+    try:
+        profile_id = ProjectManager(storage_root).load(project_id).generation_profile_id
+    except Exception as exc:  # noqa: BLE001 - a missing project is not fatal here
+        log.debug("could not read the generation profile for %s: %s", project_id, exc)
+
+    root = ensure_project_paths(storage_root, project_id).root
+    store = ReviewStore(root)
+    coordinator = ReviewCoordinator(
+        board=store.load(project_id, ReviewPolicy.for_profile(profile_id)),
+        store=store,
+    )
+    register_coordinator(app, project_id, coordinator)
+    return coordinator
+
+
+def _review_coordinator(app: Application, project_id: str):
+    """Return the live review coordinator for `project_id`, if a run published one."""
+    from manga_autopilot.routes.review_routes import COORDINATORS_KEY
+
+    return app.get(COORDINATORS_KEY, {}).get(project_id)
+
+
+def _is_anima_run(run: AutopilotRun) -> bool:
+    profile_id = run.input.get("generation_profile_id")
+    return isinstance(profile_id, str) and profile_id.startswith("anima_")
+
+
+async def _run_anima_preflight(
+    app: Application,
+    run: AutopilotRun,
+    *,
+    project_root: Path,
+    workflow_id: str,
+) -> None:
+    """Block a strict Anima run whose environment is not ready.
+
+    Only two of the eight checks need a live ``/object_info`` snapshot. When the
+    application has no ComfyUI client - a remote executor, a shared executor, or
+    the in-process test wiring - those two are held back and the other six still
+    run. Stepping aside entirely used to take the licence acknowledgement and the
+    remote-endpoint auth check down with them, which is exactly the kind of
+    silence strict mode exists to prevent.
+
+    A missing client is not by itself a failure: ``manga_remote_executor`` is a
+    supported deployment with no local ComfyUI to interrogate.
+    """
+    from manga_autopilot.services.generation_profiles import load_builtin_profile
+    from manga_autopilot.services.preflight import (
+        AnimaPreflight,
+        ComfyCapabilities,
+        PreflightRequest,
+    )
+
+    client = app.get("manga_comfy_client")
+    registry = app.get("manga_workflow_registry")
+
+    capabilities: ComfyCapabilities | None = None
+    workflow = None
+    if client is not None and registry is not None:
+        workflow = registry.get(workflow_id)
+        try:
+            object_info = await client.get_object_info()
+        except Exception as exc:  # noqa: BLE001 - re-raised with the cause named
+            # "FAILED_PANEL_GENERATION" on its own sends the reader hunting through
+            # prompts and workflows for a problem that is just a stopped server.
+            base_url = getattr(client, "base_url", "the configured endpoint")
+            raise RuntimeError(
+                f"ComfyUI at {base_url} is not reachable, so nothing can be generated: "
+                f"{type(exc).__name__}: {exc}"
+            ) from exc
+        capabilities = ComfyCapabilities.from_object_info(object_info)
+    else:
+        log.info(
+            "anima preflight for %s runs without /object_info: client=%s registry=%s",
+            run.run_id,
+            "set" if client is not None else "unset",
+            "set" if registry is not None else "unset",
+        )
+
+    profile = load_builtin_profile(str(run.input["generation_profile_id"]))
+
+    request = PreflightRequest(
+        profile=profile,
+        workflow=workflow,
+        output_dir=project_root / "assets" / "panels",
+        comfy_base_url=getattr(client, "base_url", "http://127.0.0.1:8188"),
+        allow_remote_comfyui=bool(run.input.get("allow_remote_comfyui")),
+        comfy_auth_configured=bool(run.input.get("comfy_auth_configured")),
+        license_acknowledged=bool(run.input.get("license_acknowledged")),
+    )
+    report = AnimaPreflight(capabilities).run(request)
+    for warning in report.warnings:
+        log.warning("anima preflight: %s: %s", warning.code, warning.message)
+    report.raise_if_blocked()
+
+
 # ----------------------------------------------------------------- hook helpers
 def _read_panel_records(project_root: Path) -> list[PanelRecord]:
     path = project_root / "panels.json"
@@ -126,20 +350,38 @@ def _make_plan_story(
 
     async def _hook(run: AutopilotRun) -> dict[str, Any] | None:
         try:
+            from manga_autopilot.services.page_templates import layout_catalog
+
+            strict = _is_anima_run(run)
             planner = StoryPlanner(
                 provider=_llm_provider(app),
                 page_count=int(run.input.get("page_count") or 1),
                 language=str(run.input.get("language") or "ja"),
                 genre=str(run.input.get("genre") or "fantasy"),
+                strict=strict,
+                # Strict planning rejects an unregistered layout id, so the
+                # planner has to be told the vocabulary rather than guess it.
+                layouts=layout_catalog("page") if strict else [],
             )
             plan = await planner.plan(str(run.input.get("idea") or ""))
             (project_root / "story.json").write_text(
                 json.dumps(plan.model_dump(mode="json"), ensure_ascii=False, indent=2),
                 encoding="utf-8",
             )
+            if _is_anima_run(run):
+                paths.story_bible_json.write_text(
+                    json.dumps(
+                        plan.story_bible.model_dump(mode="json"),
+                        ensure_ascii=False,
+                        indent=2,
+                    ),
+                    encoding="utf-8",
+                )
             return plan.model_dump(mode="json")
         except Exception as exc:  # noqa: BLE001
             log.warning("plan_story failed: %s", exc)
+            if _is_anima_run(run):
+                raise
             return None
 
     return _hook
@@ -150,7 +392,10 @@ def _make_define_characters(
     project_id: str,
     storage_root: Path,
 ) -> Callable[[AutopilotRun], Any]:
-    from manga_autopilot.services.character_planner import CharacterPlanner
+    from manga_autopilot.services.character_planner import (
+        CharacterPlanner,
+        spec_to_character,
+    )
     from manga_autopilot.services.character_service import CharacterService
 
     character_service = CharacterService.for_project(storage_root, project_id)
@@ -167,8 +412,15 @@ def _make_define_characters(
                     plan_input if isinstance(plan_input, (dict, str)) else {},
                 )
                 for ch in characters.characters:
-                    character_service.create(ch)
+                    # The planner emits a CharacterSpec (free text plus traits);
+                    # the persisted card needs a structured Character.
+                    character_service.create(spec_to_character(ch))
             except Exception as exc:  # noqa: BLE001
+                if _is_anima_run(run):
+                    # A strict run without characters fails later anyway, with a
+                    # confusing "character is not defined" from panel planning.
+                    # Fail here, where the cause is still visible.
+                    raise
                 log.warning("define_characters failed: %s", exc)
         ids = [c.id for c in character_service.list()]
         if project_root.joinpath("characters.json").exists():
@@ -193,14 +445,53 @@ def _make_plan_pages(
 
     async def _hook(run: AutopilotRun) -> list[PagePlan]:
         page_count = int(run.input.get("page_count") or 1)
+        strict = _is_anima_run(run)
         try:
-            planner = PagePlanner(provider=_llm_provider(app), page_count=page_count)
             story_plan = run.artefacts.get("plan_story")
             if not isinstance(story_plan, (dict, str)):
                 story_plan = {"title": "", "pages": []}
-            plan_list = await planner.plan(story_plan)
-            pages = list(plan_list.pages)
+            if strict:
+                if not isinstance(story_plan, dict):
+                    raise ValueError("strict planning requires a structured StoryPlan")
+                pages = [PagePlan.model_validate(item) for item in story_plan.get("pages", [])]
+                if len(pages) != page_count:
+                    raise ValueError(
+                        f"StoryPlan contains {len(pages)} pages; expected {page_count}"
+                    )
+                from manga_autopilot.services.page_templates import (
+                    fallback_grid,
+                    layout_catalog,
+                )
+
+                layout_slots = {
+                    str(item["layout_id"]): int(item["panel_count"])
+                    for item in layout_catalog("page")
+                }
+                for page in pages:
+                    if page.layout_id is None:
+                        page.layout_id = fallback_grid(page.panel_count).template_id
+                    elif page.layout_id.startswith("fallback_grid_"):
+                        expected = fallback_grid(page.panel_count).template_id
+                        if page.layout_id != expected:
+                            raise ValueError(
+                                f"layout {page.layout_id!r} does not match "
+                                f"panel_count={page.panel_count}"
+                            )
+                    elif page.layout_id not in layout_slots:
+                        raise ValueError(f"layout {page.layout_id!r} is not registered")
+                    elif layout_slots[page.layout_id] != page.panel_count:
+                        raise ValueError(
+                            f"layout {page.layout_id!r} has "
+                            f"{layout_slots[page.layout_id]} slots; "
+                            f"received panel_count={page.panel_count}"
+                        )
+            else:
+                planner = PagePlanner(provider=_llm_provider(app), page_count=page_count)
+                plan_list = await planner.plan(story_plan)
+                pages = list(plan_list.pages)
         except Exception as exc:  # noqa: BLE001
+            if strict:
+                raise
             log.warning("plan_pages fell back to stub: %s", exc)
             pages = [
                 PagePlan(
@@ -230,13 +521,15 @@ def _make_plan_panels(
     project_root = paths.root
 
     async def _hook(run: AutopilotRun) -> list[dict[str, Any]]:
+        from manga_autopilot.models.scene_state import SceneState
+        from manga_autopilot.services.character_service import CharacterService
+        from manga_autopilot.services.page_templates import fallback_grid, layout_catalog
+        from manga_autopilot.services.scene_state_reducer import apply_scene_delta
+
         existing = {r.panel_id: r for r in _read_panel_records(project_root)}
         panels_per_page = int(run.input.get("panels_per_page") or 1)
+        strict = _is_anima_run(run)
         records: list[PanelRecord] = []
-        try:
-            planner = PanelPlanner(panels=[])
-        except TypeError:
-            planner = PanelPlanner(provider=_llm_provider(app))  # type: ignore[call-arg]
         raw_pages: list[Any] = run.artefacts.get("plan_pages") or []
         pages: list[PagePlan] = []
         for item in raw_pages:
@@ -248,24 +541,99 @@ def _make_plan_panels(
                 except Exception:
                     continue
         if not pages:
+            if strict:
+                raise ValueError(
+                    "no page plans are available; page planning produced nothing"
+                )
             return [r.model_dump(mode="json") for r in existing.values()]
+
+        story_payload = run.artefacts.get("plan_story")
+        story_bible = StoryBible()
+        if isinstance(story_payload, dict):
+            story_bible = StoryBible.model_validate(
+                story_payload.get("story_bible")
+                or story_payload.get("storyBible")
+                or {}
+            )
+        character_service = CharacterService.for_project(storage_root, project_id)
+        characters = character_service.list()
+        known_character_ids = {character.id for character in characters}
+        character_payloads = [
+            character.model_dump(mode="json") for character in characters
+        ]
+        state = SceneState()
+        if paths.scene_state_json.exists():
+            state = SceneState.model_validate_json(
+                paths.scene_state_json.read_text(encoding="utf-8")
+            )
+
         for page in pages:
+            effective_count = page.panel_count if strict else panels_per_page
+            page_layout_id = page.layout_id
+            if strict and page_layout_id is None:
+                page_layout_id = fallback_grid(effective_count).template_id
+                page.layout_id = page_layout_id
+            catalog = layout_catalog("page")
+            registered_layout_ids = {
+                str(item["layout_id"]) for item in catalog
+            }
+            if page_layout_id and page_layout_id.startswith("fallback_grid_"):
+                registered_layout_ids.add(page_layout_id)
+                catalog.append(
+                    {
+                        "layout_id": page_layout_id,
+                        "panel_count": effective_count,
+                        "reading_order": list(range(1, effective_count + 1)),
+                    }
+                )
+            planner = PanelPlanner(
+                provider=_llm_provider(app),
+                panel_count=effective_count,
+                strict=strict,
+                character_ids=known_character_ids,
+                layout_id=page_layout_id,
+                registered_layout_ids=registered_layout_ids,
+                story_bible=story_bible.model_dump(mode="json"),
+                scene_state=state.model_dump(mode="json"),
+                active_characters=character_payloads,
+                layouts=catalog,
+            )
             try:
                 panel_list = await planner.plan(page)
-                plans = list(panel_list.panels)[:panels_per_page]
+                plans = list(panel_list.panels)[:effective_count]
             except Exception as exc:  # noqa: BLE001
+                if strict:
+                    raise
                 log.warning("plan_panels fell back to stub for page %s: %s", page.page_number, exc)
                 plans = []
-            while len(plans) < panels_per_page:
+            while len(plans) < effective_count:
                 pn = len(plans) + 1
                 plans.append(
-                    type(plans[0])(
+                    PanelPlan(
                         panel_number=pn,
                         purpose=f"panel {pn} of page {page.page_number}",
                         action=page.summary or "scene",
                     )
                 )
             for plan in plans:
+                if strict:
+                    reduced = apply_scene_delta(
+                        state,
+                        plan.scene_delta,
+                        known_character_ids,
+                    )
+                    if not reduced.applied:
+                        details = "; ".join(item.message for item in reduced.warnings)
+                        raise ValueError(f"scene delta rejected: {details}")
+                    state = reduced.state
+                    paths.scene_state_json.write_text(
+                        json.dumps(
+                            state.model_dump(mode="json"),
+                            ensure_ascii=False,
+                            indent=2,
+                        ),
+                        encoding="utf-8",
+                    )
                 pid = f"panel_{page.page_number:03d}_{plan.panel_number:02d}"
                 record = existing.get(pid) or PanelRecord(
                     panel_id=pid,
@@ -290,6 +658,7 @@ def _make_generate_panels(
     from manga_autopilot.services.generation_job import (
         GenerationLoop,
         GenerationLoopConfig,
+        run_panels_sequentially,
     )
 
     paths = ensure_project_paths(storage_root, project_id)
@@ -312,16 +681,115 @@ def _make_generate_panels(
         records = _read_panel_records(project_root)
         if not records:
             return []
+        strict = _is_anima_run(run)
+        if strict:
+            await _run_anima_preflight(
+                app,
+                run,
+                project_root=project_root,
+                workflow_id=str(run.input.get("workflow_id") or workflow_id),
+            )
         executor = _resolve_executor(app, project_id)
         loop = GenerationLoop(
             project_root=project_root,
             config=GenerationLoopConfig(
-                candidate_count=int(run.input["candidate_count"]) if run.input.get("candidate_count") is not None else 1,
+                candidate_count=_anima_candidate_count(run) if strict else (
+                    int(run.input["candidate_count"]) if run.input.get("candidate_count") is not None else 1
+                ),
                 max_retries=int(run.input["max_retries"]) if run.input.get("max_retries") is not None else 1,
                 threshold=float(run.input["threshold"]) if run.input.get("threshold") is not None else 0.5,
+                strict=strict,
+                technical_retry_count=_anima_technical_retry_count(run) if strict else 1,
             ),
         )
         builder = PromptBuilder(provider=_llm_provider(app))
+
+        if strict:
+            # A strict run persists each panel before submitting the next, so an
+            # interruption resumes instead of re-rendering, and it never
+            # substitutes a fabricated prompt for one the planner could not build.
+            #
+            # Prompts are rendered deterministically from the panel plan and the
+            # profile - no LLM call, and no technical field the profile does not
+            # own. That is the whole point of the Anima profiles.
+            from manga_autopilot.services.anima_prompt_builder import (
+                AnimaPromptBuilder,
+                panel_aspect,
+                segments_from_panel_plan,
+                stable_panel_seed,
+            )
+            from manga_autopilot.services.character_service import CharacterService
+            from manga_autopilot.services.review_gate import run_with_early_artwork_review
+
+            profile = _anima_profile(run)
+            if profile is None:
+                raise RuntimeError(
+                    f"strict run {run.run_id} has no resolvable generation profile"
+                )
+            anima_builder = AnimaPromptBuilder()
+            characters = {c.id: c for c in CharacterService.for_project(storage_root, project_id).list()}
+            base_seed = run.input.get("seed")
+
+            rendered_prompts: dict[str, PromptSpec] = {}
+
+            def _anima_prompt(record: PanelRecord) -> PromptSpec:
+                seed = (
+                    int(base_seed)
+                    if base_seed is not None
+                    else stable_panel_seed(project_id, record.panel_id)
+                )
+                spec = anima_builder.render(
+                    segments_from_panel_plan(record.plan, characters),
+                    profile,
+                    seed=seed,
+                    panel_size=panel_aspect(record, profile),
+                )
+                rendered_prompts[record.panel_id] = spec
+                return spec
+
+            async def _generate(batch: list[PanelRecord]) -> list[Any]:
+                return await run_panels_sequentially(
+                    records=batch,
+                    loop=loop,
+                    executor=executor,
+                    prompt_for=_anima_prompt,
+                    workflow_id=str(run.input.get("workflow_id") or workflow_id),
+                    project_id=project_id,
+                    persist=lambda _batch: _write_panel_records(project_root, records),
+                    run_id=run.run_id,
+                    cancel_check=_cancel_check,
+                )
+
+            coordinator = _review_coordinator(app, project_id)
+            if coordinator is None:
+                results = await _generate(records)
+            else:
+                # Page one is rendered on its own so the artwork direction can be
+                # judged before the remaining pages consume GPU time.
+                results = await run_with_early_artwork_review(
+                    records,
+                    generate=_generate,
+                    coordinator=coordinator,
+                    on_wait=lambda gate: run.log_event("review_awaiting", {"gate": gate}),
+                )
+            _write_run_snapshot(
+                app,
+                run,
+                project_root=project_root,
+                project_id=project_id,
+                profile=profile,
+                workflow_id=str(run.input.get("workflow_id") or workflow_id),
+                prompts=rendered_prompts,
+            )
+
+            blocked = [r for r in results if r.status in {"failed", "rejected"}]
+            if blocked:
+                raise RuntimeError(
+                    "strict generation stopped at "
+                    + ", ".join(f"{r.panel_id} ({r.status})" for r in blocked)
+                )
+            return [r.outcome.job.to_dict() for r in results if r.outcome is not None]
+
         rendered: list[dict[str, Any]] = []
         failed_panel_ids: list[str] = []
         skipped_panel_ids: list[str] = []
@@ -423,6 +891,7 @@ def _make_lettering(
     def _hook(run: AutopilotRun) -> dict[str, Any]:
         records = _read_panel_records(project_root)
         bubble_count = 0
+        strict = _is_anima_run(run)
 
         for record in records:
             dialogues = record.plan.dialogue if record.plan else []
@@ -448,18 +917,24 @@ def _make_lettering(
                         order=idx,
                     )
                     bubbles.append(bubble)
+            elif strict:
+                # A strict run never invents dialogue. A panel the planner left
+                # silent stays silent: six of nine panels in a live run were
+                # given a hardcoded line that had nothing to do with the art.
+                log.debug("no dialogue planned for %s; leaving it silent", record.panel_id)
             else:
-                # Fallback: at least one bubble so the page is never bare.
-                bubble = SpeechBubble(
-                    id=f"{record.panel_id}_b00",
-                    panel_id=record.panel_id,
-                    type="normal",
-                    text="行くぞ",
-                    width=160.0,
-                    height=80.0,
-                    order=0,
+                # Generic projects keep the placeholder so a page is never bare.
+                bubbles.append(
+                    SpeechBubble(
+                        id=f"{record.panel_id}_b00",
+                        panel_id=record.panel_id,
+                        type="normal",
+                        text=PLACEHOLDER_DIALOGUE,
+                        width=160.0,
+                        height=80.0,
+                        order=0,
+                    )
                 )
-                bubbles.append(bubble)
 
             # Compute placements using the panel layout (if available).
             panel_layout = record.layout
@@ -776,6 +1251,49 @@ def _default_hooks_for_project(
     )
 
 
+def _seed_input_from_project(
+    storage_root: Path, project_id: str, input_payload: Mapping[str, Any]
+) -> dict[str, Any]:
+    """Fill the run input from the project's persisted settings.
+
+    ``docs/anima_mvp.md`` tells the user to select the profile and acknowledge
+    the licence with ``PATCH /projects/{id}``. Those land on the project, but
+    strict mode, the preflight and the licence check all read ``run.input``,
+    which was built from the start request body alone. A project configured
+    exactly as documented and started with no body therefore got the Anima
+    review gates - those read the project - while strict mode stayed off and
+    preflight never ran. The documented sentence "Preflight refuses to generate
+    until this is set" was not true.
+
+    The request body still wins, so an explicit start payload can override what
+    the project holds.
+
+    Deliberately narrow. The restart path also restores ``page_count``,
+    ``candidate_count``, ``max_retries``, ``threshold`` and ``title`` from
+    ``project.json``, so start and restart still disagree about those. Closing
+    that gap here is not a cleanup: the project defaults (``candidate_count``
+    4, ``max_retry_per_panel`` 5, ``quality_threshold`` 0.78) differ from the
+    ones start falls back to (1, 1, 0.5), so seeding them would quadruple the
+    candidates generated for every caller that omits them. That is a cost
+    decision, not a wiring fix.
+    """
+    from manga_autopilot.services.project_manager import ProjectManager
+
+    try:
+        project = ProjectManager(storage_root).load(project_id)
+    except Exception as exc:  # noqa: BLE001 - a missing project is not fatal here
+        log.debug("could not read project settings for %s: %s", project_id, exc)
+        return dict(input_payload)
+
+    seeded: dict[str, Any] = {}
+    if project.generation_profile_id:
+        seeded["generation_profile_id"] = project.generation_profile_id
+    if project.license_acknowledged:
+        seeded["license_acknowledged"] = True
+    seeded.update(input_payload)
+    return seeded
+
+
 async def _payload(request: web.Request) -> dict[str, Any]:
     try:
         body = await request.json()
@@ -804,6 +1322,7 @@ async def start(request: web.Request) -> web.Response:
         raise web.HTTPInternalServerError(text="manga_storage_root is not configured")
 
     ensure_project_paths(storage_root, project_id)
+    input_payload = _seed_input_from_project(storage_root, project_id, input_payload)
 
     ctrl = _controller(request.app)
     hooks = _default_hooks_for_project(request.app, project_id, storage_root)
@@ -813,6 +1332,7 @@ async def start(request: web.Request) -> web.Response:
         hooks=hooks,
         project_root=ensure_project_paths(storage_root, project_id).root,
         input_payload=input_payload,
+        reviews=_open_review_coordinator(request.app, project_id, storage_root),
     )
     save_run_metadata(ensure_project_paths(storage_root, project_id).root, run)
     return web.json_response(run.to_status(), status=202)
@@ -966,6 +1486,7 @@ async def restart(request: web.Request) -> web.Response:
         hooks=hooks,
         project_root=paths.root,
         input_payload=restored_input,
+        reviews=_open_review_coordinator(request.app, project_id, storage_root),
     )
     # Link to previous run
     run.source["restart_of_run_id"] = previous_run_id
@@ -1041,6 +1562,7 @@ async def resume_cancelled(request: web.Request) -> web.Response:
         hooks=hooks,
         project_root=paths.root,
         input_payload=restored_input,
+        reviews=_open_review_coordinator(request.app, project_id, storage_root),
     )
     # Link to previous run as resume
     run.source["resume_of_run_id"] = previous_run_id
@@ -1112,7 +1634,9 @@ async def cleanup_runs(request: web.Request) -> web.Response:
             {
                 "run_id": c.run_id,
                 "status": c.status,
-                "path": str(Path(c.path).relative_to(paths.root)) if Path(c.path).is_relative_to(paths.root) else c.path,
+                "path": Path(c.path).relative_to(paths.root).as_posix()
+                if Path(c.path).is_relative_to(paths.root)
+                else c.path,
                 "reason": c.reason,
             }
             for c in plan.candidates

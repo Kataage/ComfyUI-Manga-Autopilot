@@ -361,7 +361,10 @@ async def test_one_page_autopilot_uses_comfy_executor_path(comfy_e2e_client) -> 
     # CLIPTextEncode negative (node "7") should have the negative prompt
     clip_neg = submitted_graph.get("7", {})
     clip_neg_inputs = clip_neg.get("inputs", {})
-    assert clip_neg_inputs.get("text") == "low quality, blurry"
+    # negative_full(): the prompt's own negatives plus the application bans.
+    negative = clip_neg_inputs.get("text", "")
+    assert negative.endswith("low quality, blurry")
+    assert "watermark" in negative
     # EmptyLatentImage (node "5") should have width/height
     latent = submitted_graph.get("5", {})
     latent_inputs = latent.get("inputs", {})

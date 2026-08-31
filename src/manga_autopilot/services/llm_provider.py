@@ -13,19 +13,50 @@ Provides:
 from __future__ import annotations
 
 import abc
+import asyncio
 import json
 import logging
 import os
 import re
+import time
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
 import aiohttp
+from jsonschema import Draft202012Validator
 from pydantic import BaseModel, Field, model_validator
 
 log = logging.getLogger(__name__)
 
 ProviderType = Literal["local", "ollama", "openai_compatible", "manual"]
+
+
+def chat_completions_url(endpoint: str) -> str:
+    """Return the chat-completions URL for `endpoint`.
+
+    Accepts a base URL with or without a trailing ``/v1``. Appending a second
+    one produced ``/v1/v1/chat/completions``, which LM Studio answers with
+    HTTP 200 and an error body rather than a 404.
+    """
+    base = endpoint.rstrip("/")
+    if base.endswith("/v1"):
+        return base + "/chat/completions"
+    return base + "/v1/chat/completions"
+
+
+def json_schema_response_format(
+    name: str,
+    schema: Mapping[str, Any],
+) -> dict[str, Any]:
+    return {
+        "type": "json_schema",
+        "json_schema": {
+            "name": name,
+            "strict": True,
+            "schema": dict(schema),
+        },
+    }
 
 
 class LLMSettings(BaseModel):
@@ -35,6 +66,14 @@ class LLMSettings(BaseModel):
     api_key_env: str | None = None
     temperature: float = Field(default=0.7, ge=0.0, le=2.0)
     max_tokens: int = Field(default=2048, ge=64, le=32768)
+    timeout_sec: int = Field(default=900, ge=1, le=7200)
+    """How long to wait for one completion.
+
+    aiohttp defaults to 300s, which a local reasoning model can exceed on a
+    single planning call: measured at 297s for a two-page story plan, so the
+    default was close enough to trip intermittently - and the timeout surfaced
+    as an exception with an empty message.
+    """
 
     @model_validator(mode="after")
     def _check_endpoint(self) -> LLMSettings:
@@ -49,6 +88,50 @@ class LLMSettings(BaseModel):
         return os.environ.get(self.api_key_env)
 
 
+@dataclass
+class CompletionStats:
+    """What the planner actually cost, accumulated across a run.
+
+    Planner latency dominates a strict run and varies by an order of magnitude
+    between identical prompts - 66.8s to over 900s were measured for the same
+    two-page plan. Most of that is a reasoning model writing chain of thought
+    that is then discarded, so without recording it the cost is invisible: the
+    only symptom is a run that sometimes takes half an hour.
+    """
+
+    calls: int = 0
+    seconds: float = 0.0
+    reasoning_chars: int = 0
+    content_chars: int = 0
+
+    def record(
+        self,
+        *,
+        seconds: float,
+        content: str = "",
+        reasoning: str = "",
+    ) -> None:
+        self.calls += 1
+        self.seconds += seconds
+        self.content_chars += len(content or "")
+        self.reasoning_chars += len(reasoning or "")
+
+    @property
+    def reasoning_ratio(self) -> float:
+        """Share of generated characters spent on chain of thought."""
+        total = self.reasoning_chars + self.content_chars
+        return self.reasoning_chars / total if total else 0.0
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "calls": self.calls,
+            "seconds": round(self.seconds, 1),
+            "reasoning_chars": self.reasoning_chars,
+            "content_chars": self.content_chars,
+            "reasoning_ratio": round(self.reasoning_ratio, 3),
+        }
+
+
 class LLMProvider(abc.ABC):
     """Abstract async LLM provider."""
 
@@ -56,6 +139,27 @@ class LLMProvider(abc.ABC):
 
     def __init__(self, settings: LLMSettings) -> None:
         self.settings = settings
+        self.stats = CompletionStats()
+
+    def _record(self, started: float, content: str, reasoning: str = "") -> None:
+        """Log and accumulate what one completion cost."""
+        elapsed = time.monotonic() - started
+        self.stats.record(seconds=elapsed, content=content, reasoning=reasoning)
+        if reasoning:
+            log.info(
+                "%s answered in %.1fs: %d content chars after %d of reasoning",
+                self.settings.model or "the model",
+                elapsed,
+                len(content or ""),
+                len(reasoning),
+            )
+        else:
+            log.info(
+                "%s answered in %.1fs: %d content chars",
+                self.settings.model or "the model",
+                elapsed,
+                len(content or ""),
+            )
 
     @abc.abstractmethod
     async def complete(
@@ -74,6 +178,7 @@ class LLMProvider(abc.ABC):
         *,
         system: str | None = None,
         max_repair_attempts: int = 1,
+        semantic_validator: Callable[[dict[str, Any]], Sequence[str]] | None = None,
     ) -> dict[str, Any]:
         """Run ``complete`` and validate against ``schema`` (with up to N repair attempts)."""
 
@@ -81,7 +186,12 @@ class LLMProvider(abc.ABC):
             max_repair_attempts=max_repair_attempts,
             system_prompt=system,
         )
-        outcome = await loop.run(self, prompt, schema)
+        outcome = await loop.run(
+            self,
+            prompt,
+            schema,
+            semantic_validator=semantic_validator,
+        )
         if not outcome.ok:
             raise ValueError(outcome.error or "JSON repair exhausted")
         return outcome.data
@@ -130,11 +240,20 @@ class OllamaProvider(LLMProvider):
             payload["system"] = system
         if schema is not None:
             payload["format"] = schema
-        async with aiohttp.ClientSession() as session:
-            async with session.post(url, json=payload) as resp:
-                resp.raise_for_status()
-                data = await resp.json()
-        return data.get("response", "")
+        timeout = aiohttp.ClientTimeout(total=self.settings.timeout_sec)
+        started = time.monotonic()
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            try:
+                async with session.post(url, json=payload) as resp:
+                    resp.raise_for_status()
+                    data = await resp.json()
+            except asyncio.TimeoutError as exc:
+                raise TimeoutError(
+                    f"{url} did not answer within {self.settings.timeout_sec}s"
+                ) from exc
+        content = data.get("response", "")
+        self._record(started, content)
+        return content
 
 
 class OpenAICompatibleProvider(LLMProvider):
@@ -149,7 +268,7 @@ class OpenAICompatibleProvider(LLMProvider):
     ) -> str:
         if not self.settings.endpoint:
             raise RuntimeError("OpenAICompatibleProvider requires an endpoint")
-        url = self.settings.endpoint.rstrip("/") + "/v1/chat/completions"
+        url = chat_completions_url(self.settings.endpoint)
         headers = {"Content-Type": "application/json"}
         if self.settings.api_key:
             headers["Authorization"] = f"Bearer {self.settings.api_key}"
@@ -164,15 +283,48 @@ class OpenAICompatibleProvider(LLMProvider):
             "max_tokens": self.settings.max_tokens,
         }
         if schema is not None:
-            payload["response_format"] = {"type": "json_object"}
-        async with aiohttp.ClientSession() as session:
-            async with session.post(url, json=payload, headers=headers) as resp:
-                resp.raise_for_status()
-                data = await resp.json()
+            payload["response_format"] = json_schema_response_format(
+                "manga_autopilot_response",
+                schema,
+            )
+        timeout = aiohttp.ClientTimeout(total=self.settings.timeout_sec)
+        started = time.monotonic()
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            try:
+                async with session.post(url, json=payload, headers=headers) as resp:
+                    resp.raise_for_status()
+                    data = await resp.json()
+            except asyncio.TimeoutError as exc:
+                # A bare TimeoutError stringifies to "", which is how this
+                # surfaced in a live run: "plan_story failed:" and nothing else.
+                raise TimeoutError(
+                    f"{url} did not answer within {self.settings.timeout_sec}s; "
+                    "a reasoning model may need a longer llm.timeout_sec"
+                ) from exc
         choices = data.get("choices") or []
         if not choices:
-            return ""
-        return choices[0].get("message", {}).get("content", "")
+            # An OpenAI-compatible server may answer HTTP 200 with an error
+            # body: LM Studio does exactly that for an unknown path, so a
+            # doubled "/v1" used to surface as an empty completion.
+            detail = data.get("error") or data
+            raise ValueError(f"{url} returned no choices: {detail!r}"[:500])
+        choice = choices[0]
+        message = choice.get("message", {})
+        content = message.get("content") or ""
+        reasoning = message.get("reasoning_content") or ""
+        self._record(started, content, reasoning)
+        if not content and choice.get("finish_reason") == "length":
+            # A reasoning model spends max_tokens on `reasoning_content` before
+            # it writes any answer. Reporting "could not extract JSON from ''"
+            # here sends the reader looking in entirely the wrong place.
+            reasoning = len(message.get("reasoning_content") or "")
+            raise ValueError(
+                f"the model hit max_tokens ({self.settings.max_tokens}) before "
+                f"producing any content"
+                + (f"; it emitted {reasoning} characters of reasoning first" if reasoning else "")
+                + " - raise llm.max_tokens or use a non-reasoning model"
+            )
+        return content
 
 
 def build_provider(settings: LLMSettings) -> LLMProvider:
@@ -216,10 +368,12 @@ def _validate_json(text: str, schema: dict[str, Any]) -> dict[str, Any]:
     data = _extract_json(text)
     if not isinstance(data, dict):
         raise ValueError(f"expected JSON object, got {type(data).__name__}")
-    required = schema.get("required") or []
-    missing = [k for k in required if k not in data]
-    if missing:
-        raise ValueError(f"missing required keys: {missing}")
+    validator = Draft202012Validator(schema)
+    errors = sorted(validator.iter_errors(data), key=lambda error: list(error.absolute_path))
+    if errors:
+        error = errors[0]
+        path = "/" + "/".join(str(part) for part in error.absolute_path)
+        raise ValueError(f"{path}: {error.message}")
     return data
 
 
@@ -271,13 +425,19 @@ class JSONRepairLoop:
         provider: LLMProvider,
         prompt: str,
         schema: dict[str, Any],
+        *,
+        semantic_validator: Callable[[dict[str, Any]], Sequence[str]] | None = None,
     ) -> RepairOutcome:
         attempts = 0
         last_error = "no attempt"
+        history: list[str] = []
         text = await provider.complete(prompt, schema=schema, system=self.system_prompt)
         attempts += 1
+        history.append(text)
         try:
-            return RepairOutcome(ok=True, data=_validate_json(text, schema), attempts=attempts, history=[text])
+            data = _validate_json(text, schema)
+            _validate_semantics(data, semantic_validator)
+            return RepairOutcome(ok=True, data=data, attempts=attempts, history=history)
         except ValueError as exc:
             last_error = str(exc)
             log.warning("LLM JSON invalid (attempt %d): %s", attempts, exc)
@@ -288,21 +448,36 @@ class JSONRepairLoop:
                 repair_prompt, schema=schema, system=self.system_prompt
             )
             attempts += 1
+            history.append(text)
             try:
+                data = _validate_json(text, schema)
+                _validate_semantics(data, semantic_validator)
                 return RepairOutcome(
                     ok=True,
-                    data=_validate_json(text, schema),
+                    data=data,
                     attempts=attempts,
-                    history=[text],
+                    history=history,
                 )
             except ValueError as exc:
                 last_error = str(exc)
                 log.warning("LLM JSON repair invalid (attempt %d): %s", attempts, exc)
 
-        return RepairOutcome(ok=False, error=last_error, attempts=attempts, history=[text])
+        return RepairOutcome(ok=False, error=last_error, attempts=attempts, history=history)
+
+
+def _validate_semantics(
+    data: dict[str, Any],
+    validator: Callable[[dict[str, Any]], Sequence[str]] | None,
+) -> None:
+    if validator is None:
+        return
+    issues = list(validator(data))
+    if issues:
+        raise ValueError("semantic validation failed: " + "; ".join(issues))
 
 
 __all__ = [
+    "chat_completions_url",
     "LLMSettings",
     "LLMProvider",
     "ManualProvider",
@@ -312,4 +487,5 @@ __all__ = [
     "enforce_json_schema",
     "JSONRepairLoop",
     "RepairOutcome",
+    "json_schema_response_format",
 ]

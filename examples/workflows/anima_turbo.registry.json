@@ -1,0 +1,162 @@
+{
+  "workflow_id": "anima_turbo",
+  "name": "Anima Turbo (Example)",
+  "type": "text_to_image",
+  "file": "examples/workflows/anima_turbo.workflow.json",
+  "description": "Single-panel Anima Turbo workflow in ComfyUI API format, derived from the verified local anima_two_prompt_v1 graph (branch A only). Requires silvermoonmixAnima_v23, qwen_3_06b_base, qwen_image_vae, the Anima turbo LoRA, and the pythongosssss custom-scripts LoraLoader. No weights are bundled: install them yourself and accept the CircleStone Labs non-commercial licence.",
+  "bindings": {
+    "positive_prompt": {
+      "node_id": "5",
+      "input": "text"
+    },
+    "negative_prompt": {
+      "node_id": "6",
+      "input": "text"
+    },
+    "seed": {
+      "node_id": "8",
+      "input": "seed"
+    },
+    "steps": {
+      "node_id": "8",
+      "input": "steps"
+    },
+    "cfg": {
+      "node_id": "8",
+      "input": "cfg"
+    },
+    "width": {
+      "node_id": "7",
+      "input": "width"
+    },
+    "height": {
+      "node_id": "7",
+      "input": "height"
+    },
+    "checkpoint": {
+      "node_id": "1",
+      "input": "unet_name"
+    },
+    "filename_prefix": {
+      "node_id": "10",
+      "input": "filename_prefix"
+    }
+  },
+  "api_graph": {
+    "1": {
+      "class_type": "UNETLoader",
+      "inputs": {
+        "unet_name": "silvermoonmixAnima_v23.safetensors",
+        "weight_dtype": "default"
+      }
+    },
+    "2": {
+      "class_type": "CLIPLoader",
+      "inputs": {
+        "clip_name": "qwen_3_06b_base.safetensors",
+        "type": "stable_diffusion",
+        "device": "default"
+      }
+    },
+    "3": {
+      "class_type": "VAELoader",
+      "inputs": {
+        "vae_name": "qwen_image_vae.safetensors"
+      }
+    },
+    "4": {
+      "class_type": "LoraLoader|pysssss",
+      "inputs": {
+        "model": [
+          "1",
+          0
+        ],
+        "clip": [
+          "2",
+          0
+        ],
+        "lora_name": "anima-turbo-lora-v0.2.safetensors",
+        "strength_model": 1.0,
+        "strength_clip": 1.0
+      }
+    },
+    "5": {
+      "class_type": "CLIPTextEncode",
+      "inputs": {
+        "text": "masterpiece, best quality, score_7, safe, 1girl, standing, plain background",
+        "clip": [
+          "4",
+          1
+        ]
+      }
+    },
+    "6": {
+      "class_type": "CLIPTextEncode",
+      "inputs": {
+        "text": "lowres, bad anatomy, text, watermark, speech bubble",
+        "clip": [
+          "2",
+          0
+        ]
+      }
+    },
+    "7": {
+      "class_type": "EmptyLatentImage",
+      "inputs": {
+        "width": 960,
+        "height": 1280,
+        "batch_size": 1
+      }
+    },
+    "8": {
+      "class_type": "KSampler",
+      "inputs": {
+        "model": [
+          "4",
+          0
+        ],
+        "seed": 123456,
+        "steps": 12,
+        "cfg": 1.0,
+        "sampler_name": "er_sde",
+        "scheduler": "simple",
+        "positive": [
+          "5",
+          0
+        ],
+        "negative": [
+          "6",
+          0
+        ],
+        "latent_image": [
+          "7",
+          0
+        ],
+        "denoise": 1.0
+      }
+    },
+    "9": {
+      "class_type": "VAEDecode",
+      "inputs": {
+        "samples": [
+          "8",
+          0
+        ],
+        "vae": [
+          "3",
+          0
+        ]
+      }
+    },
+    "10": {
+      "class_type": "SaveImage",
+      "inputs": {
+        "images": [
+          "9",
+          0
+        ],
+        "filename_prefix": "manga_autopilot/anima_panel"
+      }
+    }
+  }
+}
