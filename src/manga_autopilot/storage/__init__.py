@@ -1,4 +1,4 @@
-"""Filesystem storage helpers."""
+"""Storage helpers for Manga Autopilot."""
 
 from manga_autopilot.storage.paths import (
     ASSET_SUBDIRS,
@@ -23,12 +23,22 @@ from manga_autopilot.storage.paths import (
     storage_paths,
     work_paths,
 )
+from manga_autopilot.storage.sqlite import (
+    DEFAULT_BUSY_TIMEOUT_MS,
+    REQUIRED_JOURNAL_MODE,
+    connect_read,
+    connect_write,
+    read_connection,
+    write_connection,
+)
 
 __all__ = [
     "ASSET_SUBDIRS",
+    "DEFAULT_BUSY_TIMEOUT_MS",
     "EXPORT_SUBDIRS",
     "MASTER_DB_FILENAME",
     "PROJECTS_SUBDIR",
+    "REQUIRED_JOURNAL_MODE",
     "SHARED_ASSETS_SUBDIR",
     "WORKS_SUBDIR",
     "WORK_DB_FILENAME",
@@ -37,13 +47,17 @@ __all__ = [
     "ProjectPaths",
     "StoragePaths",
     "WorkPaths",
+    "connect_read",
+    "connect_write",
     "ensure_legacy_project_paths",
     "ensure_project_paths",
     "ensure_storage_root",
     "ensure_work_paths",
     "legacy_project_paths",
     "project_paths",
+    "read_connection",
     "resolve_storage_root",
     "storage_paths",
     "work_paths",
+    "write_connection",
 ]
