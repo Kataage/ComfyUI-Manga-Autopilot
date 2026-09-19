@@ -8,10 +8,15 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
-from manga_autopilot.storage.migrations import MigrationResult, migrate_master_database
+from manga_autopilot.storage.migrations import (
+    DatabaseIdentityMismatchError,
+    MigrationResult,
+    migrate_master_database,
+)
 from manga_autopilot.storage.sqlite import read_connection, write_connection
 
-MASTER_DATABASE_KIND = "master"
+MASTER_DATABASE_KIND = "manga_autopilot_master"
+LEGACY_MASTER_DATABASE_KINDS = frozenset({"master"})
 MASTER_FORMAT_VERSION = "2"
 
 _REQUIRED_METADATA_KEYS = (
@@ -71,7 +76,8 @@ def _identity_from_metadata(metadata: dict[str, str]) -> MasterDatabaseIdentity:
             + ", ".join(sorted(missing))
         )
 
-    if metadata["database_kind"] != MASTER_DATABASE_KIND:
+    accepted_kinds = {MASTER_DATABASE_KIND, *LEGACY_MASTER_DATABASE_KINDS}
+    if metadata["database_kind"] not in accepted_kinds:
         raise MasterDatabaseIdentityError(
             "database_kind mismatch: "
             f"expected {MASTER_DATABASE_KIND!r}, got {metadata['database_kind']!r}"
@@ -83,7 +89,7 @@ def _identity_from_metadata(metadata: dict[str, str]) -> MasterDatabaseIdentity:
         )
 
     return MasterDatabaseIdentity(
-        database_kind=metadata["database_kind"],
+        database_kind=MASTER_DATABASE_KIND,
         database_id=metadata["database_id"],
         format_version=metadata["format_version"],
         created_at=metadata["created_at"],
@@ -107,10 +113,15 @@ def bootstrap_master_database(
     if database_id is not None and not database_id.strip():
         raise ValueError("database_id must be non-empty when provided")
 
-    migration = migrate_master_database(
-        database_path,
-        app_version=app_version,
-    )
+    try:
+        migration = migrate_master_database(
+            database_path,
+            app_version=app_version,
+        )
+    except DatabaseIdentityMismatchError as exc:
+        raise MasterDatabaseIdentityError(
+            f"database_kind mismatch: {exc}"
+        ) from exc
 
     requested_database_id = database_id or _new_master_database_id()
     created_at = _utc_now_iso()
@@ -121,7 +132,8 @@ def bootstrap_master_database(
             existing = _read_metadata(connection)
 
             existing_kind = existing.get("database_kind")
-            if existing_kind is not None and existing_kind != MASTER_DATABASE_KIND:
+            accepted_kinds = {MASTER_DATABASE_KIND, *LEGACY_MASTER_DATABASE_KINDS}
+            if existing_kind is not None and existing_kind not in accepted_kinds:
                 raise MasterDatabaseIdentityError(
                     "database_kind mismatch: "
                     f"expected {MASTER_DATABASE_KIND!r}, got {existing_kind!r}"
@@ -158,6 +170,14 @@ def bootstrap_master_database(
                 """,
                 tuple(values.items()),
             )
+            connection.execute(
+                """
+                UPDATE master_metadata
+                SET value = ?
+                WHERE key = 'database_kind' AND value != ?
+                """,
+                (MASTER_DATABASE_KIND, MASTER_DATABASE_KIND),
+            )
 
             identity = _identity_from_metadata(_read_metadata(connection))
             connection.commit()
@@ -173,6 +193,7 @@ def bootstrap_master_database(
 
 __all__ = [
     "MASTER_DATABASE_KIND",
+    "LEGACY_MASTER_DATABASE_KINDS",
     "MASTER_FORMAT_VERSION",
     "MasterDatabaseBootstrapResult",
     "MasterDatabaseIdentity",

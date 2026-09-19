@@ -1,16 +1,27 @@
-"""Versioned SQLite migration runner for Master and Work databases."""
+"""Versioned SQLite migration runner for Master and Work databases.
+
+Migration safety follows the approved v2 contract:
+
+checkpoint WAL -> validate DB identity/history -> integrity_check -> verified
+backup -> transactional migration -> post-migration validation -> record
+migration versions -> commit.
+
+Fresh databases do not need a backup. Existing recognized databases are backed
+up only when at least one migration is pending.
+"""
 
 from __future__ import annotations
 
 import hashlib
 import json
+import os
 import sqlite3
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
-from manga_autopilot.storage.sqlite import write_connection
+from manga_autopilot.storage.sqlite import read_connection, write_connection
 
 SCHEMA_MIGRATIONS_TABLE = "schema_migrations"
 
@@ -37,8 +48,24 @@ class UnknownAppliedMigrationError(MigrationError):
     """Raised when a database contains a migration unknown to this application."""
 
 
+class UnrecognizedDatabaseError(MigrationError):
+    """Raised before mutation when an existing DB is not a recognized app DB."""
+
+
+class DatabaseIdentityMismatchError(MigrationError):
+    """Raised when an existing DB belongs to a different database kind."""
+
+
 class MigrationIntegrityError(MigrationError):
-    """Raised when an integrity check fails."""
+    """Raised when an integrity or constraint check fails."""
+
+
+class MigrationBackupError(MigrationError):
+    """Raised when a pre-migration backup cannot be created or verified."""
+
+
+class MigrationValidationError(MigrationError):
+    """Raised when post-migration validation fails before commit."""
 
 
 class MigrationApplyError(MigrationError):
@@ -104,6 +131,7 @@ class MigrationResult:
     database_kind: str
     current_version: int
     applied_versions: tuple[int, ...]
+    backup_path: Path | None = None
 
 
 MASTER_MIGRATIONS: tuple[Migration, ...] = (
@@ -256,6 +284,22 @@ def sqlite_integrity_check(connection: sqlite3.Connection) -> None:
         )
 
 
+def sqlite_constraint_check(connection: sqlite3.Connection) -> None:
+    """Reject unresolved SQLite foreign-key violations."""
+    rows = connection.execute("PRAGMA foreign_key_check").fetchall()
+    if rows:
+        details = "; ".join(str(tuple(row)) for row in rows[:20])
+        raise MigrationIntegrityError(
+            "SQLite foreign_key_check failed: " + details
+        )
+
+
+def sqlite_post_migration_check(connection: sqlite3.Connection) -> None:
+    """Validate integrity and constraints before migration rows are recorded."""
+    sqlite_integrity_check(connection)
+    sqlite_constraint_check(connection)
+
+
 def _validate_migration_sequence(migrations: Sequence[Migration]) -> None:
     versions = [migration.version for migration in migrations]
     if versions != sorted(versions):
@@ -270,7 +314,6 @@ def _validate_migration_sequence(migrations: Sequence[Migration]) -> None:
 
 def _ensure_schema_migrations(connection: sqlite3.Connection) -> None:
     connection.execute(_SCHEMA_MIGRATIONS_SQL)
-    connection.commit()
 
 
 def _read_applied_migrations(
@@ -320,8 +363,23 @@ def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _existing_nonempty_database(path: Path) -> bool:
+    return path.exists() and path.is_file() and path.stat().st_size > 0
+
+
+def _table_names(connection: sqlite3.Connection) -> set[str]:
+    rows = connection.execute(
+        """
+        SELECT name
+        FROM sqlite_master
+        WHERE type = 'table'
+        """
+    ).fetchall()
+    return {str(row[0]) for row in rows}
+
+
 class MigrationRunner:
-    """Apply one ordered migration sequence to a SQLite database."""
+    """Apply one ordered migration sequence to a SQLite database safely."""
 
     def __init__(
         self,
@@ -330,7 +388,11 @@ class MigrationRunner:
         migrations: Iterable[Migration],
         app_version: str | None = None,
         pre_integrity_check: IntegrityHook | None = sqlite_integrity_check,
-        post_integrity_check: IntegrityHook | None = sqlite_integrity_check,
+        post_integrity_check: IntegrityHook | None = sqlite_post_migration_check,
+        identity_table: str | None = None,
+        identity_key: str = "database_kind",
+        accepted_database_kinds: Iterable[str] = (),
+        identity_migration_version: int | None = None,
     ) -> None:
         if not database_kind.strip():
             raise ValueError("database_kind must be non-empty")
@@ -340,28 +402,66 @@ class MigrationRunner:
         self.app_version = app_version
         self.pre_integrity_check = pre_integrity_check
         self.post_integrity_check = post_integrity_check
+        self.identity_table = identity_table
+        self.identity_key = identity_key
+        self.accepted_database_kinds = frozenset(accepted_database_kinds)
+        self.identity_migration_version = identity_migration_version
         _validate_migration_sequence(self.migrations)
 
     def migrate(self, database_path: str | Path) -> MigrationResult:
-        """Migrate a database to the latest configured version."""
-        applied_versions: list[int] = []
+        """Migrate a database using backup-first, all-or-nothing semantics."""
+        path = Path(database_path).expanduser().resolve()
+        existed = _existing_nonempty_database(path)
 
-        with write_connection(database_path) as connection:
-            if self.pre_integrity_check is not None:
+        applied = self._inspect_existing_database(path) if existed else {}
+        pending = tuple(
+            migration
+            for migration in self.migrations
+            if migration.version not in applied
+        )
+
+        if not pending:
+            return MigrationResult(
+                database_kind=self.database_kind,
+                current_version=max(applied, default=0),
+                applied_versions=(),
+                backup_path=None,
+            )
+
+        backup_path: Path | None = None
+        if existed:
+            backup_path = self._prepare_verified_backup(
+                path,
+                current_version=max(applied, default=0),
+                target_version=max(migration.version for migration in pending),
+            )
+
+        with write_connection(path) as connection:
+            if self.pre_integrity_check is not None and not existed:
                 self.pre_integrity_check(connection)
 
-            _ensure_schema_migrations(connection)
-            applied = _read_applied_migrations(connection)
-            _validate_applied_migrations(self.migrations, applied)
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                _ensure_schema_migrations(connection)
 
-            for migration in self.migrations:
-                if migration.version in applied:
-                    continue
+                for migration in pending:
+                    try:
+                        for statement in migration.statements:
+                            connection.execute(statement)
+                    except Exception as exc:
+                        raise MigrationApplyError(migration, exc) from exc
 
-                try:
-                    connection.execute("BEGIN IMMEDIATE")
-                    for statement in migration.statements:
-                        connection.execute(statement)
+                if self.post_integrity_check is not None:
+                    try:
+                        self.post_integrity_check(connection)
+                    except Exception as exc:
+                        raise MigrationValidationError(
+                            "post-migration validation failed before migration "
+                            f"records were committed: {exc}"
+                        ) from exc
+
+                applied_at = _utc_now_iso()
+                for migration in pending:
                     connection.execute(
                         f"""
                         INSERT INTO {SCHEMA_MIGRATIONS_TABLE}
@@ -372,19 +472,14 @@ class MigrationRunner:
                             migration.version,
                             migration.name,
                             migration.checksum,
-                            _utc_now_iso(),
+                            applied_at,
                             self.app_version,
                         ),
                     )
-                    connection.commit()
-                except Exception as exc:
-                    connection.rollback()
-                    raise MigrationApplyError(migration, exc) from exc
-
-                applied_versions.append(migration.version)
-
-            if self.post_integrity_check is not None:
-                self.post_integrity_check(connection)
+                connection.commit()
+            except Exception:
+                connection.rollback()
+                raise
 
             final_applied = _read_applied_migrations(connection)
             current_version = max(final_applied, default=0)
@@ -392,8 +487,134 @@ class MigrationRunner:
         return MigrationResult(
             database_kind=self.database_kind,
             current_version=current_version,
-            applied_versions=tuple(applied_versions),
+            applied_versions=tuple(m.version for m in pending),
+            backup_path=backup_path,
         )
+
+    def _inspect_existing_database(
+        self,
+        path: Path,
+    ) -> dict[int, AppliedMigration]:
+        try:
+            with read_connection(path) as connection:
+                tables = _table_names(connection)
+                if SCHEMA_MIGRATIONS_TABLE not in tables:
+                    raise UnrecognizedDatabaseError(
+                        "existing non-empty SQLite database has no recognized "
+                        "Manga Autopilot migration history"
+                    )
+
+                try:
+                    applied = _read_applied_migrations(connection)
+                except sqlite3.DatabaseError as exc:
+                    raise UnrecognizedDatabaseError(
+                        "schema_migrations exists but is not readable as the "
+                        "Manga Autopilot migration table"
+                    ) from exc
+
+                _validate_applied_migrations(self.migrations, applied)
+                self._validate_identity(connection, tables, applied)
+                return applied
+        except sqlite3.DatabaseError as exc:
+            raise UnrecognizedDatabaseError(
+                f"existing database is not a readable SQLite database: {path}"
+            ) from exc
+
+    def _validate_identity(
+        self,
+        connection: sqlite3.Connection,
+        tables: set[str],
+        applied: dict[int, AppliedMigration],
+    ) -> None:
+        if self.identity_table is None:
+            return
+
+        if self.identity_table not in tables:
+            latest = max(applied, default=0)
+            if (
+                self.identity_migration_version is not None
+                and latest < self.identity_migration_version
+            ):
+                return
+            raise UnrecognizedDatabaseError(
+                f"recognized migration history is missing identity table "
+                f"{self.identity_table!r}"
+            )
+
+        row = connection.execute(
+            f"SELECT value FROM {self.identity_table} WHERE key = ?",
+            (self.identity_key,),
+        ).fetchone()
+        if row is None:
+            raise UnrecognizedDatabaseError(
+                f"identity table {self.identity_table!r} has no "
+                f"{self.identity_key!r} value"
+            )
+
+        actual_kind = str(row[0])
+        if actual_kind not in self.accepted_database_kinds:
+            expected = ", ".join(sorted(self.accepted_database_kinds))
+            raise DatabaseIdentityMismatchError(
+                f"database identity mismatch for {self.database_kind}: "
+                f"got {actual_kind!r}; accepted values: {expected}"
+            )
+
+    def _prepare_verified_backup(
+        self,
+        path: Path,
+        *,
+        current_version: int,
+        target_version: int,
+    ) -> Path:
+        backup = path.with_name(
+            f"{path.name}.backup-v{current_version}-to-v{target_version}"
+        )
+        temp = backup.with_name(backup.name + ".tmp")
+        if temp.exists():
+            temp.unlink()
+
+        try:
+            with write_connection(path) as source:
+                checkpoint = source.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+                if checkpoint is not None and int(checkpoint[0]) != 0:
+                    raise MigrationBackupError(
+                        f"WAL checkpoint was busy for {path}: {tuple(checkpoint)}"
+                    )
+
+                self._validate_identity(
+                    source,
+                    _table_names(source),
+                    _read_applied_migrations(source),
+                )
+                if self.pre_integrity_check is not None:
+                    self.pre_integrity_check(source)
+
+                destination = sqlite3.connect(temp)
+                try:
+                    source.backup(destination)
+                finally:
+                    destination.close()
+
+            with read_connection(temp) as verification:
+                sqlite_integrity_check(verification)
+                self._validate_identity(
+                    verification,
+                    _table_names(verification),
+                    _read_applied_migrations(verification),
+                )
+
+            os.replace(temp, backup)
+            return backup
+        except MigrationError:
+            if temp.exists():
+                temp.unlink()
+            raise
+        except Exception as exc:
+            if temp.exists():
+                temp.unlink()
+            raise MigrationBackupError(
+                f"failed to create verified backup for {path}: {exc}"
+            ) from exc
 
 
 def migrate_master_database(
@@ -402,7 +623,7 @@ def migrate_master_database(
     migrations: Iterable[Migration] = MASTER_MIGRATIONS,
     app_version: str | None = None,
     pre_integrity_check: IntegrityHook | None = sqlite_integrity_check,
-    post_integrity_check: IntegrityHook | None = sqlite_integrity_check,
+    post_integrity_check: IntegrityHook | None = sqlite_post_migration_check,
 ) -> MigrationResult:
     """Migrate a Master database using the independent Master sequence."""
     return MigrationRunner(
@@ -411,6 +632,9 @@ def migrate_master_database(
         app_version=app_version,
         pre_integrity_check=pre_integrity_check,
         post_integrity_check=post_integrity_check,
+        identity_table="master_metadata",
+        accepted_database_kinds=("master", "manga_autopilot_master"),
+        identity_migration_version=2,
     ).migrate(database_path)
 
 
@@ -420,7 +644,7 @@ def migrate_work_database(
     migrations: Iterable[Migration] = WORK_MIGRATIONS,
     app_version: str | None = None,
     pre_integrity_check: IntegrityHook | None = sqlite_integrity_check,
-    post_integrity_check: IntegrityHook | None = sqlite_integrity_check,
+    post_integrity_check: IntegrityHook | None = sqlite_post_migration_check,
 ) -> MigrationResult:
     """Migrate a Work database using the independent Work sequence."""
     return MigrationRunner(
@@ -429,6 +653,9 @@ def migrate_work_database(
         app_version=app_version,
         pre_integrity_check=pre_integrity_check,
         post_integrity_check=post_integrity_check,
+        identity_table="work_database_metadata",
+        accepted_database_kinds=("work", "manga_autopilot_work"),
+        identity_migration_version=2,
     ).migrate(database_path)
 
 
@@ -437,16 +664,22 @@ __all__ = [
     "SCHEMA_MIGRATIONS_TABLE",
     "WORK_MIGRATIONS",
     "AppliedMigration",
+    "DatabaseIdentityMismatchError",
     "IntegrityHook",
     "Migration",
     "MigrationApplyError",
+    "MigrationBackupError",
     "MigrationDriftError",
     "MigrationError",
     "MigrationIntegrityError",
     "MigrationResult",
     "MigrationRunner",
+    "MigrationValidationError",
     "UnknownAppliedMigrationError",
+    "UnrecognizedDatabaseError",
     "migrate_master_database",
     "migrate_work_database",
+    "sqlite_constraint_check",
     "sqlite_integrity_check",
+    "sqlite_post_migration_check",
 ]
