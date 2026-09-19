@@ -12,7 +12,6 @@ from typing import Any
 
 from manga_autopilot.primitives import new_id, sha256_file
 from manga_autopilot.storage import (
-    MASTER_MIGRATIONS,
     WORK_MIGRATIONS,
     WorkPaths,
     bootstrap_master_database,
@@ -24,6 +23,7 @@ from manga_autopilot.storage import (
     repository_write,
     storage_paths,
     work_paths,
+    write_connection,
 )
 
 WORK_MANIFEST_FORMAT = "manga-autopilot-work"
@@ -259,7 +259,7 @@ class WorkLifecycleRepository:
                     ),
                 )
 
-            with repository_write(staging_paths.work_db) as connection:
+            with write_connection(staging_paths.work_db) as connection:
                 connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
 
             manifest = {
