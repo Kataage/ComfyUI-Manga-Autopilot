@@ -1,6 +1,7 @@
 """Repository implementations for v2 persistence."""
 
 from manga_autopilot.repositories.work_lifecycle import (
+    PortableWorkInspection,
     WorkCatalogEntry,
     WorkCreationError,
     WorkHandle,
@@ -8,9 +9,12 @@ from manga_autopilot.repositories.work_lifecycle import (
     WorkLifecycleRepository,
     WorkManifestError,
     WorkNotFoundError,
+    WorkUpgradeError,
+    inspect_work_directory,
 )
 
 __all__ = [
+    "PortableWorkInspection",
     "WorkCatalogEntry",
     "WorkCreationError",
     "WorkHandle",
@@ -18,4 +22,6 @@ __all__ = [
     "WorkLifecycleRepository",
     "WorkManifestError",
     "WorkNotFoundError",
+    "WorkUpgradeError",
+    "inspect_work_directory",
 ]
