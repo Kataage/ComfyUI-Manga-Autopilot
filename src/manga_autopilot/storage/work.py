@@ -4,12 +4,15 @@ from __future__ import annotations
 
 import sqlite3
 import uuid
+from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
 from manga_autopilot.storage.migrations import (
+    WORK_MIGRATIONS,
     DatabaseIdentityMismatchError,
+    Migration,
     MigrationResult,
     migrate_work_database,
 )
@@ -116,6 +119,7 @@ def bootstrap_work_database(
     work_id: str,
     database_id: str | None = None,
     app_version: str | None = None,
+    migrations: Iterable[Migration] = WORK_MIGRATIONS,
 ) -> WorkDatabaseBootstrapResult:
     """Migrate a Work DB and initialize stable identity metadata if needed."""
     if not work_id.strip():
@@ -126,6 +130,7 @@ def bootstrap_work_database(
     try:
         migration = migrate_work_database(
             database_path,
+            migrations=migrations,
             app_version=app_version,
         )
     except DatabaseIdentityMismatchError as exc:
