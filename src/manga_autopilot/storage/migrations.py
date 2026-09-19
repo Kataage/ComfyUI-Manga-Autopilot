@@ -108,6 +108,47 @@ class MigrationResult:
 
 MASTER_MIGRATIONS: tuple[Migration, ...] = (
     Migration(version=1, name="M0001_migration_metadata_baseline"),
+    Migration(
+        version=2,
+        name="M0002_master_backbone",
+        statements=(
+            """
+            CREATE TABLE master_metadata (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            )
+            """,
+            """
+            CREATE TABLE master_commits (
+                commit_seq INTEGER PRIMARY KEY AUTOINCREMENT,
+                commit_id TEXT NOT NULL UNIQUE,
+                actor_type TEXT NOT NULL,
+                actor_id TEXT,
+                reason TEXT,
+                run_or_operation_id TEXT,
+                created_at TEXT NOT NULL
+            )
+            """,
+            """
+            CREATE TABLE master_entity_revisions (
+                id TEXT PRIMARY KEY,
+                entity_type TEXT NOT NULL,
+                entity_id TEXT NOT NULL,
+                entity_revision INTEGER NOT NULL,
+                commit_seq INTEGER NOT NULL REFERENCES master_commits(commit_seq),
+                change_kind TEXT NOT NULL,
+                before_json TEXT,
+                after_json TEXT,
+                created_at TEXT NOT NULL,
+                UNIQUE(entity_type, entity_id, entity_revision)
+            )
+            """,
+            """
+            CREATE INDEX idx_master_entity_revisions_commit_seq
+            ON master_entity_revisions(commit_seq)
+            """,
+        ),
+    ),
 )
 
 WORK_MIGRATIONS: tuple[Migration, ...] = (

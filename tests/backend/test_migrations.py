@@ -71,19 +71,20 @@ def test_rerunning_migrations_is_idempotent(tmp_path: Path) -> None:
     first = migrate_master_database(database)
     second = migrate_master_database(database)
 
-    assert first.applied_versions == (1,)
+    assert first.applied_versions == tuple(m.version for m in MASTER_MIGRATIONS)
     assert second.applied_versions == ()
-    assert second.current_version == 1
-    assert len(_applied_rows(database)) == 1
+    assert second.current_version == MASTER_MIGRATIONS[-1].version
+    assert len(_applied_rows(database)) == len(MASTER_MIGRATIONS)
 
 
 def test_failed_migration_rolls_back_its_schema_changes(tmp_path: Path) -> None:
     database = tmp_path / "master.sqlite3"
+    next_version = MASTER_MIGRATIONS[-1].version + 1
     migrations = (
         *MASTER_MIGRATIONS,
         Migration(
-            version=2,
-            name="M0002_broken",
+            version=next_version,
+            name=f"M{next_version:04d}_broken",
             statements=(
                 "CREATE TABLE should_rollback (id INTEGER PRIMARY KEY)",
                 "INSERT INTO table_that_does_not_exist (id) VALUES (1)",
@@ -94,7 +95,7 @@ def test_failed_migration_rolls_back_its_schema_changes(tmp_path: Path) -> None:
     with pytest.raises(MigrationApplyError) as exc_info:
         migrate_master_database(database, migrations=migrations)
 
-    assert exc_info.value.migration.version == 2
+    assert exc_info.value.migration.version == next_version
 
     with write_connection(database) as connection:
         table = connection.execute(
@@ -109,24 +110,25 @@ def test_failed_migration_rolls_back_its_schema_changes(tmp_path: Path) -> None:
         ).fetchall()
 
     assert table is None
-    assert [row["version"] for row in versions] == [1]
+    assert [row["version"] for row in versions] == [m.version for m in MASTER_MIGRATIONS]
 
 
 def test_checksum_drift_is_rejected(tmp_path: Path) -> None:
     database = tmp_path / "master.sqlite3"
+    next_version = MASTER_MIGRATIONS[-1].version + 1
     original = (
         *MASTER_MIGRATIONS,
         Migration(
-            version=2,
-            name="M0002_example",
+            version=next_version,
+            name=f"M{next_version:04d}_example",
             statements=("CREATE TABLE sample (id INTEGER PRIMARY KEY)",),
         ),
     )
     changed = (
         *MASTER_MIGRATIONS,
         Migration(
-            version=2,
-            name="M0002_example",
+            version=next_version,
+            name=f"M{next_version:04d}_example",
             statements=(
                 "CREATE TABLE sample (id INTEGER PRIMARY KEY, value TEXT)",
             ),
@@ -141,9 +143,10 @@ def test_checksum_drift_is_rejected(tmp_path: Path) -> None:
 
 def test_unknown_applied_migration_is_rejected(tmp_path: Path) -> None:
     database = tmp_path / "master.sqlite3"
+    next_version = MASTER_MIGRATIONS[-1].version + 1
     extended = (
         *MASTER_MIGRATIONS,
-        Migration(version=2, name="M0002_known_now"),
+        Migration(version=next_version, name=f"M{next_version:04d}_known_now"),
     )
     migrate_master_database(database, migrations=extended)
 
@@ -155,11 +158,12 @@ def test_master_and_work_versions_can_advance_independently(tmp_path: Path) -> N
     master_database = tmp_path / "master.sqlite3"
     work_database = tmp_path / "work.sqlite3"
 
+    next_version = MASTER_MIGRATIONS[-1].version + 1
     master_migrations = (
         *MASTER_MIGRATIONS,
         Migration(
-            version=2,
-            name="M0002_master_only",
+            version=next_version,
+            name=f"M{next_version:04d}_master_only",
             statements=("CREATE TABLE master_only (id INTEGER PRIMARY KEY)",),
         ),
     )
@@ -170,8 +174,8 @@ def test_master_and_work_versions_can_advance_independently(tmp_path: Path) -> N
     )
     work_result = migrate_work_database(work_database)
 
-    assert master_result.current_version == 2
-    assert work_result.current_version == 1
+    assert master_result.current_version == next_version
+    assert work_result.current_version == WORK_MIGRATIONS[-1].version
 
 
 def test_pre_and_post_integrity_hooks_are_called(tmp_path: Path) -> None:
@@ -192,7 +196,7 @@ def test_pre_and_post_integrity_hooks_are_called(tmp_path: Path) -> None:
         post_integrity_check=post,
     )
 
-    assert result.current_version == 1
+    assert result.current_version == MASTER_MIGRATIONS[-1].version
     assert calls == ["pre", "post"]
 
 
