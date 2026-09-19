@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -13,11 +14,14 @@ from typing import Any
 from manga_autopilot.primitives import new_id, sha256_file
 from manga_autopilot.storage import (
     WORK_MIGRATIONS,
+    Migration,
+    MigrationError,
     WorkPaths,
     bootstrap_master_database,
     bootstrap_work_database,
     create_work_commit,
     ensure_storage_root,
+    migrate_work_database,
     read_work_identity,
     repository_read,
     repository_write,
@@ -27,7 +31,10 @@ from manga_autopilot.storage import (
 )
 
 WORK_MANIFEST_FORMAT = "manga-autopilot-work"
-WORK_MANIFEST_FORMAT_VERSION = 1
+WORK_MANIFEST_FORMAT_VERSION = 2
+LEGACY_WORK_MANIFEST_FORMAT_VERSIONS = frozenset({1})
+LIVE_MANIFEST_INTEGRITY_MODE = "live_mutable"
+LIVE_MANIFEST_HASH_POLICY = "package_only"
 
 
 class WorkLifecycleError(RuntimeError):
@@ -50,6 +57,10 @@ class WorkIdentityMismatchError(WorkLifecycleError):
     """Raised when catalog, manifest, DB identity, and Work state disagree."""
 
 
+class WorkUpgradeError(WorkLifecycleError):
+    """Raised when a Work cannot be safely upgraded before opening."""
+
+
 @dataclass(frozen=True)
 class WorkCatalogEntry:
     """Master-side discovery metadata for one Work."""
@@ -68,6 +79,22 @@ class WorkCatalogEntry:
 
 
 @dataclass(frozen=True)
+class PortableWorkInspection:
+    """Portable Work inspection that does not require a Master database."""
+
+    work_id: str
+    root: Path
+    database_path: Path
+    manifest_path: Path
+    manifest_format_version: int
+    manifest_schema_version: int
+    database_schema_version: int
+    target_schema_version: int
+    upgrade_required: bool
+    manifest_refresh_required: bool
+
+
+@dataclass(frozen=True)
 class WorkHandle:
     """Opened Work state with Work DB authoritative metadata."""
 
@@ -82,6 +109,8 @@ class WorkHandle:
     status: str
     current_commit_seq: int
     current_revision: int
+    schema_version: int
+    migration_backup_path: Path | None
     created_at: str
     updated_at: str
     catalog: WorkCatalogEntry
@@ -138,17 +167,167 @@ def _catalog_entry(row: Any) -> WorkCatalogEntry:
     )
 
 
+def _target_schema_version(migrations: Iterable[Migration]) -> int:
+    versions = [migration.version for migration in migrations]
+    return max(versions, default=0)
+
+
+def _read_database_schema_version(database_path: Path) -> int:
+    with repository_read(database_path) as connection:
+        row = connection.execute(
+            "SELECT MAX(version) AS version FROM schema_migrations"
+        ).fetchone()
+    return int(row["version"] or 0)
+
+
+def _live_manifest(
+    *,
+    work_id: str,
+    database_name: str,
+    work_schema_version: int,
+    created_at: str,
+    app_version: str | None,
+) -> dict[str, Any]:
+    return {
+        "format": WORK_MANIFEST_FORMAT,
+        "format_version": WORK_MANIFEST_FORMAT_VERSION,
+        "work_id": work_id,
+        "database": database_name,
+        "work_schema_version": work_schema_version,
+        "created_at": created_at,
+        "app_version": app_version,
+        "integrity": {
+            "mode": LIVE_MANIFEST_INTEGRITY_MODE,
+            "database_hash_policy": LIVE_MANIFEST_HASH_POLICY,
+        },
+    }
+
+
+def _validate_manifest(
+    manifest: dict[str, Any],
+    *,
+    expected_work_id: str | None,
+    expected_database_name: str = "work.sqlite3",
+) -> None:
+    if manifest.get("format") != WORK_MANIFEST_FORMAT:
+        raise WorkManifestError(
+            f"unsupported Work manifest format: {manifest.get('format')!r}"
+        )
+
+    format_version = manifest.get("format_version")
+    accepted_versions = {
+        WORK_MANIFEST_FORMAT_VERSION,
+        *LEGACY_WORK_MANIFEST_FORMAT_VERSIONS,
+    }
+    if format_version not in accepted_versions:
+        raise WorkManifestError(
+            f"unsupported Work manifest format_version: {format_version!r}"
+        )
+
+    work_id = manifest.get("work_id")
+    if not isinstance(work_id, str) or not work_id:
+        raise WorkManifestError("Work manifest work_id must be a non-empty string")
+    if expected_work_id is not None and work_id != expected_work_id:
+        raise WorkIdentityMismatchError(
+            f"manifest Work identity mismatch: expected {expected_work_id!r}, "
+            f"got {work_id!r}"
+        )
+
+    if manifest.get("database") != expected_database_name:
+        raise WorkManifestError(
+            f"manifest database mismatch: expected {expected_database_name!r}, "
+            f"got {manifest.get('database')!r}"
+        )
+
+    schema_version = manifest.get("work_schema_version")
+    if not isinstance(schema_version, int) or schema_version < 1:
+        raise WorkManifestError(
+            "Work manifest work_schema_version must be a positive integer"
+        )
+
+
+def inspect_work_directory(
+    work_root: str | Path,
+    *,
+    migrations: Iterable[Migration] = WORK_MIGRATIONS,
+    expected_work_id: str | None = None,
+) -> PortableWorkInspection:
+    """Inspect a portable Work directory without requiring Master DB access."""
+    migration_set = tuple(migrations)
+    root = Path(work_root).expanduser().resolve()
+    manifest_path = root / "manifest.json"
+    database_path = root / "work.sqlite3"
+
+    manifest = _read_manifest(manifest_path)
+    _validate_manifest(
+        manifest,
+        expected_work_id=expected_work_id,
+        expected_database_name=database_path.name,
+    )
+
+    work_id = str(manifest["work_id"])
+    identity = read_work_identity(database_path)
+    if identity.work_id != work_id:
+        raise WorkIdentityMismatchError(
+            f"Work DB identity mismatch: manifest={work_id!r}, "
+            f"database={identity.work_id!r}"
+        )
+
+    database_schema_version = _read_database_schema_version(database_path)
+    manifest_schema_version = int(manifest["work_schema_version"])
+    if manifest_schema_version > database_schema_version:
+        raise WorkManifestError(
+            f"manifest schema version is ahead of Work DB for {work_id!r}: "
+            f"manifest={manifest_schema_version}, database={database_schema_version}"
+        )
+
+    target_schema_version = _target_schema_version(migration_set)
+    integrity = manifest.get("integrity")
+    live_integrity_current = (
+        isinstance(integrity, dict)
+        and integrity.get("mode") == LIVE_MANIFEST_INTEGRITY_MODE
+        and integrity.get("database_hash_policy") == LIVE_MANIFEST_HASH_POLICY
+        and "database_sha256" not in integrity
+    )
+    manifest_refresh_required = (
+        manifest.get("format_version") != WORK_MANIFEST_FORMAT_VERSION
+        or manifest_schema_version != database_schema_version
+        or not live_integrity_current
+    )
+
+    return PortableWorkInspection(
+        work_id=work_id,
+        root=root,
+        database_path=database_path,
+        manifest_path=manifest_path,
+        manifest_format_version=int(manifest["format_version"]),
+        manifest_schema_version=manifest_schema_version,
+        database_schema_version=database_schema_version,
+        target_schema_version=target_schema_version,
+        upgrade_required=database_schema_version < target_schema_version,
+        manifest_refresh_required=manifest_refresh_required,
+    )
+
+
 class WorkLifecycleRepository:
     """Create, open, and discover v2 Works.
 
-    The Master catalog is discovery metadata only. Opened Work semantic fields
-    are always read from `work.sqlite3`.
+    Master is discovery metadata. Work-local semantic state remains authoritative
+    in work.sqlite3. Opening a Work first upgrades its DB safely to the configured
+    Work schema before a writable handle is returned.
     """
 
-    def __init__(self, storage_root: str | Path, *, app_version: str | None = None) -> None:
+    def __init__(
+        self,
+        storage_root: str | Path,
+        *,
+        app_version: str | None = None,
+        work_migrations: Iterable[Migration] = WORK_MIGRATIONS,
+    ) -> None:
         self.storage_root = ensure_storage_root(storage_root)
         self.paths = storage_paths(self.storage_root)
         self.app_version = app_version
+        self.work_migrations = tuple(work_migrations)
         bootstrap_master_database(
             self.paths.master_db,
             app_version=app_version,
@@ -202,7 +381,6 @@ class WorkLifecycleRepository:
 
         staging_paths = WorkPaths(work_id=resolved_work_id, root=staging_root)
         created_at = _utc_now_iso()
-        manifest_hash: str | None = None
 
         try:
             staging_paths.root.mkdir(parents=True, exist_ok=False)
@@ -214,6 +392,7 @@ class WorkLifecycleRepository:
                 staging_paths.work_db,
                 work_id=resolved_work_id,
                 app_version=self.app_version,
+                migrations=self.work_migrations,
             )
 
             with repository_write(staging_paths.work_db) as connection:
@@ -262,18 +441,13 @@ class WorkLifecycleRepository:
             with write_connection(staging_paths.work_db) as connection:
                 connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
 
-            manifest = {
-                "format": WORK_MANIFEST_FORMAT,
-                "format_version": WORK_MANIFEST_FORMAT_VERSION,
-                "work_id": resolved_work_id,
-                "database": staging_paths.work_db.name,
-                "work_schema_version": WORK_MIGRATIONS[-1].version,
-                "created_at": created_at,
-                "app_version": self.app_version,
-                "integrity": {
-                    "database_sha256": sha256_file(staging_paths.work_db),
-                },
-            }
+            manifest = _live_manifest(
+                work_id=resolved_work_id,
+                database_name=staging_paths.work_db.name,
+                work_schema_version=_target_schema_version(self.work_migrations),
+                created_at=created_at,
+                app_version=self.app_version,
+            )
             _write_json_atomic(staging_paths.manifest_json, manifest)
             manifest_hash = sha256_file(staging_paths.manifest_json)
 
@@ -326,7 +500,7 @@ class WorkLifecycleRepository:
         return self.open_work(resolved_work_id)
 
     def open_work(self, work_id: str) -> WorkHandle:
-        """Open one cataloged Work and validate manifest/DB identity."""
+        """Safely upgrade, validate, and open one cataloged Work."""
         with repository_read(self.paths.master_db) as connection:
             row = connection.execute(
                 "SELECT * FROM work_catalog WHERE work_id = ?",
@@ -337,40 +511,73 @@ class WorkLifecycleRepository:
 
         catalog = _catalog_entry(row)
         root = self._resolve_catalog_path(catalog.relative_work_path)
-        database_path = root / "work.sqlite3"
-        manifest_path = root / "manifest.json"
-
-        manifest = _read_manifest(manifest_path)
-        self._validate_manifest(
-            manifest,
+        inspection = inspect_work_directory(
+            root,
+            migrations=self.work_migrations,
             expected_work_id=work_id,
-            expected_database_name=database_path.name,
         )
-
-        current_manifest_hash = sha256_file(manifest_path)
-        if (
-            catalog.manifest_hash is not None
-            and current_manifest_hash != catalog.manifest_hash
-        ):
-            raise WorkManifestError(
-                f"manifest hash mismatch for Work {work_id!r}: "
-                f"catalog={catalog.manifest_hash}, actual={current_manifest_hash}"
+        if inspection.work_id != work_id:
+            raise WorkIdentityMismatchError(
+                f"portable Work identity mismatch: catalog={work_id!r}, "
+                f"work={inspection.work_id!r}"
             )
 
-        identity = read_work_identity(database_path)
+        manifest = _read_manifest(inspection.manifest_path)
+
+        try:
+            migration = migrate_work_database(
+                inspection.database_path,
+                migrations=self.work_migrations,
+                app_version=self.app_version,
+            )
+        except MigrationError as exc:
+            raise WorkUpgradeError(
+                f"failed to upgrade Work {work_id!r} before open: {exc}"
+            ) from exc
+
+        schema_version = migration.current_version
+        created_at = str(manifest.get("created_at") or _utc_now_iso())
+        normalized_manifest = _live_manifest(
+            work_id=work_id,
+            database_name=inspection.database_path.name,
+            work_schema_version=schema_version,
+            created_at=created_at,
+            app_version=self.app_version or manifest.get("app_version"),
+        )
+
+        if manifest != normalized_manifest:
+            try:
+                _write_json_atomic(inspection.manifest_path, normalized_manifest)
+            except OSError as exc:
+                raise WorkManifestError(
+                    f"Work DB is valid but live manifest refresh failed for "
+                    f"{work_id!r}: {exc}"
+                ) from exc
+
+        refreshed_inspection = inspect_work_directory(
+            root,
+            migrations=self.work_migrations,
+        )
+        if refreshed_inspection.upgrade_required:
+            raise WorkUpgradeError(
+                f"Work {work_id!r} still requires migration after upgrade"
+            )
+        if refreshed_inspection.manifest_refresh_required:
+            raise WorkManifestError(
+                f"Work {work_id!r} live manifest is not synchronized after upgrade"
+            )
+
+        identity = read_work_identity(inspection.database_path)
         if identity.work_id != work_id:
             raise WorkIdentityMismatchError(
                 f"Work DB identity mismatch: catalog={work_id!r}, "
                 f"database={identity.work_id!r}"
             )
 
-        with repository_read(database_path) as connection:
+        with repository_read(inspection.database_path) as connection:
             metadata = connection.execute(
                 "SELECT * FROM work_metadata WHERE work_id = ?",
                 (work_id,),
-            ).fetchone()
-            schema_version_row = connection.execute(
-                "SELECT MAX(version) AS version FROM schema_migrations"
             ).fetchone()
 
         if metadata is None:
@@ -378,36 +585,31 @@ class WorkLifecycleRepository:
                 f"Work DB has no authoritative work_metadata row for {work_id!r}"
             )
 
-        manifest_schema_version = manifest.get("work_schema_version")
-        actual_schema_version = int(schema_version_row["version"] or 0)
-        if manifest_schema_version != actual_schema_version:
-            raise WorkManifestError(
-                f"work schema version mismatch for {work_id!r}: "
-                f"manifest={manifest_schema_version!r}, actual={actual_schema_version}"
-            )
-
         opened_at = _utc_now_iso()
+        manifest_hash = sha256_file(inspection.manifest_path)
         with repository_write(self.paths.master_db) as connection:
             connection.execute(
                 """
                 UPDATE work_catalog
-                SET last_opened_at = ?
+                SET manifest_hash = ?,
+                    last_opened_at = ?
                 WHERE work_id = ?
                 """,
-                (opened_at, work_id),
+                (manifest_hash, opened_at, work_id),
             )
 
         refreshed_catalog = WorkCatalogEntry(
             **{
                 **catalog.__dict__,
+                "manifest_hash": manifest_hash,
                 "last_opened_at": opened_at,
             }
         )
         return WorkHandle(
             work_id=work_id,
             root=root,
-            database_path=database_path,
-            manifest_path=manifest_path,
+            database_path=inspection.database_path,
+            manifest_path=inspection.manifest_path,
             title=str(metadata["title"]),
             work_kind=str(metadata["work_kind"]),
             language=str(metadata["language"]),
@@ -415,6 +617,8 @@ class WorkLifecycleRepository:
             status=str(metadata["status"]),
             current_commit_seq=int(metadata["current_commit_seq"]),
             current_revision=int(metadata["current_revision"]),
+            schema_version=schema_version,
+            migration_backup_path=migration.backup_path,
             created_at=str(metadata["created_at"]),
             updated_at=str(metadata["updated_at"]),
             catalog=refreshed_catalog,
@@ -446,37 +650,14 @@ class WorkLifecycleRepository:
             )
         return root
 
-    @staticmethod
-    def _validate_manifest(
-        manifest: dict[str, Any],
-        *,
-        expected_work_id: str,
-        expected_database_name: str,
-    ) -> None:
-        if manifest.get("format") != WORK_MANIFEST_FORMAT:
-            raise WorkManifestError(
-                f"unsupported Work manifest format: {manifest.get('format')!r}"
-            )
-        if manifest.get("format_version") != WORK_MANIFEST_FORMAT_VERSION:
-            raise WorkManifestError(
-                "unsupported Work manifest format_version: "
-                f"{manifest.get('format_version')!r}"
-            )
-        if manifest.get("work_id") != expected_work_id:
-            raise WorkIdentityMismatchError(
-                f"manifest Work identity mismatch: expected {expected_work_id!r}, "
-                f"got {manifest.get('work_id')!r}"
-            )
-        if manifest.get("database") != expected_database_name:
-            raise WorkManifestError(
-                f"manifest database mismatch: expected {expected_database_name!r}, "
-                f"got {manifest.get('database')!r}"
-            )
-
 
 __all__ = [
+    "LEGACY_WORK_MANIFEST_FORMAT_VERSIONS",
+    "LIVE_MANIFEST_HASH_POLICY",
+    "LIVE_MANIFEST_INTEGRITY_MODE",
     "WORK_MANIFEST_FORMAT",
     "WORK_MANIFEST_FORMAT_VERSION",
+    "PortableWorkInspection",
     "WorkCatalogEntry",
     "WorkCreationError",
     "WorkHandle",
@@ -485,4 +666,6 @@ __all__ = [
     "WorkLifecycleRepository",
     "WorkManifestError",
     "WorkNotFoundError",
+    "WorkUpgradeError",
+    "inspect_work_directory",
 ]
