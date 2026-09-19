@@ -243,6 +243,142 @@ WORK_MIGRATIONS: tuple[Migration, ...] = (
             """,
         ),
     ),
+    Migration(
+        version=3,
+        name="W0003_page_layout_panel",
+        statements=(
+            """
+            CREATE TABLE pages (
+                id TEXT PRIMARY KEY,
+                page_number INTEGER NOT NULL,
+                order_key TEXT NOT NULL,
+                page_role TEXT NOT NULL,
+                page_purpose TEXT NOT NULL,
+                narrative_goal TEXT,
+                format_kind TEXT NOT NULL,
+                layout_instance_id TEXT,
+                status TEXT NOT NULL,
+                revision INTEGER NOT NULL,
+                created_commit_seq INTEGER NOT NULL REFERENCES commits(commit_seq),
+                updated_commit_seq INTEGER NOT NULL REFERENCES commits(commit_seq),
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                archived_at TEXT,
+                UNIQUE(page_number)
+            )
+            """,
+            """
+            CREATE INDEX idx_pages_order_key
+            ON pages(order_key)
+            """,
+            """
+            CREATE INDEX idx_pages_status_number
+            ON pages(status, page_number)
+            """,
+            """
+            CREATE TABLE page_story_beats (
+                id TEXT PRIMARY KEY,
+                page_id TEXT NOT NULL REFERENCES pages(id),
+                sequence_key TEXT NOT NULL,
+                story_event_id TEXT REFERENCES story_events(id),
+                beat_type TEXT NOT NULL,
+                description TEXT NOT NULL,
+                required INTEGER NOT NULL,
+                visual_weight TEXT NOT NULL,
+                metadata_json TEXT NOT NULL,
+                revision INTEGER NOT NULL,
+                created_commit_seq INTEGER NOT NULL REFERENCES commits(commit_seq),
+                updated_commit_seq INTEGER NOT NULL REFERENCES commits(commit_seq),
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """,
+            """
+            CREATE INDEX idx_page_story_beats_page_sequence
+            ON page_story_beats(page_id, sequence_key)
+            """,
+            """
+            CREATE INDEX idx_page_story_beats_story_event
+            ON page_story_beats(story_event_id)
+            """,
+            """
+            CREATE TABLE layout_instances (
+                id TEXT PRIMARY KEY,
+                page_id TEXT NOT NULL UNIQUE REFERENCES pages(id),
+                source_template_id TEXT,
+                template_snapshot_id TEXT REFERENCES source_snapshots(id),
+                layout_kind TEXT NOT NULL,
+                reading_direction TEXT NOT NULL,
+                parameters_json TEXT NOT NULL,
+                geometry_json TEXT NOT NULL,
+                constraints_json TEXT NOT NULL,
+                revision INTEGER NOT NULL,
+                created_commit_seq INTEGER NOT NULL REFERENCES commits(commit_seq),
+                updated_commit_seq INTEGER NOT NULL REFERENCES commits(commit_seq),
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """,
+            """
+            CREATE TABLE layout_slots (
+                id TEXT PRIMARY KEY,
+                layout_instance_id TEXT NOT NULL REFERENCES layout_instances(id),
+                slot_key TEXT NOT NULL,
+                reading_order INTEGER NOT NULL,
+                geometry_json TEXT NOT NULL,
+                semantic_json TEXT NOT NULL,
+                safe_subject_region_json TEXT NOT NULL,
+                bubble_regions_json TEXT NOT NULL,
+                forbidden_regions_json TEXT NOT NULL,
+                revision INTEGER NOT NULL,
+                created_commit_seq INTEGER NOT NULL REFERENCES commits(commit_seq),
+                updated_commit_seq INTEGER NOT NULL REFERENCES commits(commit_seq),
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(layout_instance_id, slot_key),
+                UNIQUE(layout_instance_id, reading_order)
+            )
+            """,
+            """
+            CREATE TABLE panels (
+                id TEXT PRIMARY KEY,
+                page_id TEXT NOT NULL REFERENCES pages(id),
+                layout_slot_id TEXT REFERENCES layout_slots(id),
+                order_index INTEGER NOT NULL,
+                panel_role TEXT NOT NULL,
+                panel_purpose TEXT NOT NULL,
+                entry_anchor_id TEXT REFERENCES temporal_anchors(id),
+                exit_anchor_id TEXT REFERENCES temporal_anchors(id),
+                action_json TEXT NOT NULL,
+                camera_json TEXT NOT NULL,
+                emotion_requirements_json TEXT NOT NULL,
+                environment_requirements_json TEXT NOT NULL,
+                continuity_requirements_json TEXT NOT NULL,
+                generation_spec_json TEXT NOT NULL,
+                selected_candidate_id TEXT,
+                status TEXT NOT NULL,
+                revision INTEGER NOT NULL,
+                created_commit_seq INTEGER NOT NULL REFERENCES commits(commit_seq),
+                updated_commit_seq INTEGER NOT NULL REFERENCES commits(commit_seq),
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                archived_at TEXT,
+                UNIQUE(page_id, order_index)
+            )
+            """,
+            """
+            CREATE INDEX idx_panels_page_status
+            ON panels(page_id, status)
+            """,
+            """
+            CREATE TABLE panel_story_beats (
+                panel_id TEXT NOT NULL REFERENCES panels(id),
+                page_story_beat_id TEXT NOT NULL REFERENCES page_story_beats(id),
+                PRIMARY KEY(panel_id, page_story_beat_id)
+            )
+            """,
+        ),
+    ),
 )
 
 
