@@ -11,14 +11,20 @@ from manga_autopilot.storage import (
     MASTER_MIGRATIONS,
     SCHEMA_MIGRATIONS_TABLE,
     WORK_MIGRATIONS,
+    DatabaseIdentityMismatchError,
     Migration,
     MigrationApplyError,
     MigrationDriftError,
     MigrationIntegrityError,
     MigrationRunner,
+    MigrationValidationError,
     UnknownAppliedMigrationError,
+    UnrecognizedDatabaseError,
+    bootstrap_master_database,
+    bootstrap_work_database,
     migrate_master_database,
     migrate_work_database,
+    read_connection,
     write_connection,
 )
 
@@ -42,6 +48,7 @@ def test_fresh_master_database_migrates_to_latest(tmp_path: Path) -> None:
     assert result.database_kind == "master"
     assert result.current_version == MASTER_MIGRATIONS[-1].version
     assert result.applied_versions == tuple(m.version for m in MASTER_MIGRATIONS)
+    assert result.backup_path is None
 
     rows = _applied_rows(database)
     assert [row["version"] for row in rows] == [m.version for m in MASTER_MIGRATIONS]
@@ -59,25 +66,29 @@ def test_fresh_work_database_migrates_to_independent_sequence(tmp_path: Path) ->
     assert result.database_kind == "work"
     assert result.current_version == WORK_MIGRATIONS[-1].version
     assert result.applied_versions == tuple(m.version for m in WORK_MIGRATIONS)
+    assert result.backup_path is None
 
     rows = _applied_rows(database)
     assert rows[-1]["name"] == WORK_MIGRATIONS[-1].name
     assert rows[-1]["name"] != MASTER_MIGRATIONS[-1].name
 
 
-def test_rerunning_migrations_is_idempotent(tmp_path: Path) -> None:
+def test_rerunning_migrations_is_idempotent_for_valid_master(tmp_path: Path) -> None:
     database = tmp_path / "master.sqlite3"
 
-    first = migrate_master_database(database)
+    first = bootstrap_master_database(database).migration
     second = migrate_master_database(database)
 
     assert first.applied_versions == tuple(m.version for m in MASTER_MIGRATIONS)
     assert second.applied_versions == ()
     assert second.current_version == MASTER_MIGRATIONS[-1].version
+    assert second.backup_path is None
     assert len(_applied_rows(database)) == len(MASTER_MIGRATIONS)
 
 
-def test_failed_migration_rolls_back_its_schema_changes(tmp_path: Path) -> None:
+def test_failed_fresh_migration_rolls_back_all_pending_schema_changes(
+    tmp_path: Path,
+) -> None:
     database = tmp_path / "master.sqlite3"
     next_version = MASTER_MIGRATIONS[-1].version + 1
     migrations = (
@@ -98,23 +109,188 @@ def test_failed_migration_rolls_back_its_schema_changes(tmp_path: Path) -> None:
     assert exc_info.value.migration.version == next_version
 
     with write_connection(database) as connection:
-        table = connection.execute(
-            """
-            SELECT name
-            FROM sqlite_master
-            WHERE type = 'table' AND name = 'should_rollback'
-            """
-        ).fetchone()
-        versions = connection.execute(
-            f"SELECT version FROM {SCHEMA_MIGRATIONS_TABLE} ORDER BY version"
-        ).fetchall()
+        tables = {
+            row["name"]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            ).fetchall()
+        }
 
-    assert table is None
-    assert [row["version"] for row in versions] == [m.version for m in MASTER_MIGRATIONS]
+    assert "should_rollback" not in tables
+    assert SCHEMA_MIGRATIONS_TABLE not in tables
+
+
+def test_existing_migration_failure_preserves_verified_backup_and_original(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "master.sqlite3"
+    bootstrap_master_database(database, database_id="master_test")
+    next_version = MASTER_MIGRATIONS[-1].version + 1
+    migrations = (
+        *MASTER_MIGRATIONS,
+        Migration(
+            version=next_version,
+            name=f"M{next_version:04d}_broken",
+            statements=(
+                "CREATE TABLE should_rollback (id INTEGER PRIMARY KEY)",
+                "INSERT INTO missing_table (id) VALUES (1)",
+            ),
+        ),
+    )
+
+    with pytest.raises(MigrationApplyError):
+        migrate_master_database(database, migrations=migrations)
+
+    backup = database.with_name(
+        f"{database.name}.backup-v{MASTER_MIGRATIONS[-1].version}-to-v{next_version}"
+    )
+    assert backup.is_file()
+
+    with read_connection(database) as connection:
+        assert connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE name = 'should_rollback'"
+        ).fetchone() is None
+        version = connection.execute(
+            f"SELECT MAX(version) FROM {SCHEMA_MIGRATIONS_TABLE}"
+        ).fetchone()[0]
+    assert version == MASTER_MIGRATIONS[-1].version
+
+    with read_connection(backup) as connection:
+        assert connection.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+        version = connection.execute(
+            f"SELECT MAX(version) FROM {SCHEMA_MIGRATIONS_TABLE}"
+        ).fetchone()[0]
+    assert version == MASTER_MIGRATIONS[-1].version
+
+
+def test_existing_valid_database_migration_creates_verified_backup(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "master.sqlite3"
+    bootstrap_master_database(database, database_id="master_test")
+
+    with write_connection(database) as connection:
+        connection.execute(
+            """
+            INSERT INTO master_commits (commit_id, actor_type, created_at)
+            VALUES ('before_backup', 'system', '2026-09-20T00:00:00+00:00')
+            """
+        )
+        connection.commit()
+
+    next_version = MASTER_MIGRATIONS[-1].version + 1
+    migrations = (
+        *MASTER_MIGRATIONS,
+        Migration(
+            version=next_version,
+            name=f"M{next_version:04d}_backup_test",
+            statements=("CREATE TABLE after_backup (id INTEGER PRIMARY KEY)",),
+        ),
+    )
+
+    result = migrate_master_database(database, migrations=migrations)
+
+    assert result.backup_path is not None
+    assert result.backup_path.is_file()
+    assert result.current_version == next_version
+
+    with read_connection(result.backup_path) as backup:
+        assert backup.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+        assert backup.execute(
+            "SELECT 1 FROM master_commits WHERE commit_id = 'before_backup'"
+        ).fetchone() is not None
+        assert backup.execute(
+            "SELECT 1 FROM sqlite_master WHERE name = 'after_backup'"
+        ).fetchone() is None
+
+
+def test_post_validation_failure_is_not_recorded_or_committed(tmp_path: Path) -> None:
+    database = tmp_path / "master.sqlite3"
+    bootstrap_master_database(database, database_id="master_test")
+    next_version = MASTER_MIGRATIONS[-1].version + 1
+    migrations = (
+        *MASTER_MIGRATIONS,
+        Migration(
+            version=next_version,
+            name=f"M{next_version:04d}_validation_test",
+            statements=("CREATE TABLE validation_test (id INTEGER PRIMARY KEY)",),
+        ),
+    )
+
+    def fail_validation(_connection: sqlite3.Connection) -> None:
+        raise MigrationIntegrityError("simulated post validation failure")
+
+    with pytest.raises(MigrationValidationError, match="post-migration validation"):
+        migrate_master_database(
+            database,
+            migrations=migrations,
+            post_integrity_check=fail_validation,
+        )
+
+    with read_connection(database) as connection:
+        assert connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE name = 'validation_test'"
+        ).fetchone() is None
+        version = connection.execute(
+            f"SELECT MAX(version) FROM {SCHEMA_MIGRATIONS_TABLE}"
+        ).fetchone()[0]
+
+    assert version == MASTER_MIGRATIONS[-1].version
+    backup = database.with_name(
+        f"{database.name}.backup-v{MASTER_MIGRATIONS[-1].version}-to-v{next_version}"
+    )
+    assert backup.is_file()
+
+
+def test_unknown_nonempty_sqlite_database_is_not_mutated(tmp_path: Path) -> None:
+    database = tmp_path / "unknown.sqlite3"
+    raw = sqlite3.connect(database)
+    try:
+        raw.execute("CREATE TABLE unrelated (id INTEGER PRIMARY KEY)")
+        raw.execute("INSERT INTO unrelated (id) VALUES (1)")
+        raw.commit()
+    finally:
+        raw.close()
+
+    with pytest.raises(UnrecognizedDatabaseError, match="migration history"):
+        migrate_master_database(database)
+
+    raw = sqlite3.connect(database)
+    try:
+        tables = {
+            row[0]
+            for row in raw.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            ).fetchall()
+        }
+        count = raw.execute("SELECT COUNT(*) FROM unrelated").fetchone()[0]
+    finally:
+        raw.close()
+
+    assert tables == {"unrelated"}
+    assert count == 1
+
+
+def test_wrong_database_identity_is_rejected_before_master_mutation(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "work.sqlite3"
+    bootstrap_work_database(database, work_id="work_001")
+
+    with pytest.raises(
+        (DatabaseIdentityMismatchError, MigrationDriftError),
+    ):
+        migrate_master_database(database)
+
+    with read_connection(database) as connection:
+        assert connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE name = 'master_metadata'"
+        ).fetchone() is None
 
 
 def test_checksum_drift_is_rejected(tmp_path: Path) -> None:
     database = tmp_path / "master.sqlite3"
+    bootstrap_master_database(database, database_id="master_test")
     next_version = MASTER_MIGRATIONS[-1].version + 1
     original = (
         *MASTER_MIGRATIONS,
@@ -143,6 +319,7 @@ def test_checksum_drift_is_rejected(tmp_path: Path) -> None:
 
 def test_unknown_applied_migration_is_rejected(tmp_path: Path) -> None:
     database = tmp_path / "master.sqlite3"
+    bootstrap_master_database(database, database_id="master_test")
     next_version = MASTER_MIGRATIONS[-1].version + 1
     extended = (
         *MASTER_MIGRATIONS,
@@ -157,6 +334,9 @@ def test_unknown_applied_migration_is_rejected(tmp_path: Path) -> None:
 def test_master_and_work_versions_can_advance_independently(tmp_path: Path) -> None:
     master_database = tmp_path / "master.sqlite3"
     work_database = tmp_path / "work.sqlite3"
+
+    bootstrap_master_database(master_database, database_id="master_test")
+    bootstrap_work_database(work_database, work_id="work_001")
 
     next_version = MASTER_MIGRATIONS[-1].version + 1
     master_migrations = (
@@ -178,9 +358,12 @@ def test_master_and_work_versions_can_advance_independently(tmp_path: Path) -> N
     assert work_result.current_version == WORK_MIGRATIONS[-1].version
 
 
-def test_pre_and_post_integrity_hooks_are_called(tmp_path: Path) -> None:
-    database = tmp_path / "master.sqlite3"
+def test_pre_and_post_integrity_hooks_are_called_for_fresh_database(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "generic.sqlite3"
     calls: list[str] = []
+    migrations = (Migration(version=1, name="first"),)
 
     def pre(connection: sqlite3.Connection) -> None:
         assert connection.execute("SELECT 1").fetchone()[0] == 1
@@ -190,17 +373,18 @@ def test_pre_and_post_integrity_hooks_are_called(tmp_path: Path) -> None:
         assert connection.execute("SELECT 1").fetchone()[0] == 1
         calls.append("post")
 
-    result = migrate_master_database(
-        database,
+    result = MigrationRunner(
+        database_kind="test",
+        migrations=migrations,
         pre_integrity_check=pre,
         post_integrity_check=post,
-    )
+    ).migrate(database)
 
-    assert result.current_version == MASTER_MIGRATIONS[-1].version
+    assert result.current_version == 1
     assert calls == ["pre", "post"]
 
 
-def test_pre_integrity_failure_prevents_migration(tmp_path: Path) -> None:
+def test_pre_integrity_failure_prevents_fresh_migration(tmp_path: Path) -> None:
     database = tmp_path / "master.sqlite3"
 
     def fail(_connection: sqlite3.Connection) -> None:
