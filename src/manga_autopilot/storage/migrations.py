@@ -149,6 +149,35 @@ MASTER_MIGRATIONS: tuple[Migration, ...] = (
             """,
         ),
     ),
+    Migration(
+        version=3,
+        name="M0003_work_catalog",
+        statements=(
+            """
+            CREATE TABLE work_catalog (
+                work_id TEXT PRIMARY KEY,
+                universe_id TEXT,
+                series_id TEXT,
+                title TEXT NOT NULL,
+                work_kind TEXT NOT NULL,
+                relative_work_path TEXT NOT NULL UNIQUE,
+                status TEXT NOT NULL,
+                manifest_hash TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                last_opened_at TEXT
+            )
+            """,
+            """
+            CREATE INDEX idx_work_catalog_series_id
+            ON work_catalog(series_id)
+            """,
+            """
+            CREATE INDEX idx_work_catalog_status
+            ON work_catalog(status)
+            """,
+        ),
+    ),
 )
 
 WORK_MIGRATIONS: tuple[Migration, ...] = (
