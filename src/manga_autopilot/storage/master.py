@@ -8,7 +8,11 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
-from manga_autopilot.storage.migrations import MigrationResult, migrate_master_database
+from manga_autopilot.storage.migrations import (
+    DatabaseIdentityMismatchError,
+    MigrationResult,
+    migrate_master_database,
+)
 from manga_autopilot.storage.sqlite import read_connection, write_connection
 
 MASTER_DATABASE_KIND = "manga_autopilot_master"
@@ -109,10 +113,13 @@ def bootstrap_master_database(
     if database_id is not None and not database_id.strip():
         raise ValueError("database_id must be non-empty when provided")
 
-    migration = migrate_master_database(
-        database_path,
-        app_version=app_version,
-    )
+    try:
+        migration = migrate_master_database(
+            database_path,
+            app_version=app_version,
+        )
+    except DatabaseIdentityMismatchError as exc:
+        raise MasterDatabaseIdentityError(str(exc)) from exc
 
     requested_database_id = database_id or _new_master_database_id()
     created_at = _utc_now_iso()
