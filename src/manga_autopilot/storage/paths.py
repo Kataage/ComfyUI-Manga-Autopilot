@@ -41,6 +41,10 @@ ASSET_SUBDIRS: tuple[str, ...] = ("characters", "panels", "pages", "temp")
 EXPORT_SUBDIRS: tuple[str, ...] = ("pages", "webtoon", "pdf")
 
 
+class UnsafeStoragePathError(ValueError):
+    """Raised when a managed storage path can escape via symlink/reparse state."""
+
+
 def _safe_path_component(value: str, *, field_name: str) -> str:
     """Validate a user-controlled ID before using it as one path component."""
     if not value:
@@ -54,6 +58,80 @@ def _safe_path_component(value: str, *, field_name: str) -> str:
     if Path(value).is_absolute():
         raise ValueError(f"{field_name} must not be absolute")
     return value
+
+
+def _is_within(path: Path, root: Path) -> bool:
+    return path == root or root in path.parents
+
+
+def _assert_managed_path(
+    path: Path,
+    *,
+    containment_root: Path,
+    field_name: str,
+) -> None:
+    """Reject managed paths that contain symlinks or resolve outside their root."""
+    root = containment_root.resolve()
+    candidate = path.absolute()
+
+    try:
+        relative = candidate.relative_to(root)
+    except ValueError as exc:
+        raise UnsafeStoragePathError(
+            f"{field_name} is outside managed storage root: {candidate}"
+        ) from exc
+
+    current = root
+    for part in relative.parts:
+        current = current / part
+        # is_symlink() also detects broken symlinks, for which exists() is False.
+        if current.is_symlink():
+            raise UnsafeStoragePathError(
+                f"{field_name} must not traverse a symlink: {current}"
+            )
+        if current.exists():
+            resolved = current.resolve()
+            if not _is_within(resolved, root):
+                raise UnsafeStoragePathError(
+                    f"{field_name} resolves outside managed storage root: "
+                    f"{current} -> {resolved}"
+                )
+
+    resolved_candidate = candidate.resolve(strict=False)
+    if not _is_within(resolved_candidate, root):
+        raise UnsafeStoragePathError(
+            f"{field_name} resolves outside managed storage root: "
+            f"{candidate} -> {resolved_candidate}"
+        )
+
+
+def _ensure_managed_directory(
+    path: Path,
+    *,
+    containment_root: Path,
+    field_name: str,
+) -> None:
+    """Create one managed directory without following a symlink escape."""
+    _assert_managed_path(
+        path,
+        containment_root=containment_root,
+        field_name=field_name,
+    )
+
+    if path.exists() and not path.is_dir():
+        raise UnsafeStoragePathError(
+            f"{field_name} exists but is not a directory: {path}"
+        )
+
+    path.mkdir(exist_ok=True)
+
+    # Re-check immediately after mutation so a resolved destination must still
+    # be contained in the managed root.
+    _assert_managed_path(
+        path,
+        containment_root=containment_root,
+        field_name=field_name,
+    )
 
 
 @dataclass(frozen=True)
@@ -219,12 +297,16 @@ class ProjectPaths:
 
     def asset(self, name: str) -> Path:
         if name not in ASSET_SUBDIRS:
-            raise ValueError(f"Unknown asset subdir: {name!r}; expected one of {ASSET_SUBDIRS}")
+            raise ValueError(
+                f"Unknown asset subdir: {name!r}; expected one of {ASSET_SUBDIRS}"
+            )
         return self.assets / name
 
     def export(self, name: str) -> Path:
         if name not in EXPORT_SUBDIRS:
-            raise ValueError(f"Unknown export subdir: {name!r}; expected one of {EXPORT_SUBDIRS}")
+            raise ValueError(
+                f"Unknown export subdir: {name!r}; expected one of {EXPORT_SUBDIRS}"
+            )
         return self.exports / name
 
 
@@ -244,12 +326,20 @@ def storage_paths(storage_path: str | Path) -> StoragePaths:
 
 
 def ensure_storage_root(storage_path: str | Path) -> Path:
-    """Ensure both v2 and legacy top-level storage directories exist."""
+    """Ensure v2/legacy top-level dirs exist without following child symlinks."""
     paths = storage_paths(storage_path)
     paths.root.mkdir(parents=True, exist_ok=True)
-    paths.shared_assets.mkdir(parents=True, exist_ok=True)
-    paths.works.mkdir(parents=True, exist_ok=True)
-    paths.legacy_projects.mkdir(parents=True, exist_ok=True)
+
+    for path, name in (
+        (paths.shared_assets, SHARED_ASSETS_SUBDIR),
+        (paths.works, WORKS_SUBDIR),
+        (paths.legacy_projects, PROJECTS_SUBDIR),
+    ):
+        _ensure_managed_directory(
+            path,
+            containment_root=paths.root,
+            field_name=name,
+        )
     return paths.root
 
 
@@ -261,13 +351,26 @@ def work_paths(storage_path: str | Path, work_id: str) -> WorkPaths:
 
 
 def ensure_work_paths(storage_path: str | Path, work_id: str) -> WorkPaths:
-    """Create the directory skeleton for one v2 Work without creating its DB."""
+    """Create one v2 Work directory skeleton without following symlinks."""
     ensure_storage_root(storage_path)
     paths = work_paths(storage_path, work_id)
-    paths.root.mkdir(parents=True, exist_ok=True)
-    paths.assets.mkdir(parents=True, exist_ok=True)
-    paths.cache.mkdir(parents=True, exist_ok=True)
-    paths.exports.mkdir(parents=True, exist_ok=True)
+    works_root = storage_paths(storage_path).works
+
+    _ensure_managed_directory(
+        paths.root,
+        containment_root=works_root,
+        field_name="work root",
+    )
+    for path, name in (
+        (paths.assets, "work assets"),
+        (paths.cache, "work cache"),
+        (paths.exports, "work exports"),
+    ):
+        _ensure_managed_directory(
+            path,
+            containment_root=works_root,
+            field_name=name,
+        )
     return paths
 
 
@@ -279,14 +382,38 @@ def legacy_project_paths(storage_path: str | Path, project_id: str) -> ProjectPa
 
 
 def ensure_legacy_project_paths(storage_path: str | Path, project_id: str) -> ProjectPaths:
-    """Create every directory expected for a legacy JSON project."""
+    """Create legacy dirs without following symlinks outside projects/."""
     ensure_storage_root(storage_path)
     paths = legacy_project_paths(storage_path, project_id)
-    paths.root.mkdir(parents=True, exist_ok=True)
+    projects_root = storage_paths(storage_path).legacy_projects
+
+    _ensure_managed_directory(
+        paths.root,
+        containment_root=projects_root,
+        field_name="legacy project root",
+    )
+    _ensure_managed_directory(
+        paths.assets,
+        containment_root=projects_root,
+        field_name="legacy assets",
+    )
+    _ensure_managed_directory(
+        paths.exports,
+        containment_root=projects_root,
+        field_name="legacy exports",
+    )
     for sub in ASSET_SUBDIRS:
-        paths.asset(sub).mkdir(parents=True, exist_ok=True)
+        _ensure_managed_directory(
+            paths.asset(sub),
+            containment_root=projects_root,
+            field_name=f"legacy asset {sub}",
+        )
     for sub in EXPORT_SUBDIRS:
-        paths.export(sub).mkdir(parents=True, exist_ok=True)
+        _ensure_managed_directory(
+            paths.export(sub),
+            containment_root=projects_root,
+            field_name=f"legacy export {sub}",
+        )
     return paths
 
 
@@ -312,6 +439,7 @@ __all__ = [
     "LegacyProjectPaths",
     "ProjectPaths",
     "StoragePaths",
+    "UnsafeStoragePathError",
     "WorkPaths",
     "ensure_legacy_project_paths",
     "ensure_project_paths",
