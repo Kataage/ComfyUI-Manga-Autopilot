@@ -15,6 +15,7 @@ from manga_autopilot.storage import (
     WORK_DB_FILENAME,
     WORK_MANIFEST_FILENAME,
     WORKS_SUBDIR,
+    UnsafeStoragePathError,
     ensure_legacy_project_paths,
     ensure_project_paths,
     ensure_storage_root,
@@ -133,3 +134,80 @@ def test_asset_export_helpers_reject_unknown(tmp_path: Path) -> None:
         paths.asset("nope")
     with pytest.raises(ValueError):
         paths.export("nope")
+
+
+
+def test_ensure_storage_root_rejects_symlinked_works_directory(tmp_path: Path) -> None:
+    storage = tmp_path / "store"
+    storage.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    works_link = storage / WORKS_SUBDIR
+    try:
+        works_link.symlink_to(outside, target_is_directory=True)
+    except OSError:
+        pytest.skip("directory symlinks are not supported in this environment")
+
+    with pytest.raises(UnsafeStoragePathError, match="symlink"):
+        ensure_storage_root(storage)
+
+
+def test_ensure_work_paths_rejects_existing_work_symlink_escape(tmp_path: Path) -> None:
+    storage = tmp_path / "store"
+    ensure_storage_root(storage)
+    outside = tmp_path / "outside-work"
+    outside.mkdir()
+    link = storage / WORKS_SUBDIR / "work_001"
+    try:
+        link.symlink_to(outside, target_is_directory=True)
+    except OSError:
+        pytest.skip("directory symlinks are not supported in this environment")
+
+    with pytest.raises(UnsafeStoragePathError, match="symlink"):
+        ensure_work_paths(storage, "work_001")
+
+    assert not (outside / "assets").exists()
+    assert not (outside / "cache").exists()
+    assert not (outside / "exports").exists()
+
+
+def test_ensure_legacy_project_paths_rejects_project_symlink_escape(
+    tmp_path: Path,
+) -> None:
+    storage = tmp_path / "store"
+    ensure_storage_root(storage)
+    outside = tmp_path / "outside-project"
+    outside.mkdir()
+    link = storage / PROJECTS_SUBDIR / "proj_001"
+    try:
+        link.symlink_to(outside, target_is_directory=True)
+    except OSError:
+        pytest.skip("directory symlinks are not supported in this environment")
+
+    with pytest.raises(UnsafeStoragePathError, match="symlink"):
+        ensure_legacy_project_paths(storage, "proj_001")
+
+    assert not (outside / "assets").exists()
+    assert not (outside / "exports").exists()
+
+
+def test_ensure_legacy_project_paths_rejects_nested_assets_symlink(
+    tmp_path: Path,
+) -> None:
+    storage = tmp_path / "store"
+    ensure_storage_root(storage)
+    project = storage / PROJECTS_SUBDIR / "proj_001"
+    project.mkdir()
+    outside = tmp_path / "outside-assets"
+    outside.mkdir()
+    assets_link = project / "assets"
+    try:
+        assets_link.symlink_to(outside, target_is_directory=True)
+    except OSError:
+        pytest.skip("directory symlinks are not supported in this environment")
+
+    with pytest.raises(UnsafeStoragePathError, match="symlink"):
+        ensure_legacy_project_paths(storage, "proj_001")
+
+    assert not (outside / "characters").exists()
+    assert not (outside / "panels").exists()

@@ -132,15 +132,18 @@ class LegacyProjectInventoryService:
         self.projects_root = self.storage_root / PROJECTS_SUBDIR
 
     def discover_project_ids(self) -> tuple[str, ...]:
-        """Return legacy project directory names that contain project.json."""
-        if not self.projects_root.is_dir():
+        """Return project dirs with a real, non-symlink project.json."""
+        if not self.projects_root.is_dir() or self.projects_root.is_symlink():
             return ()
 
         project_ids: list[str] = []
         for child in sorted(self.projects_root.iterdir(), key=lambda path: path.name):
             if child.is_symlink() or not child.is_dir():
                 continue
-            if (child / "project.json").is_file():
+            project_json = child / "project.json"
+            if project_json.is_symlink():
+                continue
+            if project_json.is_file():
                 project_ids.append(child.name)
         return tuple(project_ids)
 
@@ -160,9 +163,13 @@ class LegacyProjectInventoryService:
 
         root = self.projects_root / project_id
         project_json = root / "project.json"
-        if not root.is_dir() or root.is_symlink() or not project_json.is_file():
+        if not root.is_dir() or root.is_symlink():
             raise LegacyProjectNotFoundError(
                 f"legacy project is not discoverable: {project_id!r}"
+            )
+        if not project_json.exists() and not project_json.is_symlink():
+            raise LegacyProjectNotFoundError(
+                f"legacy project has no project.json: {project_id!r}"
             )
 
         warnings: list[LegacyInventoryWarning] = []
@@ -203,10 +210,14 @@ class LegacyProjectInventoryService:
                 title = raw_title
 
         missing_optional_files = tuple(
-            filename for filename in _OPTIONAL_FILES if not (root / filename).is_file()
+            filename
+            for filename in _OPTIONAL_FILES
+            if not self._is_regular_file(root / filename)
         )
         missing_optional_directories = tuple(
-            dirname for dirname in _OPTIONAL_DIRECTORIES if not (root / dirname).is_dir()
+            dirname
+            for dirname in _OPTIONAL_DIRECTORIES
+            if not self._is_regular_directory(root / dirname)
         )
 
         for relative_path in missing_optional_files:
@@ -241,10 +252,39 @@ class LegacyProjectInventoryService:
         )
 
     @staticmethod
+    def _is_regular_file(path: Path) -> bool:
+        return path.is_file() and not path.is_symlink()
+
+    @staticmethod
+    def _is_regular_directory(path: Path) -> bool:
+        return path.is_dir() and not path.is_symlink()
+
+    @staticmethod
     def _read_project_json(
         path: Path,
         warnings: list[LegacyInventoryWarning],
     ) -> dict[str, Any] | None:
+        if path.is_symlink():
+            warnings.append(
+                LegacyInventoryWarning(
+                    code="SYMLINK_PROJECT_JSON_IGNORED",
+                    message="project.json is a symlink and was not read",
+                    relative_path="project.json",
+                    severity="error",
+                )
+            )
+            return None
+        if not path.is_file():
+            warnings.append(
+                LegacyInventoryWarning(
+                    code="PROJECT_JSON_NOT_REGULAR_FILE",
+                    message="project.json is not a regular file",
+                    relative_path="project.json",
+                    severity="error",
+                )
+            )
+            return None
+
         try:
             raw = path.read_text(encoding="utf-8")
         except (OSError, UnicodeError) as exc:
@@ -319,12 +359,36 @@ class LegacyProjectInventoryService:
             for name in sorted(directory_names):
                 path = current / name
                 relative = path.relative_to(root)
-                entries.append(cls._entry_for(path, relative))
+                entry = cls._entry_for(path, relative)
+                entries.append(entry)
+                if entry.kind == "symlink":
+                    warnings.append(
+                        LegacyInventoryWarning(
+                            code="SYMLINK_ENTRY_IGNORED",
+                            message="symlink entry was inventoried but not followed",
+                            relative_path=entry.relative_path,
+                        )
+                    )
+
+            # Explicitly prevent traversal into directory symlinks even though
+            # os.walk(followlinks=False) already does so on supported platforms.
+            directory_names[:] = [
+                name for name in directory_names if not (current / name).is_symlink()
+            ]
 
             for name in sorted(file_names):
                 path = current / name
                 relative = path.relative_to(root)
-                entries.append(cls._entry_for(path, relative))
+                entry = cls._entry_for(path, relative)
+                entries.append(entry)
+                if entry.kind == "symlink":
+                    warnings.append(
+                        LegacyInventoryWarning(
+                            code="SYMLINK_ENTRY_IGNORED",
+                            message="symlink entry was inventoried but not followed",
+                            relative_path=entry.relative_path,
+                        )
+                    )
 
         return tuple(sorted(entries, key=lambda entry: entry.relative_path))
 
@@ -352,7 +416,10 @@ class LegacyProjectInventoryService:
             kind = "other"
             size_bytes = None
 
-        if len(parts) == 1 and parts[0] in _FILE_CATEGORIES:
+        if kind == "symlink":
+            category = "symlink"
+            recognized = False
+        elif len(parts) == 1 and parts[0] in _FILE_CATEGORIES:
             category = _FILE_CATEGORIES[parts[0]]
             recognized = True
         elif parts and parts[0] in _DIRECTORY_CATEGORIES:

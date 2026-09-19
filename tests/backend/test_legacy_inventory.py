@@ -242,3 +242,90 @@ def test_symlink_project_directory_is_not_discovered(
     service = LegacyProjectInventoryService(tmp_path)
 
     assert "linked" not in service.discover_project_ids()
+
+
+
+def test_symlink_project_json_is_not_discovered_or_read(tmp_path: Path) -> None:
+    projects = tmp_path / "projects"
+    project_root = projects / "linked_json"
+    project_root.mkdir(parents=True)
+    outside = tmp_path / "outside-project.json"
+    outside.write_text(
+        '{"id":"external","name":"do-not-read","title":"External"}',
+        encoding="utf-8",
+    )
+    link = project_root / "project.json"
+    try:
+        link.symlink_to(outside)
+    except OSError:
+        pytest.skip("file symlinks are not supported in this environment")
+
+    service = LegacyProjectInventoryService(tmp_path)
+
+    assert "linked_json" not in service.discover_project_ids()
+
+    report = service.inventory_project("linked_json")
+    assert report.project_json_id is None
+    assert report.name is None
+    assert report.title is None
+    assert any(
+        warning.code == "SYMLINK_PROJECT_JSON_IGNORED"
+        for warning in report.warnings
+    )
+    entry = next(
+        entry for entry in report.entries if entry.relative_path == "project.json"
+    )
+    assert entry.kind == "symlink"
+    assert entry.category == "symlink"
+    assert entry.recognized is False
+
+
+def test_symlink_optional_file_is_inventoried_but_not_trusted(tmp_path: Path) -> None:
+    project_root = _write_project(tmp_path)
+    outside = tmp_path / "outside-story.json"
+    outside.write_text('{"secret":"external"}', encoding="utf-8")
+    story_link = project_root / "story.json"
+    try:
+        story_link.symlink_to(outside)
+    except OSError:
+        pytest.skip("file symlinks are not supported in this environment")
+
+    report = LegacyProjectInventoryService(tmp_path).inventory_project("legacy_001")
+
+    assert "story.json" in report.missing_optional_files
+    story_entry = next(
+        entry for entry in report.entries if entry.relative_path == "story.json"
+    )
+    assert story_entry.kind == "symlink"
+    assert story_entry.category == "symlink"
+    assert story_entry.recognized is False
+    assert any(
+        warning.code == "SYMLINK_ENTRY_IGNORED"
+        and warning.relative_path == "story.json"
+        for warning in report.warnings
+    )
+
+
+def test_symlink_optional_directory_is_not_traversed(tmp_path: Path) -> None:
+    project_root = _write_project(tmp_path)
+    outside = tmp_path / "outside-assets"
+    outside.mkdir()
+    (outside / "secret.bin").write_bytes(b"secret")
+    assets_link = project_root / "assets"
+    try:
+        assets_link.symlink_to(outside, target_is_directory=True)
+    except OSError:
+        pytest.skip("directory symlinks are not supported in this environment")
+
+    report = LegacyProjectInventoryService(tmp_path).inventory_project("legacy_001")
+
+    assert "assets" in report.missing_optional_directories
+    by_path = {entry.relative_path: entry for entry in report.entries}
+    assert by_path["assets"].kind == "symlink"
+    assert by_path["assets"].recognized is False
+    assert "assets/secret.bin" not in by_path
+    assert any(
+        warning.code == "SYMLINK_ENTRY_IGNORED"
+        and warning.relative_path == "assets"
+        for warning in report.warnings
+    )
