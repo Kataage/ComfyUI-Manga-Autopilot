@@ -119,7 +119,9 @@ def bootstrap_master_database(
             app_version=app_version,
         )
     except DatabaseIdentityMismatchError as exc:
-        raise MasterDatabaseIdentityError(str(exc)) from exc
+        raise MasterDatabaseIdentityError(
+            f"database_kind mismatch: {exc}"
+        ) from exc
 
     requested_database_id = database_id or _new_master_database_id()
     created_at = _utc_now_iso()
