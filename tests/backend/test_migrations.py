@@ -196,7 +196,7 @@ def test_pre_and_post_integrity_hooks_are_called(tmp_path: Path) -> None:
         post_integrity_check=post,
     )
 
-    assert result.current_version == 1
+    assert result.current_version == MASTER_MIGRATIONS[-1].version
     assert calls == ["pre", "post"]
 
 
