@@ -129,7 +129,9 @@ def bootstrap_work_database(
             app_version=app_version,
         )
     except DatabaseIdentityMismatchError as exc:
-        raise WorkDatabaseIdentityError(str(exc)) from exc
+        raise WorkDatabaseIdentityError(
+            f"database_kind mismatch: {exc}"
+        ) from exc
 
     requested_database_id = database_id or _new_work_database_id()
     created_at = _utc_now_iso()
