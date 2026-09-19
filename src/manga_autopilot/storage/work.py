@@ -5,6 +5,7 @@ from __future__ import annotations
 import sqlite3
 import uuid
 from collections.abc import Iterable
+from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
