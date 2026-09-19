@@ -153,6 +153,67 @@ MASTER_MIGRATIONS: tuple[Migration, ...] = (
 
 WORK_MIGRATIONS: tuple[Migration, ...] = (
     Migration(version=1, name="W0001_migration_metadata_baseline"),
+    Migration(
+        version=2,
+        name="W0002_work_backbone",
+        statements=(
+            """
+            CREATE TABLE work_database_metadata (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            )
+            """,
+            """
+            CREATE TABLE commits (
+                commit_seq INTEGER PRIMARY KEY AUTOINCREMENT,
+                commit_id TEXT NOT NULL UNIQUE,
+                parent_commit_seq INTEGER,
+                run_id TEXT,
+                actor_type TEXT NOT NULL,
+                actor_id TEXT,
+                operation_type TEXT NOT NULL,
+                reason TEXT,
+                created_at TEXT NOT NULL
+            )
+            """,
+            """
+            CREATE TABLE entity_revisions (
+                id TEXT PRIMARY KEY,
+                entity_type TEXT NOT NULL,
+                entity_id TEXT NOT NULL,
+                entity_revision INTEGER NOT NULL,
+                commit_seq INTEGER NOT NULL REFERENCES commits(commit_seq),
+                change_kind TEXT NOT NULL,
+                before_json TEXT,
+                after_json TEXT,
+                created_at TEXT NOT NULL,
+                UNIQUE(entity_type, entity_id, entity_revision)
+            )
+            """,
+            """
+            CREATE INDEX idx_entity_revisions_commit_seq
+            ON entity_revisions(commit_seq)
+            """,
+            """
+            CREATE TABLE work_metadata (
+                work_id TEXT PRIMARY KEY,
+                universe_source_id TEXT,
+                series_source_id TEXT,
+                source_checkpoint_id TEXT,
+                title TEXT NOT NULL,
+                work_kind TEXT NOT NULL,
+                language TEXT NOT NULL,
+                reading_direction TEXT NOT NULL,
+                status TEXT NOT NULL,
+                current_commit_seq INTEGER NOT NULL,
+                current_revision INTEGER NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                completed_at TEXT
+            )
+            """,
+        ),
+    ),
 )
 
 
