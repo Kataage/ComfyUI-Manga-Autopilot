@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 from pathlib import Path
 
 import pytest
@@ -13,8 +14,32 @@ from manga_autopilot.repositories import (
     WorkCreationError,
     WorkIdentityMismatchError,
     WorkLifecycleRepository,
+    WorkUpgradeError,
+    inspect_work_directory,
 )
-from manga_autopilot.storage import repository_read, repository_write
+from manga_autopilot.storage import (
+    WORK_MIGRATIONS,
+    Migration,
+    repository_read,
+    repository_write,
+)
+
+
+def _future_work_migration(*, broken: bool = False) -> tuple[Migration, ...]:
+    version = WORK_MIGRATIONS[-1].version + 1
+    statements = (
+        ("INSERT INTO missing_upgrade_table (id) VALUES (1)",)
+        if broken
+        else ("CREATE TABLE upgrade_probe (id INTEGER PRIMARY KEY)",)
+    )
+    return (
+        *WORK_MIGRATIONS,
+        Migration(
+            version=version,
+            name=f"W{version:04d}_test_upgrade",
+            statements=statements,
+        ),
+    )
 
 
 def test_create_open_list_and_reopen_work(tmp_path: Path) -> None:
@@ -34,6 +59,8 @@ def test_create_open_list_and_reopen_work(tmp_path: Path) -> None:
     assert created.database_path.is_file()
     assert created.manifest_path.is_file()
     assert created.current_revision == 1
+    assert created.schema_version == WORK_MIGRATIONS[-1].version
+    assert created.migration_backup_path is None
 
     listed = repository.list_works()
     assert [entry.work_id for entry in listed] == ["work_001"]
@@ -47,25 +74,32 @@ def test_create_open_list_and_reopen_work(tmp_path: Path) -> None:
     assert reopened.title == created.title
     assert reopened.current_commit_seq == created.current_commit_seq
     assert reopened.catalog.last_opened_at is not None
+    assert reopened.migration_backup_path is None
 
 
-def test_create_work_writes_expected_manifest(tmp_path: Path) -> None:
+def test_create_work_writes_live_mutable_manifest(tmp_path: Path) -> None:
     repository = WorkLifecycleRepository(tmp_path, app_version="2.0-test")
     handle = repository.create_work(work_id="work_001", title="Manifest Test")
 
     manifest = json.loads(handle.manifest_path.read_text(encoding="utf-8"))
 
     assert manifest["format"] == "manga-autopilot-work"
-    assert manifest["format_version"] == 1
+    assert manifest["format_version"] == 2
     assert manifest["work_id"] == "work_001"
     assert manifest["database"] == "work.sqlite3"
-    assert manifest["work_schema_version"] >= 1
+    assert manifest["work_schema_version"] == WORK_MIGRATIONS[-1].version
     assert manifest["created_at"]
     assert manifest["app_version"] == "2.0-test"
-    assert len(manifest["integrity"]["database_sha256"]) == 64
+    assert manifest["integrity"] == {
+        "mode": "live_mutable",
+        "database_hash_policy": "package_only",
+    }
+    assert "database_sha256" not in manifest["integrity"]
 
 
-def test_open_uses_work_db_as_authority_not_catalog_title(tmp_path: Path) -> None:
+def test_legitimate_work_db_edit_does_not_trigger_false_hash_corruption(
+    tmp_path: Path,
+) -> None:
     repository = WorkLifecycleRepository(tmp_path)
     created = repository.create_work(work_id="work_001", title="Catalog Title")
 
@@ -84,6 +118,7 @@ def test_open_uses_work_db_as_authority_not_catalog_title(tmp_path: Path) -> Non
     listed = repository.list_works()
 
     assert opened.title == "Authoritative DB Title"
+    assert opened.current_revision == 2
     assert listed[0].title == "Catalog Title"
 
 
@@ -93,7 +128,10 @@ def test_open_does_not_read_legacy_project_json(tmp_path: Path) -> None:
 
     legacy_dir = tmp_path / "projects" / "work_001"
     legacy_dir.mkdir(parents=True)
-    (legacy_dir / "project.json").write_text("{ definitely not valid json", encoding="utf-8")
+    (legacy_dir / "project.json").write_text(
+        "{ definitely not valid json",
+        encoding="utf-8",
+    )
 
     opened = repository.open_work("work_001")
 
@@ -147,7 +185,10 @@ def test_create_cleans_staging_on_filesystem_finalize_failure(
     repository = WorkLifecycleRepository(tmp_path)
     original_replace = os.replace
 
-    def fail_directory_replace(src: str | os.PathLike[str], dst: str | os.PathLike[str]) -> None:
+    def fail_directory_replace(
+        src: str | os.PathLike[str],
+        dst: str | os.PathLike[str],
+    ) -> None:
         source = Path(src)
         if source.name == ".creating-work_fail":
             raise OSError("simulated directory rename failure")
@@ -223,3 +264,188 @@ def test_generated_work_id_is_opaque_and_cataloged(tmp_path: Path) -> None:
     assert created.work_id.startswith("work_")
     assert "/" not in created.work_id
     assert repository.list_works()[0].work_id == created.work_id
+
+
+def test_open_upgrades_work_from_schema_n_to_n_plus_1(tmp_path: Path) -> None:
+    old_repository = WorkLifecycleRepository(
+        tmp_path,
+        app_version="old",
+        work_migrations=WORK_MIGRATIONS,
+    )
+    created = old_repository.create_work(work_id="work_001", title="Upgrade Me")
+    old_version = created.schema_version
+    future_migrations = _future_work_migration()
+    new_version = future_migrations[-1].version
+
+    inspection_before = inspect_work_directory(
+        created.root,
+        migrations=future_migrations,
+    )
+    assert inspection_before.database_schema_version == old_version
+    assert inspection_before.upgrade_required is True
+
+    new_repository = WorkLifecycleRepository(
+        tmp_path,
+        app_version="new",
+        work_migrations=future_migrations,
+    )
+    opened = new_repository.open_work("work_001")
+
+    assert opened.schema_version == new_version
+    assert opened.migration_backup_path is not None
+    assert opened.migration_backup_path.is_file()
+
+    with repository_read(opened.database_path) as connection:
+        assert connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE name = 'upgrade_probe'"
+        ).fetchone() is not None
+        actual_version = connection.execute(
+            "SELECT MAX(version) FROM schema_migrations"
+        ).fetchone()[0]
+
+    manifest = json.loads(opened.manifest_path.read_text(encoding="utf-8"))
+    assert actual_version == new_version
+    assert manifest["work_schema_version"] == new_version
+    assert manifest["format_version"] == 2
+    assert manifest["integrity"]["mode"] == "live_mutable"
+
+
+def test_reopening_already_upgraded_work_is_idempotent(tmp_path: Path) -> None:
+    base_repository = WorkLifecycleRepository(
+        tmp_path,
+        work_migrations=WORK_MIGRATIONS,
+    )
+    base_repository.create_work(work_id="work_001", title="Upgrade Once")
+    future_migrations = _future_work_migration()
+
+    upgraded_repository = WorkLifecycleRepository(
+        tmp_path,
+        work_migrations=future_migrations,
+    )
+    first = upgraded_repository.open_work("work_001")
+    second = upgraded_repository.open_work("work_001")
+
+    assert first.schema_version == future_migrations[-1].version
+    assert first.migration_backup_path is not None
+    assert second.schema_version == first.schema_version
+    assert second.migration_backup_path is None
+
+
+def test_failed_work_upgrade_does_not_expose_partially_upgraded_work(
+    tmp_path: Path,
+) -> None:
+    base_repository = WorkLifecycleRepository(
+        tmp_path,
+        work_migrations=WORK_MIGRATIONS,
+    )
+    created = base_repository.create_work(work_id="work_001", title="Stay Safe")
+    old_manifest = created.manifest_path.read_bytes()
+    old_version = created.schema_version
+    broken_migrations = _future_work_migration(broken=True)
+    target_version = broken_migrations[-1].version
+
+    broken_repository = WorkLifecycleRepository(
+        tmp_path,
+        work_migrations=broken_migrations,
+    )
+    with pytest.raises(WorkUpgradeError, match="failed to upgrade Work"):
+        broken_repository.open_work("work_001")
+
+    with repository_read(created.database_path) as connection:
+        version = connection.execute(
+            "SELECT MAX(version) FROM schema_migrations"
+        ).fetchone()[0]
+
+    assert version == old_version
+    assert created.manifest_path.read_bytes() == old_manifest
+    backup = created.database_path.with_name(
+        f"{created.database_path.name}.backup-v{old_version}-to-v{target_version}"
+    )
+    assert backup.is_file()
+
+
+def test_legacy_v1_live_manifest_is_normalized_without_hash_enforcement(
+    tmp_path: Path,
+) -> None:
+    repository = WorkLifecycleRepository(tmp_path, app_version="new")
+    created = repository.create_work(work_id="work_001", title="Legacy Manifest")
+
+    legacy_manifest = json.loads(created.manifest_path.read_text(encoding="utf-8"))
+    legacy_manifest["format_version"] = 1
+    legacy_manifest["integrity"] = {"database_sha256": "0" * 64}
+    created.manifest_path.write_text(
+        json.dumps(legacy_manifest, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+    with repository_write(created.database_path) as connection:
+        connection.execute(
+            """
+            UPDATE work_metadata
+            SET title = 'Edited After Legacy Hash',
+                current_revision = current_revision + 1
+            WHERE work_id = 'work_001'
+            """
+        )
+
+    opened = repository.open_work("work_001")
+    normalized = json.loads(opened.manifest_path.read_text(encoding="utf-8"))
+
+    assert opened.title == "Edited After Legacy Hash"
+    assert normalized["format_version"] == 2
+    assert normalized["integrity"] == {
+        "mode": "live_mutable",
+        "database_hash_policy": "package_only",
+    }
+
+
+def test_open_repairs_manifest_left_behind_after_completed_db_upgrade(
+    tmp_path: Path,
+) -> None:
+    repository = WorkLifecycleRepository(tmp_path)
+    created = repository.create_work(work_id="work_001", title="Refresh Manifest")
+    old_manifest = json.loads(created.manifest_path.read_text(encoding="utf-8"))
+    future_migrations = _future_work_migration()
+
+    from manga_autopilot.storage import migrate_work_database
+
+    migrate_work_database(
+        created.database_path,
+        migrations=future_migrations,
+    )
+
+    inspection = inspect_work_directory(
+        created.root,
+        migrations=future_migrations,
+    )
+    assert inspection.database_schema_version == future_migrations[-1].version
+    assert inspection.manifest_schema_version == old_manifest["work_schema_version"]
+    assert inspection.manifest_refresh_required is True
+
+    upgraded_repository = WorkLifecycleRepository(
+        tmp_path,
+        work_migrations=future_migrations,
+    )
+    opened = upgraded_repository.open_work("work_001")
+
+    refreshed = json.loads(opened.manifest_path.read_text(encoding="utf-8"))
+    assert refreshed["work_schema_version"] == future_migrations[-1].version
+    assert opened.migration_backup_path is None
+
+
+def test_portable_work_inspection_does_not_require_master_database(
+    tmp_path: Path,
+) -> None:
+    repository = WorkLifecycleRepository(tmp_path / "library")
+    created = repository.create_work(work_id="work_001", title="Portable")
+
+    portable_root = tmp_path / "portable-work"
+    shutil.copytree(created.root, portable_root)
+
+    inspection = inspect_work_directory(portable_root)
+
+    assert inspection.work_id == "work_001"
+    assert inspection.root == portable_root.resolve()
+    assert inspection.database_schema_version == WORK_MIGRATIONS[-1].version
+    assert inspection.upgrade_required is False
+    assert not (portable_root.parent / "master.sqlite3").exists()
