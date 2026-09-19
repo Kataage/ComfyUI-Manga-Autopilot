@@ -1,5 +1,14 @@
 """Storage helpers for Manga Autopilot."""
 
+from manga_autopilot.storage.master import (
+    MASTER_DATABASE_KIND,
+    MASTER_FORMAT_VERSION,
+    MasterDatabaseBootstrapResult,
+    MasterDatabaseIdentity,
+    MasterDatabaseIdentityError,
+    bootstrap_master_database,
+    read_master_identity,
+)
 from manga_autopilot.storage.migrations import (
     MASTER_MIGRATIONS,
     SCHEMA_MIGRATIONS_TABLE,
@@ -54,7 +63,9 @@ __all__ = [
     "ASSET_SUBDIRS",
     "DEFAULT_BUSY_TIMEOUT_MS",
     "EXPORT_SUBDIRS",
+    "MASTER_DATABASE_KIND",
     "MASTER_DB_FILENAME",
+    "MASTER_FORMAT_VERSION",
     "MASTER_MIGRATIONS",
     "PROJECTS_SUBDIR",
     "REQUIRED_JOURNAL_MODE",
@@ -73,6 +84,9 @@ __all__ = [
     "MigrationError",
     "MigrationIntegrityError",
     "MigrationResult",
+    "MasterDatabaseBootstrapResult",
+    "MasterDatabaseIdentity",
+    "MasterDatabaseIdentityError",
     "MigrationRunner",
     "ProjectPaths",
     "StoragePaths",
@@ -84,11 +98,13 @@ __all__ = [
     "ensure_project_paths",
     "ensure_storage_root",
     "ensure_work_paths",
+    "bootstrap_master_database",
     "legacy_project_paths",
     "migrate_master_database",
     "migrate_work_database",
     "project_paths",
     "read_connection",
+    "read_master_identity",
     "resolve_storage_root",
     "sqlite_integrity_check",
     "storage_paths",
