@@ -250,6 +250,7 @@ def inspect_work_directory(
     work_root: str | Path,
     *,
     migrations: Iterable[Migration] = WORK_MIGRATIONS,
+    expected_work_id: str | None = None,
 ) -> PortableWorkInspection:
     """Inspect a portable Work directory without requiring Master DB access."""
     migration_set = tuple(migrations)
@@ -260,7 +261,7 @@ def inspect_work_directory(
     manifest = _read_manifest(manifest_path)
     _validate_manifest(
         manifest,
-        expected_work_id=None,
+        expected_work_id=expected_work_id,
         expected_database_name=database_path.name,
     )
 
@@ -513,6 +514,7 @@ class WorkLifecycleRepository:
         inspection = inspect_work_directory(
             root,
             migrations=self.work_migrations,
+            expected_work_id=work_id,
         )
         if inspection.work_id != work_id:
             raise WorkIdentityMismatchError(
