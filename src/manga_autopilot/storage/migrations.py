@@ -44,7 +44,7 @@ class MigrationIntegrityError(MigrationError):
 class MigrationApplyError(MigrationError):
     """Raised when applying one migration fails."""
 
-    def __init__(self, migration: "Migration", cause: BaseException) -> None:
+    def __init__(self, migration: Migration, cause: BaseException) -> None:
         super().__init__(
             f"migration {migration.version} ({migration.name}) failed: {cause}"
         )
