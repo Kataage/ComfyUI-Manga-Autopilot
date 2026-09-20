@@ -386,19 +386,31 @@ def _validate_applied_migrations(
 ) -> None:
     configured_by_version = {migration.version: migration for migration in configured}
 
-    for version, persisted in applied.items():
-        expected = configured_by_version.get(version)
+    ordered_applied = [applied[version] for version in sorted(applied)]
+    for persisted in ordered_applied:
+        expected = configured_by_version.get(persisted.version)
         if expected is None:
             raise UnknownAppliedMigrationError(
-                f"database contains unknown applied migration version {version}: "
-                f"{persisted.name}"
+                "database contains unknown applied migration version "
+                f"{persisted.version}: {persisted.name}"
             )
         if persisted.name != expected.name or persisted.checksum != expected.checksum:
             raise MigrationDriftError(
-                f"migration {version} drift detected: "
+                f"migration {persisted.version} drift detected: "
                 f"database has {persisted.name}/{persisted.checksum}, "
                 f"application expects {expected.name}/{expected.checksum}"
             )
+
+    expected_prefix = tuple(
+        migration.version for migration in configured[: len(ordered_applied)]
+    )
+    actual_versions = tuple(migration.version for migration in ordered_applied)
+    if actual_versions != expected_prefix:
+        raise MigrationDriftError(
+            "applied migration history is not an ordered configured prefix: "
+            f"database has versions {actual_versions}, expected prefix "
+            f"{expected_prefix}"
+        )
 
 
 def _utc_now_iso() -> str:

@@ -709,3 +709,82 @@ def test_backup_failure_reports_pending_migration_ids(
     ]
     assert "target version" in str(error)
     assert outside.read_bytes() == b"do not replace"
+
+def test_applied_migrations_must_be_exact_configured_prefix(tmp_path: Path) -> None:
+    database = tmp_path / "generic.sqlite3"
+    migrations = (
+        Migration(version=10, name="first"),
+        Migration(version=20, name="second"),
+        Migration(version=30, name="third"),
+    )
+    MigrationRunner(
+        database_kind="test",
+        migrations=migrations,
+    ).migrate(database)
+
+    with write_connection(database) as connection:
+        connection.execute(
+            f"DELETE FROM {SCHEMA_MIGRATIONS_TABLE} WHERE version = 20"
+        )
+        connection.commit()
+
+    before = database.read_bytes()
+    with pytest.raises(MigrationDriftError, match="ordered configured prefix"):
+        MigrationRunner(
+            database_kind="test",
+            migrations=migrations,
+        ).migrate(database)
+
+    assert database.read_bytes() == before
+    assert [row["version"] for row in _applied_rows(database)] == [10, 30]
+
+
+def test_intentionally_sparse_configured_versions_accept_real_prefix(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "generic.sqlite3"
+    first_two = (
+        Migration(version=10, name="first"),
+        Migration(version=20, name="second"),
+    )
+    full = (
+        *first_two,
+        Migration(version=30, name="third"),
+    )
+    MigrationRunner(
+        database_kind="test",
+        migrations=first_two,
+    ).migrate(database)
+
+    result = MigrationRunner(
+        database_kind="test",
+        migrations=full,
+    ).migrate(database)
+
+    assert result.applied_versions == (30,)
+    assert [row["version"] for row in _applied_rows(database)] == [10, 20, 30]
+
+
+def test_interrupted_master_identity_recovery_rejects_non_prefix_history(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "master.sqlite3"
+    MigrationRunner(
+        database_kind="test",
+        migrations=MASTER_MIGRATIONS,
+    ).migrate(database)
+
+    with write_connection(database) as connection:
+        connection.execute(
+            f"DELETE FROM {SCHEMA_MIGRATIONS_TABLE} WHERE version = 2"
+        )
+        connection.commit()
+
+    with pytest.raises(MigrationDriftError, match="ordered configured prefix"):
+        bootstrap_master_database(database, database_id="must_not_recover")
+
+    with read_connection(database) as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM master_metadata"
+        ).fetchone()[0] == 0
+
