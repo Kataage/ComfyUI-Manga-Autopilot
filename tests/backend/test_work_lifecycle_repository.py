@@ -14,12 +14,15 @@ from manga_autopilot.repositories import (
     WorkCreationError,
     WorkIdentityMismatchError,
     WorkLifecycleRepository,
+    WorkRecoveryError,
     WorkUpgradeError,
     inspect_work_directory,
 )
 from manga_autopilot.storage import (
     WORK_MIGRATIONS,
     Migration,
+    UnsafeStoragePathError,
+    bootstrap_master_database,
     repository_read,
     repository_write,
 )
@@ -578,3 +581,96 @@ def test_finalize_staging_is_idempotent_after_directory_move(
     assert second == first
     assert (tmp_path / "works" / "work_retry").is_dir()
     assert not staging.exists()
+
+
+
+def test_repository_rejects_symlinked_master_database_before_mutation(
+    tmp_path: Path,
+) -> None:
+    outside = tmp_path / "outside-master.sqlite3"
+    bootstrap_master_database(outside, database_id="outside_master")
+    before = outside.read_bytes()
+
+    storage = tmp_path / "library"
+    (storage / "works").mkdir(parents=True)
+    (storage / "shared_assets").mkdir()
+    (storage / "projects").mkdir()
+    link = storage / "master.sqlite3"
+    try:
+        link.symlink_to(outside)
+    except OSError:
+        pytest.skip("file symlinks are not supported in this environment")
+
+    with pytest.raises(UnsafeStoragePathError, match="symlink"):
+        WorkLifecycleRepository(storage)
+
+    assert outside.read_bytes() == before
+
+
+def test_open_rejects_symlinked_work_manifest_without_reading_external_file(
+    tmp_path: Path,
+) -> None:
+    repository = WorkLifecycleRepository(tmp_path)
+    created = repository.create_work(work_id="work_001", title="Safe")
+    outside = tmp_path / "outside-manifest.json"
+    outside.write_text(created.manifest_path.read_text(encoding="utf-8"), encoding="utf-8")
+    before = outside.read_bytes()
+
+    created.manifest_path.unlink()
+    try:
+        created.manifest_path.symlink_to(outside)
+    except OSError:
+        pytest.skip("file symlinks are not supported in this environment")
+
+    with pytest.raises(UnsafeStoragePathError, match="symlink"):
+        repository.open_work("work_001")
+
+    assert outside.read_bytes() == before
+
+
+def test_open_rejects_symlinked_work_database_without_mutating_external_db(
+    tmp_path: Path,
+) -> None:
+    repository = WorkLifecycleRepository(tmp_path)
+    created = repository.create_work(work_id="work_001", title="Safe")
+    outside = tmp_path / "outside-work.sqlite3"
+    shutil.copy2(created.database_path, outside)
+    before = outside.read_bytes()
+
+    created.database_path.unlink()
+    try:
+        created.database_path.symlink_to(outside)
+    except OSError:
+        pytest.skip("file symlinks are not supported in this environment")
+
+    with pytest.raises(UnsafeStoragePathError, match="symlink"):
+        repository.open_work("work_001")
+
+    assert outside.read_bytes() == before
+
+
+def test_recovery_refuses_orphan_with_symlinked_critical_database(
+    tmp_path: Path,
+) -> None:
+    repository = WorkLifecycleRepository(tmp_path)
+    created = repository.create_work(work_id="work_orphan", title="Orphan")
+    with repository_write(repository.paths.master_db) as connection:
+        connection.execute("DELETE FROM work_catalog WHERE work_id = 'work_orphan'")
+
+    outside = tmp_path / "outside-orphan.sqlite3"
+    shutil.copy2(created.database_path, outside)
+    before = outside.read_bytes()
+    created.database_path.unlink()
+    try:
+        created.database_path.symlink_to(outside)
+    except OSError:
+        pytest.skip("file symlinks are not supported in this environment")
+
+    findings = repository.scan_recovery()
+
+    assert len(findings) == 1
+    assert findings[0].kind == "UNREGISTERED_WORK_INVALID"
+    assert findings[0].valid is False
+    with pytest.raises(WorkRecoveryError, match="invalid orphan"):
+        repository.reconcile_orphan_work("work_orphan")
+    assert outside.read_bytes() == before
