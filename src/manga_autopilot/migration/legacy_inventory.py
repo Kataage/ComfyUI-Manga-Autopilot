@@ -17,7 +17,12 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
-from manga_autopilot.storage.paths import PROJECTS_SUBDIR, resolve_storage_root
+from manga_autopilot.storage.paths import (
+    PROJECTS_SUBDIR,
+    UnsafeStoragePathError,
+    assert_managed_path,
+    resolve_storage_root,
+)
 
 _OPTIONAL_FILES = (
     "story.json",
@@ -131,13 +136,24 @@ class LegacyProjectInventoryService:
         self.storage_root = resolve_storage_root(storage_root)
         self.projects_root = self.storage_root / PROJECTS_SUBDIR
 
+    def _validated_projects_root(self) -> Path:
+        return assert_managed_path(
+            self.projects_root,
+            containment_root=self.storage_root,
+            field_name="legacy projects root",
+        )
+
     def discover_project_ids(self) -> tuple[str, ...]:
         """Return project dirs with a real, non-symlink project.json."""
-        if not self.projects_root.is_dir() or self.projects_root.is_symlink():
+        try:
+            projects_root = self._validated_projects_root()
+        except UnsafeStoragePathError:
+            return ()
+        if not projects_root.is_dir():
             return ()
 
         project_ids: list[str] = []
-        for child in sorted(self.projects_root.iterdir(), key=lambda path: path.name):
+        for child in sorted(projects_root.iterdir(), key=lambda path: path.name):
             if child.is_symlink() or not child.is_dir():
                 continue
             project_json = child / "project.json"
@@ -161,7 +177,13 @@ class LegacyProjectInventoryService:
         if project_id in {".", ".."} or "/" in project_id or "\\" in project_id:
             raise ValueError("project_id must be a single path component")
 
-        root = self.projects_root / project_id
+        projects_root = self._validated_projects_root()
+        root = projects_root / project_id
+        assert_managed_path(
+            root,
+            containment_root=projects_root,
+            field_name="legacy project root",
+        )
         project_json = root / "project.json"
         if not root.is_dir() or root.is_symlink():
             raise LegacyProjectNotFoundError(
