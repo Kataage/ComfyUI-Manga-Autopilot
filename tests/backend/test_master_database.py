@@ -12,6 +12,7 @@ from manga_autopilot.storage import (
     MASTER_FORMAT_VERSION,
     MASTER_MIGRATIONS,
     MasterDatabaseIdentityError,
+    UnrecognizedDatabaseError,
     bootstrap_master_database,
     migrate_master_database,
     read_master_identity,
@@ -314,7 +315,7 @@ def test_bootstrap_does_not_repair_incomplete_identity_when_user_data_exists(
         )
         connection.commit()
 
-    with pytest.raises(Exception):
+    with pytest.raises(UnrecognizedDatabaseError):
         bootstrap_master_database(database)
 
     with write_connection(database) as connection:
