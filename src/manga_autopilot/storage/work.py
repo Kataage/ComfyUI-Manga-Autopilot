@@ -134,7 +134,7 @@ def _migration_history_is_known_prefix(
     if len(rows) > len(migration_set):
         return False
 
-    for row, migration in zip(rows, migration_set):
+    for row, migration in zip(rows, migration_set, strict=False):
         if int(row["version"]) != migration.version:
             return False
         if str(row["name"]) != migration.name:
