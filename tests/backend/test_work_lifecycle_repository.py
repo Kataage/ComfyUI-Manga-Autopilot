@@ -204,7 +204,7 @@ def test_create_cleans_staging_on_filesystem_finalize_failure(
     assert repository.list_works() == ()
 
 
-def test_catalog_registration_failure_removes_new_finalized_work(
+def test_catalog_registration_failure_preserves_recoverable_orphan_work(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -229,7 +229,10 @@ def test_catalog_registration_failure_removes_new_finalized_work(
     with pytest.raises(WorkCreationError, match="simulated catalog write failure"):
         repository.create_work(work_id="work_fail", title="Will Fail")
 
-    assert not (tmp_path / "works" / "work_fail").exists()
+    final_root = tmp_path / "works" / "work_fail"
+    assert final_root.is_dir()
+    assert (final_root / "work.sqlite3").is_file()
+    assert (final_root / "manifest.json").is_file()
     assert not (tmp_path / "works" / ".creating-work_fail").exists()
 
     with repository_read(repository.paths.master_db) as connection:
@@ -237,6 +240,23 @@ def test_catalog_registration_failure_removes_new_finalized_work(
             "SELECT 1 FROM work_catalog WHERE work_id = 'work_fail'"
         ).fetchone()
     assert row is None
+
+    findings = repository.scan_recovery()
+    assert len(findings) == 1
+    finding = findings[0]
+    assert finding.kind == "UNREGISTERED_WORK_VALID"
+    assert finding.work_id == "work_fail"
+    assert finding.valid is True
+    assert finding.recommended_action == "register"
+    assert finding.diagnostics == ()
+
+    first = repository.reconcile_orphan_work("work_fail")
+    second = repository.reconcile_orphan_work("work_fail")
+
+    assert first.work_id == "work_fail"
+    assert second == first
+    assert repository.open_work("work_fail").title == "Will Fail"
+    assert repository.scan_recovery() == ()
 
 
 def test_catalog_path_escape_is_rejected(tmp_path: Path) -> None:
@@ -449,3 +469,112 @@ def test_portable_work_inspection_does_not_require_master_database(
     assert inspection.database_schema_version == WORK_MIGRATIONS[-1].version
     assert inspection.upgrade_required is False
     assert not (portable_root.parent / "master.sqlite3").exists()
+
+
+
+def test_recovery_scan_detects_and_finalizes_complete_stale_staging(
+    tmp_path: Path,
+) -> None:
+    repository = WorkLifecycleRepository(tmp_path)
+    created = repository.create_work(work_id="work_staged", title="Staged Work")
+
+    staging = tmp_path / "works" / ".creating-work_staged"
+    os.replace(created.root, staging)
+    with repository_write(repository.paths.master_db) as connection:
+        connection.execute(
+            "DELETE FROM work_catalog WHERE work_id = 'work_staged'"
+        )
+
+    findings = repository.scan_recovery()
+
+    assert len(findings) == 1
+    finding = findings[0]
+    assert finding.kind == "STALE_STAGING_VALID"
+    assert finding.work_id == "work_staged"
+    assert finding.valid is True
+    assert finding.recommended_action == "finalize"
+    assert finding.path == staging
+    assert finding.diagnostics == ()
+
+    catalog = repository.finalize_staging_work("work_staged")
+
+    assert catalog.work_id == "work_staged"
+    assert not staging.exists()
+    assert (tmp_path / "works" / "work_staged").is_dir()
+    assert repository.open_work("work_staged").title == "Staged Work"
+    assert repository.scan_recovery() == ()
+
+
+def test_recovery_scan_reports_invalid_staging_without_deleting_it(
+    tmp_path: Path,
+) -> None:
+    repository = WorkLifecycleRepository(tmp_path)
+    staging = tmp_path / "works" / ".creating-work_broken"
+    staging.mkdir()
+    (staging / "manifest.json").write_text(
+        '{"format":"manga-autopilot-work","format_version":2,'
+        '"work_id":"work_broken","database":"work.sqlite3",'
+        '"work_schema_version":1}',
+        encoding="utf-8",
+    )
+    evidence = staging / "partial.txt"
+    evidence.write_text("keep recovery evidence", encoding="utf-8")
+
+    findings = repository.scan_recovery()
+
+    assert len(findings) == 1
+    finding = findings[0]
+    assert finding.kind == "STALE_STAGING_INVALID"
+    assert finding.work_id == "work_broken"
+    assert finding.valid is False
+    assert finding.recommended_action == "quarantine"
+    assert finding.diagnostics
+    assert staging.is_dir()
+    assert evidence.read_text(encoding="utf-8") == "keep recovery evidence"
+
+
+def test_quarantine_invalid_staging_preserves_evidence_and_is_idempotent_for_scan(
+    tmp_path: Path,
+) -> None:
+    repository = WorkLifecycleRepository(tmp_path)
+    staging = tmp_path / "works" / ".creating-work_broken"
+    staging.mkdir()
+    (staging / "partial.txt").write_text("evidence", encoding="utf-8")
+
+    destination = repository.quarantine_staging_work(
+        "work_broken",
+        reason="incomplete crash state",
+    )
+
+    assert not staging.exists()
+    assert destination.is_dir()
+    assert (destination / "partial.txt").read_text(encoding="utf-8") == "evidence"
+
+    receipt = destination.with_name(destination.name + ".recovery.json")
+    payload = json.loads(receipt.read_text(encoding="utf-8"))
+    assert payload["work_id"] == "work_broken"
+    assert payload["source"] == ".creating-work_broken"
+    assert payload["reason"] == "incomplete crash state"
+    assert payload["quarantined_at"]
+
+    assert repository.scan_recovery() == ()
+
+
+def test_finalize_staging_is_idempotent_after_directory_move(
+    tmp_path: Path,
+) -> None:
+    repository = WorkLifecycleRepository(tmp_path)
+    created = repository.create_work(work_id="work_retry", title="Retry Finalize")
+
+    staging = tmp_path / "works" / ".creating-work_retry"
+    os.replace(created.root, staging)
+    with repository_write(repository.paths.master_db) as connection:
+        connection.execute("DELETE FROM work_catalog WHERE work_id = 'work_retry'")
+
+    first = repository.finalize_staging_work("work_retry")
+    second = repository.finalize_staging_work("work_retry")
+
+    assert first.work_id == "work_retry"
+    assert second == first
+    assert (tmp_path / "works" / "work_retry").is_dir()
+    assert not staging.exists()
