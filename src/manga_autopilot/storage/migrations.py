@@ -16,6 +16,7 @@ import hashlib
 import json
 import os
 import sqlite3
+import uuid
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -80,6 +81,7 @@ class MigrationApplyError(MigrationError):
 
 
 IntegrityHook = Callable[[sqlite3.Connection], None]
+InitializationHook = Callable[[sqlite3.Connection], None]
 
 
 @dataclass(frozen=True)
@@ -203,6 +205,17 @@ MASTER_MIGRATIONS: tuple[Migration, ...] = (
             """
             CREATE INDEX idx_work_catalog_status
             ON work_catalog(status)
+            """,
+        ),
+    ),,
+    Migration(
+        version=4,
+        name="M0004_canonical_database_kind",
+        statements=(
+            """
+            UPDATE master_metadata
+            SET value = 'manga_autopilot_master'
+            WHERE key = 'database_kind' AND value = 'master'
             """,
         ),
     ),
@@ -393,6 +406,7 @@ class MigrationRunner:
         identity_key: str = "database_kind",
         accepted_database_kinds: Iterable[str] = (),
         identity_migration_version: int | None = None,
+        fresh_initializer: InitializationHook | None = None,
     ) -> None:
         if not database_kind.strip():
             raise ValueError("database_kind must be non-empty")
@@ -406,6 +420,7 @@ class MigrationRunner:
         self.identity_key = identity_key
         self.accepted_database_kinds = frozenset(accepted_database_kinds)
         self.identity_migration_version = identity_migration_version
+        self.fresh_initializer = fresh_initializer
         _validate_migration_sequence(self.migrations)
 
     def migrate(self, database_path: str | Path) -> MigrationResult:
@@ -450,6 +465,9 @@ class MigrationRunner:
                             connection.execute(statement)
                     except Exception as exc:
                         raise MigrationApplyError(migration, exc) from exc
+
+                if not existed and self.fresh_initializer is not None:
+                    self.fresh_initializer(connection)
 
                 if self.post_integrity_check is not None:
                     try:
@@ -617,15 +635,40 @@ class MigrationRunner:
             ) from exc
 
 
+def _new_database_id(prefix: str) -> str:
+    return f"{prefix}_{uuid.uuid4().hex}"
+
+
 def migrate_master_database(
     database_path: str | Path,
     *,
     migrations: Iterable[Migration] = MASTER_MIGRATIONS,
     app_version: str | None = None,
+    database_id: str | None = None,
+    created_at: str | None = None,
     pre_integrity_check: IntegrityHook | None = sqlite_integrity_check,
     post_integrity_check: IntegrityHook | None = sqlite_post_migration_check,
 ) -> MigrationResult:
-    """Migrate a Master database using the independent Master sequence."""
+    """Migrate a Master database and atomically initialize fresh DB identity."""
+    path = Path(database_path).expanduser().resolve()
+    fresh = not _existing_nonempty_database(path)
+    initial_database_id = database_id or _new_database_id("master")
+    initial_created_at = created_at or _utc_now_iso()
+
+    def initialize_identity(connection: sqlite3.Connection) -> None:
+        connection.executemany(
+            """
+            INSERT INTO master_metadata (key, value)
+            VALUES (?, ?)
+            """,
+            (
+                ("database_kind", "manga_autopilot_master"),
+                ("database_id", initial_database_id),
+                ("format_version", "2"),
+                ("created_at", initial_created_at),
+            ),
+        )
+
     return MigrationRunner(
         database_kind="master",
         migrations=migrations,
@@ -635,7 +678,8 @@ def migrate_master_database(
         identity_table="master_metadata",
         accepted_database_kinds=("master", "manga_autopilot_master"),
         identity_migration_version=2,
-    ).migrate(database_path)
+        fresh_initializer=initialize_identity if fresh else None,
+    ).migrate(path)
 
 
 def migrate_work_database(
@@ -643,10 +687,37 @@ def migrate_work_database(
     *,
     migrations: Iterable[Migration] = WORK_MIGRATIONS,
     app_version: str | None = None,
+    work_id: str | None = None,
+    database_id: str | None = None,
+    created_at: str | None = None,
     pre_integrity_check: IntegrityHook | None = sqlite_integrity_check,
     post_integrity_check: IntegrityHook | None = sqlite_post_migration_check,
 ) -> MigrationResult:
-    """Migrate a Work database using the independent Work sequence."""
+    """Migrate a Work DB and atomically initialize identity when it is fresh."""
+    path = Path(database_path).expanduser().resolve()
+    fresh = not _existing_nonempty_database(path)
+    if fresh and (work_id is None or not work_id.strip()):
+        raise ValueError("work_id is required when migrating a fresh Work database")
+
+    initial_database_id = database_id or _new_database_id("workdb")
+    initial_created_at = created_at or _utc_now_iso()
+
+    def initialize_identity(connection: sqlite3.Connection) -> None:
+        assert work_id is not None
+        connection.executemany(
+            """
+            INSERT INTO work_database_metadata (key, value)
+            VALUES (?, ?)
+            """,
+            (
+                ("database_kind", "work"),
+                ("database_id", initial_database_id),
+                ("format_version", "2"),
+                ("work_id", work_id),
+                ("created_at", initial_created_at),
+            ),
+        )
+
     return MigrationRunner(
         database_kind="work",
         migrations=migrations,
@@ -656,7 +727,8 @@ def migrate_work_database(
         identity_table="work_database_metadata",
         accepted_database_kinds=("work", "manga_autopilot_work"),
         identity_migration_version=2,
-    ).migrate(database_path)
+        fresh_initializer=initialize_identity if fresh else None,
+    ).migrate(path)
 
 
 __all__ = [
@@ -665,6 +737,7 @@ __all__ = [
     "WORK_MIGRATIONS",
     "AppliedMigration",
     "DatabaseIdentityMismatchError",
+    "InitializationHook",
     "IntegrityHook",
     "Migration",
     "MigrationApplyError",
