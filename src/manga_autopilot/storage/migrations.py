@@ -430,6 +430,23 @@ def _existing_nonempty_database(path: Path) -> bool:
     return path.exists() and path.is_file() and path.stat().st_size > 0
 
 
+def _cleanup_failed_fresh_database(path: Path) -> None:
+    """Best-effort cleanup for a DB file created by this failed fresh attempt."""
+    for candidate in (
+        path.with_name(path.name + "-shm"),
+        path.with_name(path.name + "-wal"),
+        path,
+    ):
+        try:
+            if candidate.is_symlink():
+                continue
+            if candidate.is_file():
+                candidate.unlink()
+        except OSError:
+            # Cleanup must never mask the primary migration failure.
+            pass
+
+
 def _table_names(connection: sqlite3.Connection) -> set[str]:
     rows = connection.execute(
         """
@@ -480,6 +497,7 @@ class MigrationRunner:
     def migrate(self, database_path: str | Path) -> MigrationResult:
         """Migrate a database using backup-first, all-or-nothing semantics."""
         path = _migration_database_path(database_path)
+        path_existed_before = path.exists()
         existed = _existing_nonempty_database(path)
 
         applied = self._inspect_existing_database(path) if existed else {}
@@ -505,58 +523,63 @@ class MigrationRunner:
                 pending_migrations=pending,
             )
 
-        with write_connection(path) as connection:
-            if self.pre_integrity_check is not None and not existed:
-                self.pre_integrity_check(connection)
+        try:
+            with write_connection(path) as connection:
+                if self.pre_integrity_check is not None and not existed:
+                    self.pre_integrity_check(connection)
 
-            try:
-                connection.execute("BEGIN IMMEDIATE")
-                _ensure_schema_migrations(connection)
+                try:
+                    connection.execute("BEGIN IMMEDIATE")
+                    _ensure_schema_migrations(connection)
 
-                for migration in pending:
-                    try:
-                        for statement in migration.statements:
-                            connection.execute(statement)
-                    except Exception as exc:
-                        raise MigrationApplyError(migration, exc) from exc
+                    for migration in pending:
+                        try:
+                            for statement in migration.statements:
+                                connection.execute(statement)
+                        except Exception as exc:
+                            raise MigrationApplyError(migration, exc) from exc
 
-                if not existed and self.fresh_initializer is not None:
-                    self.fresh_initializer(connection)
+                    if not existed and self.fresh_initializer is not None:
+                        self.fresh_initializer(connection)
 
-                if self.post_integrity_check is not None:
-                    try:
-                        self.post_integrity_check(connection)
-                    except Exception as exc:
-                        raise MigrationValidationError(
-                            "post-migration validation failed before migration "
-                            "records were committed",
-                            pending_migrations=pending,
-                            cause=exc,
-                        ) from exc
+                    if self.post_integrity_check is not None:
+                        try:
+                            self.post_integrity_check(connection)
+                        except Exception as exc:
+                            raise MigrationValidationError(
+                                "post-migration validation failed before migration "
+                                "records were committed",
+                                pending_migrations=pending,
+                                cause=exc,
+                            ) from exc
 
-                applied_at = _utc_now_iso()
-                for migration in pending:
-                    connection.execute(
-                        f"""
-                        INSERT INTO {SCHEMA_MIGRATIONS_TABLE}
-                            (version, name, checksum, applied_at, app_version)
-                        VALUES (?, ?, ?, ?, ?)
-                        """,
-                        (
-                            migration.version,
-                            migration.name,
-                            migration.checksum,
-                            applied_at,
-                            self.app_version,
-                        ),
-                    )
-                connection.commit()
-            except Exception:
-                connection.rollback()
-                raise
+                    applied_at = _utc_now_iso()
+                    for migration in pending:
+                        connection.execute(
+                            f"""
+                            INSERT INTO {SCHEMA_MIGRATIONS_TABLE}
+                                (version, name, checksum, applied_at, app_version)
+                            VALUES (?, ?, ?, ?, ?)
+                            """,
+                            (
+                                migration.version,
+                                migration.name,
+                                migration.checksum,
+                                applied_at,
+                                self.app_version,
+                            ),
+                        )
+                    connection.commit()
+                except Exception:
+                    connection.rollback()
+                    raise
 
-            final_applied = _read_applied_migrations(connection)
-            current_version = max(final_applied, default=0)
+                final_applied = _read_applied_migrations(connection)
+                current_version = max(final_applied, default=0)
+        except Exception:
+            if not path_existed_before:
+                _cleanup_failed_fresh_database(path)
+            raise
 
         return MigrationResult(
             database_kind=self.database_kind,
