@@ -121,7 +121,7 @@ def _migration_history_is_known_prefix(connection: sqlite3.Connection) -> bool:
     if len(rows) > len(MASTER_MIGRATIONS):
         return False
 
-    for row, migration in zip(rows, MASTER_MIGRATIONS):
+    for row, migration in zip(rows, MASTER_MIGRATIONS, strict=False):
         if int(row["version"]) != migration.version:
             return False
         if str(row["name"]) != migration.name:
