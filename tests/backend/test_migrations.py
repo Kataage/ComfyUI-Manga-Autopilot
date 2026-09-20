@@ -880,3 +880,88 @@ def test_existing_work_with_mismatched_work_id_is_rejected_before_upgrade(
     assert not database.with_name(
         f"{database.name}.backup-v{WORK_MIGRATIONS[-1].version}-to-v{next_version}"
     ).exists()
+
+def test_failed_fresh_master_migration_is_retry_safe(tmp_path: Path) -> None:
+    database = tmp_path / "master.sqlite3"
+    broken_version = MASTER_MIGRATIONS[-1].version + 1
+    broken = (
+        *MASTER_MIGRATIONS,
+        Migration(
+            version=broken_version,
+            name=f"M{broken_version:04d}_broken_fresh",
+            statements=("INSERT INTO missing_table (id) VALUES (1)",),
+        ),
+    )
+
+    with pytest.raises(MigrationApplyError):
+        migrate_master_database(
+            database,
+            migrations=broken,
+            database_id="master_retry",
+        )
+
+    assert not database.exists()
+    assert not database.with_name(database.name + "-wal").exists()
+    assert not database.with_name(database.name + "-shm").exists()
+
+    result = migrate_master_database(
+        database,
+        database_id="master_retry",
+    )
+    assert result.current_version == MASTER_MIGRATIONS[-1].version
+    assert read_master_identity(database).database_id == "master_retry"
+
+
+def test_failed_fresh_work_migration_is_retry_safe(tmp_path: Path) -> None:
+    database = tmp_path / "work.sqlite3"
+    broken_version = WORK_MIGRATIONS[-1].version + 1
+    broken = (
+        *WORK_MIGRATIONS,
+        Migration(
+            version=broken_version,
+            name=f"W{broken_version:04d}_broken_fresh",
+            statements=("INSERT INTO missing_table (id) VALUES (1)",),
+        ),
+    )
+
+    with pytest.raises(MigrationApplyError):
+        migrate_work_database(
+            database,
+            migrations=broken,
+            work_id="work_retry",
+            database_id="workdb_retry",
+        )
+
+    assert not database.exists()
+    assert not database.with_name(database.name + "-wal").exists()
+    assert not database.with_name(database.name + "-shm").exists()
+
+    result = migrate_work_database(
+        database,
+        work_id="work_retry",
+        database_id="workdb_retry",
+    )
+    assert result.current_version == WORK_MIGRATIONS[-1].version
+    assert read_work_identity(database).database_id == "workdb_retry"
+
+
+def test_failed_fresh_migration_never_deletes_preexisting_empty_file(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "preexisting.sqlite3"
+    database.write_bytes(b"")
+    broken = (
+        Migration(
+            version=1,
+            name="broken",
+            statements=("INSERT INTO missing_table (id) VALUES (1)",),
+        ),
+    )
+
+    with pytest.raises(MigrationApplyError):
+        MigrationRunner(
+            database_kind="test",
+            migrations=broken,
+        ).migrate(database)
+
+    assert database.exists()
