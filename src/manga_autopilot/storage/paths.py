@@ -37,6 +37,14 @@ PROJECTS_SUBDIR = "projects"
 WORK_DB_FILENAME = "work.sqlite3"
 WORK_MANIFEST_FILENAME = "manifest.json"
 
+# The works/ directory reserves a dot-prefixed namespace for lifecycle internals.
+# Keep exact internal names and prefixes centralized so Work IDs can never collide
+# with staging, recovery, or future hidden management entries.
+WORK_STAGING_PREFIX = ".creating-"
+WORK_RECOVERY_QUARANTINE_DIR = ".recovery-quarantine"
+WORK_RESERVED_ID_NAMES = frozenset({WORK_RECOVERY_QUARANTINE_DIR})
+WORK_RESERVED_ID_PREFIXES: tuple[str, ...] = (".",)
+
 ASSET_SUBDIRS: tuple[str, ...] = ("characters", "panels", "pages", "temp")
 EXPORT_SUBDIRS: tuple[str, ...] = ("pages", "webtoon", "pdf")
 
@@ -58,6 +66,29 @@ def _safe_path_component(value: str, *, field_name: str) -> str:
     if Path(value).is_absolute():
         raise ValueError(f"{field_name} must not be absolute")
     return value
+
+
+def validate_work_id(work_id: str) -> str:
+    """Validate one Work ID for both path safety and lifecycle namespaces."""
+    safe_work_id = _safe_path_component(work_id, field_name="work_id")
+    if safe_work_id in WORK_RESERVED_ID_NAMES:
+        raise ValueError(
+            f"work_id is reserved for internal storage state: {safe_work_id!r}"
+        )
+    reserved_prefix = next(
+        (
+            prefix
+            for prefix in WORK_RESERVED_ID_PREFIXES
+            if safe_work_id.startswith(prefix)
+        ),
+        None,
+    )
+    if reserved_prefix is not None:
+        raise ValueError(
+            "work_id must not use a reserved internal storage prefix: "
+            f"{reserved_prefix!r}"
+        )
+    return safe_work_id
 
 
 def _is_within(path: Path, root: Path) -> bool:
@@ -389,7 +420,7 @@ def ensure_storage_root(storage_path: str | Path) -> Path:
 
 def work_paths(storage_path: str | Path, work_id: str) -> WorkPaths:
     """Resolve the canonical paths for one v2 Work."""
-    safe_work_id = _safe_path_component(work_id, field_name="work_id")
+    safe_work_id = validate_work_id(work_id)
     root = storage_paths(storage_path).works / safe_work_id
     return WorkPaths(work_id=safe_work_id, root=root)
 
