@@ -11,6 +11,7 @@ from manga_autopilot.migration.legacy_inventory import (
     LegacyProjectInventoryService,
     LegacyProjectNotFoundError,
 )
+from manga_autopilot.storage import UnsafeStoragePathError
 
 
 def _write_project(root: Path, project_id: str = "legacy_001") -> Path:
@@ -242,6 +243,8 @@ def test_symlink_project_directory_is_not_discovered(
     service = LegacyProjectInventoryService(tmp_path)
 
     assert "linked" not in service.discover_project_ids()
+    with pytest.raises(UnsafeStoragePathError, match="symlink"):
+        service.inventory_project("linked")
 
 
 
@@ -329,3 +332,34 @@ def test_symlink_optional_directory_is_not_traversed(tmp_path: Path) -> None:
         and warning.relative_path == "assets"
         for warning in report.warnings
     )
+
+
+
+def test_direct_inventory_rejects_symlinked_projects_root_without_reading_external(
+    tmp_path: Path,
+) -> None:
+    outside_projects = tmp_path / "outside-projects"
+    outside_project = outside_projects / "external"
+    outside_project.mkdir(parents=True)
+    external_project_json = outside_project / "project.json"
+    external_project_json.write_text(
+        '{"id":"external","name":"outside","title":"Do Not Read"}',
+        encoding="utf-8",
+    )
+    before = external_project_json.read_bytes()
+
+    storage = tmp_path / "storage"
+    storage.mkdir()
+    projects_link = storage / "projects"
+    try:
+        projects_link.symlink_to(outside_projects, target_is_directory=True)
+    except OSError:
+        pytest.skip("directory symlinks are not supported in this environment")
+
+    service = LegacyProjectInventoryService(storage)
+
+    assert service.discover_project_ids() == ()
+    with pytest.raises(UnsafeStoragePathError, match="symlink"):
+        service.inventory_project("external")
+
+    assert external_project_json.read_bytes() == before
