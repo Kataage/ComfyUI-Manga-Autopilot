@@ -788,3 +788,95 @@ def test_interrupted_master_identity_recovery_rejects_non_prefix_history(
             "SELECT COUNT(*) FROM master_metadata"
         ).fetchone()[0] == 0
 
+def test_existing_master_with_incomplete_identity_is_rejected_before_upgrade(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "master.sqlite3"
+    bootstrap_master_database(database, database_id="master_test")
+    with write_connection(database) as connection:
+        connection.execute(
+            "DELETE FROM master_metadata WHERE key = 'database_id'"
+        )
+        connection.commit()
+
+    next_version = MASTER_MIGRATIONS[-1].version + 1
+    migrations = (
+        *MASTER_MIGRATIONS,
+        Migration(
+            version=next_version,
+            name=f"M{next_version:04d}_must_not_run",
+            statements=("CREATE TABLE must_not_run (id INTEGER PRIMARY KEY)",),
+        ),
+    )
+
+    with pytest.raises(UnrecognizedDatabaseError, match="incomplete identity"):
+        migrate_master_database(database, migrations=migrations)
+
+    with read_connection(database) as connection:
+        assert connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE name = 'must_not_run'"
+        ).fetchone() is None
+    assert not database.with_name(
+        f"{database.name}.backup-v{MASTER_MIGRATIONS[-1].version}-to-v{next_version}"
+    ).exists()
+
+
+def test_existing_master_with_wrong_format_is_rejected_before_upgrade(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "master.sqlite3"
+    bootstrap_master_database(database, database_id="master_test")
+    with write_connection(database) as connection:
+        connection.execute(
+            "UPDATE master_metadata SET value = '999' WHERE key = 'format_version'"
+        )
+        connection.commit()
+
+    next_version = MASTER_MIGRATIONS[-1].version + 1
+    migrations = (
+        *MASTER_MIGRATIONS,
+        Migration(
+            version=next_version,
+            name=f"M{next_version:04d}_must_not_run",
+            statements=("CREATE TABLE must_not_run (id INTEGER PRIMARY KEY)",),
+        ),
+    )
+
+    with pytest.raises(DatabaseIdentityMismatchError, match="format_version"):
+        migrate_master_database(database, migrations=migrations)
+
+    with read_connection(database) as connection:
+        assert connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE name = 'must_not_run'"
+        ).fetchone() is None
+
+
+def test_existing_work_with_mismatched_work_id_is_rejected_before_upgrade(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "work.sqlite3"
+    bootstrap_work_database(database, work_id="work_original")
+    next_version = WORK_MIGRATIONS[-1].version + 1
+    migrations = (
+        *WORK_MIGRATIONS,
+        Migration(
+            version=next_version,
+            name=f"W{next_version:04d}_must_not_run",
+            statements=("CREATE TABLE must_not_run (id INTEGER PRIMARY KEY)",),
+        ),
+    )
+
+    with pytest.raises(DatabaseIdentityMismatchError, match="work_id"):
+        migrate_work_database(
+            database,
+            migrations=migrations,
+            work_id="work_other",
+        )
+
+    with read_connection(database) as connection:
+        assert connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE name = 'must_not_run'"
+        ).fetchone() is None
+    assert not database.with_name(
+        f"{database.name}.backup-v{WORK_MIGRATIONS[-1].version}-to-v{next_version}"
+    ).exists()
