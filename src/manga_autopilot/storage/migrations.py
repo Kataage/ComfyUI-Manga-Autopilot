@@ -207,7 +207,7 @@ MASTER_MIGRATIONS: tuple[Migration, ...] = (
             ON work_catalog(status)
             """,
         ),
-    ),,
+    ),
     Migration(
         version=4,
         name="M0004_canonical_database_kind",
