@@ -130,11 +130,12 @@ def _migration_history_is_known_prefix(
     if not rows:
         return False
 
-    configured = {migration.version: migration for migration in migrations}
-    for row in rows:
-        version = int(row["version"])
-        migration = configured.get(version)
-        if migration is None:
+    migration_set = tuple(migrations)
+    if len(rows) > len(migration_set):
+        return False
+
+    for row, migration in zip(rows, migration_set, strict=True):
+        if int(row["version"]) != migration.version:
             return False
         if str(row["name"]) != migration.name:
             return False
