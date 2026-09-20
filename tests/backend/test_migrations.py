@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import sqlite3
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
@@ -881,6 +883,80 @@ def test_existing_work_with_mismatched_work_id_is_rejected_before_upgrade(
     assert not database.with_name(
         f"{database.name}.backup-v{WORK_MIGRATIONS[-1].version}-to-v{next_version}"
     ).exists()
+
+def test_concurrent_fresh_master_bootstrap_never_deletes_winner(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = tmp_path / "master.sqlite3"
+    publish_barrier = threading.Barrier(2)
+    original_link = migrations_module.os.link
+
+    def synchronized_link(
+        source: str | bytes | Path,
+        destination: str | bytes | Path,
+        *args: object,
+        **kwargs: object,
+    ) -> None:
+        if Path(destination) == database:
+            publish_barrier.wait(timeout=10)
+        original_link(source, destination, *args, **kwargs)
+
+    monkeypatch.setattr(migrations_module.os, "link", synchronized_link)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [
+            executor.submit(bootstrap_master_database, database)
+            for _ in range(2)
+        ]
+        results = [future.result(timeout=20) for future in futures]
+
+    identity = read_master_identity(database)
+    assert {result.identity.database_id for result in results} == {
+        identity.database_id
+    }
+    assert identity.database_kind == "manga_autopilot_master"
+    assert not list(tmp_path.glob(".master.sqlite3.init-*"))
+
+
+def test_concurrent_fresh_work_bootstrap_never_deletes_winner(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = tmp_path / "work.sqlite3"
+    publish_barrier = threading.Barrier(2)
+    original_link = migrations_module.os.link
+
+    def synchronized_link(
+        source: str | bytes | Path,
+        destination: str | bytes | Path,
+        *args: object,
+        **kwargs: object,
+    ) -> None:
+        if Path(destination) == database:
+            publish_barrier.wait(timeout=10)
+        original_link(source, destination, *args, **kwargs)
+
+    monkeypatch.setattr(migrations_module.os, "link", synchronized_link)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [
+            executor.submit(
+                bootstrap_work_database,
+                database,
+                work_id="work_race",
+            )
+            for _ in range(2)
+        ]
+        results = [future.result(timeout=20) for future in futures]
+
+    identity = read_work_identity(database)
+    assert {result.identity.database_id for result in results} == {
+        identity.database_id
+    }
+    assert identity.work_id == "work_race"
+    assert not list(tmp_path.glob(".work.sqlite3.init-*"))
+
 
 def test_failed_fresh_master_migration_is_retry_safe(tmp_path: Path) -> None:
     database = tmp_path / "master.sqlite3"
