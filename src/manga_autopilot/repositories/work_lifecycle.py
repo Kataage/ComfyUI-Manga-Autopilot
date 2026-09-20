@@ -14,6 +14,8 @@ from typing import Any
 from manga_autopilot.primitives import new_id, sha256_file
 from manga_autopilot.storage import (
     WORK_MIGRATIONS,
+    WORK_RECOVERY_QUARANTINE_DIR,
+    WORK_STAGING_PREFIX,
     Migration,
     MigrationError,
     WorkPaths,
@@ -28,6 +30,7 @@ from manga_autopilot.storage import (
     repository_read,
     repository_write,
     storage_paths,
+    validate_work_id,
     work_paths,
     write_connection,
 )
@@ -42,9 +45,6 @@ from manga_autopilot.storage.work_manifest import (
     is_canonical_live_manifest,
     validate_manifest_common,
 )
-
-WORK_STAGING_PREFIX = ".creating-"
-WORK_RECOVERY_QUARANTINE_DIR = ".recovery-quarantine"
 
 
 class WorkLifecycleError(RuntimeError):
@@ -255,6 +255,11 @@ def _validate_manifest(
     except WorkManifestContractError as exc:
         if "manifest Work identity mismatch" in str(exc):
             raise WorkIdentityMismatchError(str(exc)) from exc
+        raise WorkManifestError(str(exc)) from exc
+
+    try:
+        validate_work_id(str(manifest["work_id"]))
+    except ValueError as exc:
         raise WorkManifestError(str(exc)) from exc
 
 
