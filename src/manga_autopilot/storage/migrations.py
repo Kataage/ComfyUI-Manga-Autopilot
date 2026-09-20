@@ -508,6 +508,11 @@ class MigrationRunner:
         )
 
         if not pending:
+            if existed:
+                with read_connection(path) as connection:
+                    if self.pre_integrity_check is not None:
+                        self.pre_integrity_check(connection)
+                    sqlite_constraint_check(connection)
             return MigrationResult(
                 database_kind=self.database_kind,
                 current_version=max(applied, default=0),
