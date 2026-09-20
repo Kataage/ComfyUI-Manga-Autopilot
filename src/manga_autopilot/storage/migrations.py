@@ -707,20 +707,31 @@ class MigrationRunner:
             f"{path.name}.backup-v{current_version}-to-v{target_version}"
         )
         temp = backup.with_name(backup.name + ".tmp")
-        if backup.is_symlink():
-            raise MigrationBackupError(
-                f"migration backup path must not be a symlink: {backup}",
-                pending_migrations=pending_migrations,
-            )
-        if temp.is_symlink():
-            raise MigrationBackupError(
-                f"migration backup temp path must not be a symlink: {temp}",
-                pending_migrations=pending_migrations,
-            )
-        if temp.exists():
-            temp.unlink()
+
+        def cleanup_temp_best_effort() -> None:
+            try:
+                if temp.is_symlink():
+                    return
+                if temp.exists():
+                    temp.unlink()
+            except OSError:
+                # Never mask the primary backup/migration failure.
+                pass
 
         try:
+            if backup.is_symlink():
+                raise MigrationBackupError(
+                    f"migration backup path must not be a symlink: {backup}",
+                    pending_migrations=pending_migrations,
+                )
+            if temp.is_symlink():
+                raise MigrationBackupError(
+                    f"migration backup temp path must not be a symlink: {temp}",
+                    pending_migrations=pending_migrations,
+                )
+            if temp.exists():
+                temp.unlink()
+
             with write_connection(path) as source:
                 checkpoint = source.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
                 if checkpoint is not None and int(checkpoint[0]) != 0:
@@ -754,12 +765,10 @@ class MigrationRunner:
             os.replace(temp, backup)
             return backup
         except MigrationError:
-            if temp.exists():
-                temp.unlink()
+            cleanup_temp_best_effort()
             raise
         except Exception as exc:
-            if temp.exists():
-                temp.unlink()
+            cleanup_temp_best_effort()
             raise MigrationBackupError(
                 f"failed to create verified backup for {path}",
                 pending_migrations=pending_migrations,
