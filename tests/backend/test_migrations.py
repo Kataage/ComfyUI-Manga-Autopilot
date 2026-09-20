@@ -25,6 +25,8 @@ from manga_autopilot.storage import (
     migrate_master_database,
     migrate_work_database,
     read_connection,
+    read_master_identity,
+    read_work_identity,
     write_connection,
 )
 
@@ -56,12 +58,13 @@ def test_fresh_master_database_migrates_to_latest(tmp_path: Path) -> None:
     assert rows[-1]["checksum"] == MASTER_MIGRATIONS[-1].checksum
     assert rows[-1]["app_version"] == "test"
     assert rows[-1]["applied_at"]
+    assert read_master_identity(database).database_kind == "manga_autopilot_master"
 
 
 def test_fresh_work_database_migrates_to_independent_sequence(tmp_path: Path) -> None:
     database = tmp_path / "work.sqlite3"
 
-    result = migrate_work_database(database)
+    result = migrate_work_database(database, work_id="work_direct")
 
     assert result.database_kind == "work"
     assert result.current_version == WORK_MIGRATIONS[-1].version
@@ -71,6 +74,7 @@ def test_fresh_work_database_migrates_to_independent_sequence(tmp_path: Path) ->
     rows = _applied_rows(database)
     assert rows[-1]["name"] == WORK_MIGRATIONS[-1].name
     assert rows[-1]["name"] != MASTER_MIGRATIONS[-1].name
+    assert read_work_identity(database).work_id == "work_direct"
 
 
 def test_rerunning_migrations_is_idempotent_for_valid_master(tmp_path: Path) -> None:
@@ -441,3 +445,60 @@ def test_migration_checksum_is_stable() -> None:
     )
 
     assert first.checksum == second.checksum
+
+
+
+def test_fresh_work_migration_requires_work_id(tmp_path: Path) -> None:
+    database = tmp_path / "work.sqlite3"
+
+    with pytest.raises(ValueError, match="work_id is required"):
+        migrate_work_database(database)
+
+    assert not database.exists()
+
+
+def test_generic_runner_can_simulate_stranded_master_identity_state(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "master.sqlite3"
+    MigrationRunner(
+        database_kind="test",
+        migrations=MASTER_MIGRATIONS,
+    ).migrate(database)
+
+    with read_connection(database) as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM master_metadata"
+        ).fetchone()[0] == 0
+
+    recovered = bootstrap_master_database(
+        database,
+        database_id="master_recovered",
+    )
+
+    assert recovered.identity.database_id == "master_recovered"
+    assert recovered.identity.database_kind == "manga_autopilot_master"
+
+
+def test_generic_runner_can_simulate_stranded_work_identity_state(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "work.sqlite3"
+    MigrationRunner(
+        database_kind="test",
+        migrations=WORK_MIGRATIONS,
+    ).migrate(database)
+
+    with read_connection(database) as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM work_database_metadata"
+        ).fetchone()[0] == 0
+
+    recovered = bootstrap_work_database(
+        database,
+        work_id="work_recovered",
+        database_id="workdb_recovered",
+    )
+
+    assert recovered.identity.work_id == "work_recovered"
+    assert recovered.identity.database_id == "workdb_recovered"
