@@ -7,6 +7,8 @@ from pathlib import Path
 
 import pytest
 
+import manga_autopilot.storage.migrations as migrations_module
+
 from manga_autopilot.storage import (
     MASTER_MIGRATIONS,
     SCHEMA_MIGRATIONS_TABLE,
@@ -1057,3 +1059,85 @@ def test_current_schema_integrity_failure_is_not_reported_as_success(
             migrations=migrations,
             pre_integrity_check=fail_validation,
         ).migrate(database)
+
+def test_backup_temp_directory_failure_keeps_pending_migration_attribution(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "master.sqlite3"
+    bootstrap_master_database(database, database_id="master_test")
+    next_version = MASTER_MIGRATIONS[-1].version + 1
+    migrations = (
+        *MASTER_MIGRATIONS,
+        Migration(
+            version=next_version,
+            name=f"M{next_version:04d}_temp_directory",
+            statements=("CREATE TABLE must_not_run (id INTEGER PRIMARY KEY)",),
+        ),
+    )
+    backup = database.with_name(
+        f"{database.name}.backup-v{MASTER_MIGRATIONS[-1].version}-to-v{next_version}"
+    )
+    temp = backup.with_name(backup.name + ".tmp")
+    temp.mkdir()
+
+    with pytest.raises(MigrationBackupError) as exc_info:
+        migrate_master_database(database, migrations=migrations)
+
+    error = exc_info.value
+    assert error.pending_versions == (next_version,)
+    assert error.target_version == next_version
+    assert isinstance(error.cause, IsADirectoryError)
+    assert temp.is_dir()
+    assert not backup.exists()
+    with read_connection(database) as connection:
+        assert connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE name = 'must_not_run'"
+        ).fetchone() is None
+
+
+def test_backup_cleanup_failure_does_not_mask_primary_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = tmp_path / "master.sqlite3"
+    bootstrap_master_database(database, database_id="master_test")
+    next_version = MASTER_MIGRATIONS[-1].version + 1
+    migrations = (
+        *MASTER_MIGRATIONS,
+        Migration(
+            version=next_version,
+            name=f"M{next_version:04d}_cleanup_mask",
+            statements=("CREATE TABLE must_not_run (id INTEGER PRIMARY KEY)",),
+        ),
+    )
+    backup = database.with_name(
+        f"{database.name}.backup-v{MASTER_MIGRATIONS[-1].version}-to-v{next_version}"
+    )
+    temp = backup.with_name(backup.name + ".tmp")
+    original_unlink = Path.unlink
+
+    def fail_replace(_source: object, _destination: object) -> None:
+        raise OSError("primary replace failure")
+
+    def fail_temp_unlink(
+        self: Path,
+        *args: object,
+        **kwargs: object,
+    ) -> None:
+        if self == temp:
+            raise OSError("secondary cleanup failure")
+        original_unlink(self, *args, **kwargs)
+
+    monkeypatch.setattr(migrations_module.os, "replace", fail_replace)
+    monkeypatch.setattr(Path, "unlink", fail_temp_unlink)
+
+    with pytest.raises(MigrationBackupError) as exc_info:
+        migrate_master_database(database, migrations=migrations)
+
+    error = exc_info.value
+    assert error.pending_versions == (next_version,)
+    assert error.target_version == next_version
+    assert isinstance(error.cause, OSError)
+    assert str(error.cause) == "primary replace failure"
+    assert temp.exists()
+    assert not backup.exists()
