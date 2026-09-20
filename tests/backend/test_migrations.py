@@ -965,3 +965,95 @@ def test_failed_fresh_migration_never_deletes_preexisting_empty_file(
         ).migrate(database)
 
     assert database.exists()
+
+def test_current_schema_database_runs_validation_without_backup(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "generic.sqlite3"
+    migrations = (Migration(version=1, name="first"),)
+    MigrationRunner(
+        database_kind="test",
+        migrations=migrations,
+    ).migrate(database)
+
+    calls: list[str] = []
+
+    def validate(connection: sqlite3.Connection) -> None:
+        assert connection.execute("PRAGMA query_only").fetchone()[0] == 1
+        calls.append("validate")
+
+    result = MigrationRunner(
+        database_kind="test",
+        migrations=migrations,
+        pre_integrity_check=validate,
+    ).migrate(database)
+
+    assert calls == ["validate"]
+    assert result.applied_versions == ()
+    assert result.backup_path is None
+    assert not list(tmp_path.glob("*.backup-*"))
+
+
+def test_current_work_schema_rejects_existing_foreign_key_violation(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "work.sqlite3"
+    bootstrap_work_database(database, work_id="work_001")
+
+    raw = sqlite3.connect(database)
+    try:
+        raw.execute("PRAGMA foreign_keys = OFF")
+        raw.execute(
+            """
+            INSERT INTO entity_revisions (
+                id,
+                entity_type,
+                entity_id,
+                entity_revision,
+                commit_seq,
+                change_kind,
+                created_at
+            )
+            VALUES (
+                'revision_orphan',
+                'work',
+                'work_001',
+                1,
+                999,
+                'test',
+                '2026-09-20T00:00:00+00:00'
+            )
+            """
+        )
+        raw.commit()
+    finally:
+        raw.close()
+
+    with pytest.raises(MigrationIntegrityError, match="foreign_key_check"):
+        migrate_work_database(database)
+
+    assert not list(tmp_path.glob("*.backup-*"))
+
+
+def test_current_schema_integrity_failure_is_not_reported_as_success(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "generic.sqlite3"
+    migrations = (Migration(version=1, name="first"),)
+    MigrationRunner(
+        database_kind="test",
+        migrations=migrations,
+    ).migrate(database)
+
+    def fail_validation(_connection: sqlite3.Connection) -> None:
+        raise MigrationIntegrityError("simulated current-schema corruption")
+
+    with pytest.raises(
+        MigrationIntegrityError,
+        match="simulated current-schema corruption",
+    ):
+        MigrationRunner(
+            database_kind="test",
+            migrations=migrations,
+            pre_integrity_check=fail_validation,
+        ).migrate(database)
