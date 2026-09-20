@@ -8,7 +8,6 @@ from pathlib import Path
 import pytest
 
 import manga_autopilot.storage.migrations as migrations_module
-
 from manga_autopilot.storage import (
     MASTER_MIGRATIONS,
     SCHEMA_MIGRATIONS_TABLE,
