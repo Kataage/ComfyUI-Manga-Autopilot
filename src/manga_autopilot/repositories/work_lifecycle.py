@@ -31,12 +31,18 @@ from manga_autopilot.storage import (
     work_paths,
     write_connection,
 )
+from manga_autopilot.storage.work_manifest import (
+    LEGACY_WORK_MANIFEST_FORMAT_VERSIONS,
+    LIVE_MANIFEST_HASH_POLICY,
+    LIVE_MANIFEST_INTEGRITY_MODE,
+    WORK_MANIFEST_FORMAT,
+    WORK_MANIFEST_FORMAT_VERSION,
+    WorkManifestContractError,
+    build_live_work_manifest,
+    is_canonical_live_manifest,
+    validate_manifest_common,
+)
 
-WORK_MANIFEST_FORMAT = "manga-autopilot-work"
-WORK_MANIFEST_FORMAT_VERSION = 2
-LEGACY_WORK_MANIFEST_FORMAT_VERSIONS = frozenset({1})
-LIVE_MANIFEST_INTEGRITY_MODE = "live_mutable"
-LIVE_MANIFEST_HASH_POLICY = "package_only"
 WORK_STAGING_PREFIX = ".creating-"
 WORK_RECOVERY_QUARANTINE_DIR = ".recovery-quarantine"
 
@@ -214,19 +220,13 @@ def _live_manifest(
     created_at: str,
     app_version: str | None,
 ) -> dict[str, Any]:
-    return {
-        "format": WORK_MANIFEST_FORMAT,
-        "format_version": WORK_MANIFEST_FORMAT_VERSION,
-        "work_id": work_id,
-        "database": database_name,
-        "work_schema_version": work_schema_version,
-        "created_at": created_at,
-        "app_version": app_version,
-        "integrity": {
-            "mode": LIVE_MANIFEST_INTEGRITY_MODE,
-            "database_hash_policy": LIVE_MANIFEST_HASH_POLICY,
-        },
-    }
+    return build_live_work_manifest(
+        work_id=work_id,
+        database_name=database_name,
+        work_schema_version=work_schema_version,
+        created_at=created_at,
+        app_version=app_version,
+    )
 
 
 def _validate_manifest(
@@ -235,41 +235,27 @@ def _validate_manifest(
     expected_work_id: str | None,
     expected_database_name: str = "work.sqlite3",
 ) -> None:
-    if manifest.get("format") != WORK_MANIFEST_FORMAT:
-        raise WorkManifestError(
-            f"unsupported Work manifest format: {manifest.get('format')!r}"
-        )
-
-    format_version = manifest.get("format_version")
-    accepted_versions = {
-        WORK_MANIFEST_FORMAT_VERSION,
-        *LEGACY_WORK_MANIFEST_FORMAT_VERSIONS,
-    }
-    if format_version not in accepted_versions:
-        raise WorkManifestError(
-            f"unsupported Work manifest format_version: {format_version!r}"
-        )
-
     work_id = manifest.get("work_id")
-    if not isinstance(work_id, str) or not work_id:
-        raise WorkManifestError("Work manifest work_id must be a non-empty string")
-    if expected_work_id is not None and work_id != expected_work_id:
+    if (
+        expected_work_id is not None
+        and isinstance(work_id, str)
+        and work_id != expected_work_id
+    ):
         raise WorkIdentityMismatchError(
             f"manifest Work identity mismatch: expected {expected_work_id!r}, "
             f"got {work_id!r}"
         )
 
-    if manifest.get("database") != expected_database_name:
-        raise WorkManifestError(
-            f"manifest database mismatch: expected {expected_database_name!r}, "
-            f"got {manifest.get('database')!r}"
+    try:
+        validate_manifest_common(
+            manifest,
+            expected_work_id=expected_work_id,
+            expected_database_name=expected_database_name,
         )
-
-    schema_version = manifest.get("work_schema_version")
-    if not isinstance(schema_version, int) or schema_version < 1:
-        raise WorkManifestError(
-            "Work manifest work_schema_version must be a positive integer"
-        )
+    except WorkManifestContractError as exc:
+        if "manifest Work identity mismatch" in str(exc):
+            raise WorkIdentityMismatchError(str(exc)) from exc
+        raise WorkManifestError(str(exc)) from exc
 
 
 def inspect_work_directory(
@@ -319,17 +305,9 @@ def inspect_work_directory(
         )
 
     target_schema_version = _target_schema_version(migration_set)
-    integrity = manifest.get("integrity")
-    live_integrity_current = (
-        isinstance(integrity, dict)
-        and integrity.get("mode") == LIVE_MANIFEST_INTEGRITY_MODE
-        and integrity.get("database_hash_policy") == LIVE_MANIFEST_HASH_POLICY
-        and "database_sha256" not in integrity
-    )
     manifest_refresh_required = (
-        manifest.get("format_version") != WORK_MANIFEST_FORMAT_VERSION
-        or manifest_schema_version != database_schema_version
-        or not live_integrity_current
+        manifest_schema_version != database_schema_version
+        or not is_canonical_live_manifest(manifest)
     )
 
     return PortableWorkInspection(
