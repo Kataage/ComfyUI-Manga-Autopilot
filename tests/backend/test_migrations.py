@@ -517,6 +517,75 @@ def test_generic_runner_can_simulate_stranded_work_identity_state(
 
 
 
+def test_master_bootstrap_rejects_symlink_before_identity_recovery(
+    tmp_path: Path,
+) -> None:
+    outside = tmp_path / "outside-master.sqlite3"
+    MigrationRunner(
+        database_kind="test",
+        migrations=MASTER_MIGRATIONS,
+    ).migrate(outside)
+
+    with read_connection(outside) as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM master_metadata"
+        ).fetchone()[0] == 0
+    before = outside.read_bytes()
+
+    managed = tmp_path / "master.sqlite3"
+    try:
+        managed.symlink_to(outside)
+    except OSError:
+        pytest.skip("file symlinks are not supported in this environment")
+
+    with pytest.raises(UnsafeStoragePathError, match="symlink"):
+        bootstrap_master_database(
+            managed,
+            database_id="master_must_not_write",
+        )
+
+    assert outside.read_bytes() == before
+    with read_connection(outside) as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM master_metadata"
+        ).fetchone()[0] == 0
+
+
+def test_work_bootstrap_rejects_symlink_before_identity_recovery(
+    tmp_path: Path,
+) -> None:
+    outside = tmp_path / "outside-work.sqlite3"
+    MigrationRunner(
+        database_kind="test",
+        migrations=WORK_MIGRATIONS,
+    ).migrate(outside)
+
+    with read_connection(outside) as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM work_database_metadata"
+        ).fetchone()[0] == 0
+    before = outside.read_bytes()
+
+    managed = tmp_path / "work.sqlite3"
+    try:
+        managed.symlink_to(outside)
+    except OSError:
+        pytest.skip("file symlinks are not supported in this environment")
+
+    with pytest.raises(UnsafeStoragePathError, match="symlink"):
+        bootstrap_work_database(
+            managed,
+            work_id="work_must_not_write",
+            database_id="workdb_must_not_write",
+        )
+
+    assert outside.read_bytes() == before
+    with read_connection(outside) as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM work_database_metadata"
+        ).fetchone()[0] == 0
+
+
 def test_migration_rejects_symlinked_database_before_backup_or_mutation(
     tmp_path: Path,
 ) -> None:

@@ -16,6 +16,7 @@ from manga_autopilot.storage.migrations import (
     MigrationResult,
     migrate_work_database,
 )
+from manga_autopilot.storage.paths import UnsafeStoragePathError
 from manga_autopilot.storage.sqlite import read_connection, write_connection
 
 WORK_DATABASE_KIND = "work"
@@ -156,7 +157,11 @@ def _recover_interrupted_identity_bootstrap(
     migrations: Iterable[Migration],
 ) -> bool:
     """Recover only an empty-data Work DB left by old Phase A bootstrap."""
-    path = Path(database_path).expanduser().resolve()
+    path = Path(database_path).expanduser().absolute()
+    if path.is_symlink():
+        raise UnsafeStoragePathError(
+            f"database_path must not be a symlink: {path}"
+        )
     if not path.is_file() or path.stat().st_size == 0:
         return False
 
