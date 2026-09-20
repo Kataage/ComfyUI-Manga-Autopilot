@@ -80,6 +80,65 @@ def test_create_open_list_and_reopen_work(tmp_path: Path) -> None:
     assert reopened.migration_backup_path is None
 
 
+@pytest.mark.parametrize(
+    "reserved_id",
+    [
+        ".creating-work_001",
+        ".recovery-quarantine",
+        ".future-internal",
+    ],
+)
+def test_create_work_rejects_reserved_id_before_work_filesystem_mutation(
+    tmp_path: Path,
+    reserved_id: str,
+) -> None:
+    repository = WorkLifecycleRepository(tmp_path)
+    before = tuple(repository.paths.works.iterdir())
+
+    with pytest.raises(ValueError, match="reserved"):
+        repository.create_work(work_id=reserved_id, title="Must Not Create")
+
+    assert tuple(repository.paths.works.iterdir()) == before
+
+
+@pytest.mark.parametrize(
+    "operation",
+    [
+        "reconcile_orphan_work",
+        "finalize_staging_work",
+        "quarantine_staging_work",
+    ],
+)
+def test_recovery_operations_reject_reserved_work_ids(
+    tmp_path: Path,
+    operation: str,
+) -> None:
+    repository = WorkLifecycleRepository(tmp_path)
+    before = tuple(repository.paths.works.iterdir())
+
+    with pytest.raises(ValueError, match="reserved"):
+        getattr(repository, operation)(".creating-not-a-work")
+
+    assert tuple(repository.paths.works.iterdir()) == before
+
+
+def test_portable_inspection_rejects_reserved_manifest_work_id(
+    tmp_path: Path,
+) -> None:
+    repository = WorkLifecycleRepository(tmp_path / "library")
+    created = repository.create_work(work_id="work_001", title="Portable")
+
+    portable_root = tmp_path / "portable"
+    shutil.copytree(created.root, portable_root)
+    manifest_path = portable_root / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["work_id"] = ".creating-not-a-work"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(lifecycle_module.WorkManifestError, match="reserved"):
+        inspect_work_directory(portable_root)
+
+
 def test_create_work_writes_live_mutable_manifest(tmp_path: Path) -> None:
     repository = WorkLifecycleRepository(tmp_path, app_version="2.0-test")
     handle = repository.create_work(work_id="work_001", title="Manifest Test")
