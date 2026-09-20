@@ -9,6 +9,8 @@ from manga_autopilot.repositories.work_lifecycle import (
     WorkLifecycleRepository,
     WorkManifestError,
     WorkNotFoundError,
+    WorkRecoveryError,
+    WorkRecoveryFinding,
     WorkUpgradeError,
     inspect_work_directory,
 )
@@ -22,6 +24,8 @@ __all__ = [
     "WorkLifecycleRepository",
     "WorkManifestError",
     "WorkNotFoundError",
+    "WorkRecoveryError",
+    "WorkRecoveryFinding",
     "WorkUpgradeError",
     "inspect_work_directory",
 ]

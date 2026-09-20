@@ -35,6 +35,8 @@ WORK_MANIFEST_FORMAT_VERSION = 2
 LEGACY_WORK_MANIFEST_FORMAT_VERSIONS = frozenset({1})
 LIVE_MANIFEST_INTEGRITY_MODE = "live_mutable"
 LIVE_MANIFEST_HASH_POLICY = "package_only"
+WORK_STAGING_PREFIX = ".creating-"
+WORK_RECOVERY_QUARANTINE_DIR = ".recovery-quarantine"
 
 
 class WorkLifecycleError(RuntimeError):
@@ -59,6 +61,10 @@ class WorkIdentityMismatchError(WorkLifecycleError):
 
 class WorkUpgradeError(WorkLifecycleError):
     """Raised when a Work cannot be safely upgraded before opening."""
+
+
+class WorkRecoveryError(WorkLifecycleError):
+    """Raised when incomplete Work creation cannot be reconciled safely."""
 
 
 @dataclass(frozen=True)
@@ -92,6 +98,18 @@ class PortableWorkInspection:
     target_schema_version: int
     upgrade_required: bool
     manifest_refresh_required: bool
+
+
+@dataclass(frozen=True)
+class WorkRecoveryFinding:
+    """One recoverable or diagnostic Work-creation filesystem state."""
+
+    kind: str
+    path: Path
+    work_id: str | None
+    valid: bool
+    recommended_action: str | None
+    diagnostics: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -359,7 +377,7 @@ class WorkLifecycleRepository:
         resolved_work_id = work_id or new_id("work")
         final_paths = work_paths(self.storage_root, resolved_work_id)
         relative_work_path = final_paths.root.relative_to(self.storage_root).as_posix()
-        staging_root = self.paths.works / f".creating-{resolved_work_id}"
+        staging_root = self.paths.works / f"{WORK_STAGING_PREFIX}{resolved_work_id}"
 
         if final_paths.root.exists():
             raise WorkCreationError(f"Work directory already exists: {final_paths.root}")
@@ -453,40 +471,36 @@ class WorkLifecycleRepository:
 
             os.replace(staging_paths.root, final_paths.root)
 
-            try:
-                with repository_write(self.paths.master_db) as connection:
-                    connection.execute(
-                        """
-                        INSERT INTO work_catalog (
-                            work_id,
-                            universe_id,
-                            series_id,
-                            title,
-                            work_kind,
-                            relative_work_path,
-                            status,
-                            manifest_hash,
-                            created_at,
-                            updated_at
-                        )
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                        """,
-                        (
-                            resolved_work_id,
-                            universe_id,
-                            series_id,
-                            title,
-                            work_kind,
-                            relative_work_path,
-                            status,
-                            manifest_hash,
-                            created_at,
-                            created_at,
-                        ),
+            with repository_write(self.paths.master_db) as connection:
+                connection.execute(
+                    """
+                    INSERT INTO work_catalog (
+                        work_id,
+                        universe_id,
+                        series_id,
+                        title,
+                        work_kind,
+                        relative_work_path,
+                        status,
+                        manifest_hash,
+                        created_at,
+                        updated_at
                     )
-            except Exception:
-                shutil.rmtree(final_paths.root, ignore_errors=True)
-                raise
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        resolved_work_id,
+                        universe_id,
+                        series_id,
+                        title,
+                        work_kind,
+                        relative_work_path,
+                        status,
+                        manifest_hash,
+                        created_at,
+                        created_at,
+                    ),
+                )
 
         except Exception as exc:
             if staging_root.exists():
@@ -624,6 +638,252 @@ class WorkLifecycleRepository:
             catalog=refreshed_catalog,
         )
 
+    def scan_recovery(self) -> tuple[WorkRecoveryFinding, ...]:
+        """Detect stale staging and unregistered Work directories without mutation."""
+        with repository_read(self.paths.master_db) as connection:
+            cataloged_ids = {
+                str(row["work_id"])
+                for row in connection.execute(
+                    "SELECT work_id FROM work_catalog"
+                ).fetchall()
+            }
+
+        findings: list[WorkRecoveryFinding] = []
+        for entry in sorted(self.paths.works.iterdir(), key=lambda path: path.name):
+            if entry.name == WORK_RECOVERY_QUARANTINE_DIR:
+                continue
+
+            if entry.name.startswith(WORK_STAGING_PREFIX):
+                work_id = entry.name[len(WORK_STAGING_PREFIX) :] or None
+                valid, diagnostics = self._validate_recovery_directory(
+                    entry,
+                    expected_work_id=work_id,
+                )
+                findings.append(
+                    WorkRecoveryFinding(
+                        kind=(
+                            "STALE_STAGING_VALID"
+                            if valid
+                            else "STALE_STAGING_INVALID"
+                        ),
+                        path=entry,
+                        work_id=work_id,
+                        valid=valid,
+                        recommended_action="finalize" if valid else "quarantine",
+                        diagnostics=diagnostics,
+                    )
+                )
+                continue
+
+            if entry.name.startswith("."):
+                continue
+            if not entry.is_dir() and not entry.is_symlink():
+                continue
+            if entry.name in cataloged_ids:
+                continue
+
+            valid, diagnostics = self._validate_recovery_directory(
+                entry,
+                expected_work_id=entry.name,
+            )
+            findings.append(
+                WorkRecoveryFinding(
+                    kind=(
+                        "UNREGISTERED_WORK_VALID"
+                        if valid
+                        else "UNREGISTERED_WORK_INVALID"
+                    ),
+                    path=entry,
+                    work_id=entry.name,
+                    valid=valid,
+                    recommended_action="register" if valid else None,
+                    diagnostics=diagnostics,
+                )
+            )
+
+        return tuple(findings)
+
+    def reconcile_orphan_work(self, work_id: str) -> WorkCatalogEntry:
+        """Register a valid finalized Work that is missing from Master catalog."""
+        final_paths = work_paths(self.storage_root, work_id)
+        relative_work_path = final_paths.root.relative_to(self.storage_root).as_posix()
+
+        with repository_read(self.paths.master_db) as connection:
+            existing = connection.execute(
+                "SELECT * FROM work_catalog WHERE work_id = ?",
+                (work_id,),
+            ).fetchone()
+        if existing is not None:
+            entry = _catalog_entry(existing)
+            if entry.relative_work_path != relative_work_path:
+                raise WorkRecoveryError(
+                    f"catalog path mismatch for existing Work {work_id!r}: "
+                    f"{entry.relative_work_path!r}"
+                )
+            return entry
+
+        valid, diagnostics = self._validate_recovery_directory(
+            final_paths.root,
+            expected_work_id=work_id,
+        )
+        if not valid:
+            raise WorkRecoveryError(
+                f"cannot register invalid orphan Work {work_id!r}: "
+                + "; ".join(diagnostics)
+            )
+
+        with repository_read(final_paths.work_db) as connection:
+            metadata = connection.execute(
+                "SELECT * FROM work_metadata WHERE work_id = ?",
+                (work_id,),
+            ).fetchone()
+        if metadata is None:
+            raise WorkRecoveryError(
+                f"orphan Work {work_id!r} has no authoritative work_metadata row"
+            )
+
+        manifest_hash = sha256_file(final_paths.manifest_json)
+        with repository_write(self.paths.master_db) as connection:
+            connection.execute(
+                """
+                INSERT INTO work_catalog (
+                    work_id,
+                    universe_id,
+                    series_id,
+                    title,
+                    work_kind,
+                    relative_work_path,
+                    status,
+                    manifest_hash,
+                    created_at,
+                    updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    work_id,
+                    metadata["universe_source_id"],
+                    metadata["series_source_id"],
+                    metadata["title"],
+                    metadata["work_kind"],
+                    relative_work_path,
+                    metadata["status"],
+                    manifest_hash,
+                    metadata["created_at"],
+                    metadata["updated_at"],
+                ),
+            )
+
+        with repository_read(self.paths.master_db) as connection:
+            row = connection.execute(
+                "SELECT * FROM work_catalog WHERE work_id = ?",
+                (work_id,),
+            ).fetchone()
+        if row is None:
+            raise WorkRecoveryError(
+                f"catalog registration did not persist for Work {work_id!r}"
+            )
+        return _catalog_entry(row)
+
+    def finalize_staging_work(self, work_id: str) -> WorkCatalogEntry:
+        """Finalize a complete stale staging Work and register it idempotently."""
+        final_paths = work_paths(self.storage_root, work_id)
+        staging = self.paths.works / f"{WORK_STAGING_PREFIX}{work_id}"
+
+        if not staging.exists() and not staging.is_symlink():
+            if final_paths.root.exists() and not final_paths.root.is_symlink():
+                return self.reconcile_orphan_work(work_id)
+            raise WorkRecoveryError(
+                f"staging Work does not exist for {work_id!r}: {staging}"
+            )
+
+        valid, diagnostics = self._validate_recovery_directory(
+            staging,
+            expected_work_id=work_id,
+        )
+        if not valid:
+            raise WorkRecoveryError(
+                f"cannot finalize invalid staging Work {work_id!r}: "
+                + "; ".join(diagnostics)
+            )
+        if final_paths.root.exists() or final_paths.root.is_symlink():
+            raise WorkRecoveryError(
+                f"final Work path already exists for {work_id!r}: {final_paths.root}"
+            )
+
+        os.replace(staging, final_paths.root)
+        # If catalog registration fails, leave the finalized Work intact so a
+        # later recovery scan can reconcile it without regenerating identity.
+        return self.reconcile_orphan_work(work_id)
+
+    def quarantine_staging_work(
+        self,
+        work_id: str,
+        *,
+        reason: str | None = None,
+    ) -> Path:
+        """Move stale staging aside without deleting its evidence."""
+        work_paths(self.storage_root, work_id)  # validates one safe component
+        staging = self.paths.works / f"{WORK_STAGING_PREFIX}{work_id}"
+        if not staging.exists() and not staging.is_symlink():
+            raise WorkRecoveryError(
+                f"staging Work does not exist for {work_id!r}: {staging}"
+            )
+
+        quarantine_root = self.paths.works / WORK_RECOVERY_QUARANTINE_DIR
+        if quarantine_root.is_symlink():
+            raise WorkRecoveryError(
+                f"recovery quarantine must not be a symlink: {quarantine_root}"
+            )
+        quarantine_root.mkdir(exist_ok=True)
+
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+        destination = quarantine_root / f"{stamp}-{WORK_STAGING_PREFIX[1:]}{work_id}"
+        os.replace(staging, destination)
+
+        _write_json_atomic(
+            destination.with_name(destination.name + ".recovery.json"),
+            {
+                "work_id": work_id,
+                "source": staging.name,
+                "quarantined_at": _utc_now_iso(),
+                "reason": reason,
+            },
+        )
+        return destination
+
+    def _validate_recovery_directory(
+        self,
+        root: Path,
+        *,
+        expected_work_id: str | None,
+    ) -> tuple[bool, tuple[str, ...]]:
+        diagnostics: list[str] = []
+        if root.is_symlink():
+            return False, (f"symlink recovery entry is not trusted: {root}",)
+        if not root.is_dir():
+            return False, (f"recovery entry is not a directory: {root}",)
+
+        try:
+            inspection = inspect_work_directory(
+                root,
+                migrations=self.work_migrations,
+                expected_work_id=expected_work_id,
+            )
+            with repository_read(inspection.database_path) as connection:
+                metadata = connection.execute(
+                    "SELECT work_id FROM work_metadata WHERE work_id = ?",
+                    (inspection.work_id,),
+                ).fetchone()
+            if metadata is None:
+                diagnostics.append(
+                    f"work_metadata row is missing for {inspection.work_id!r}"
+                )
+        except Exception as exc:
+            diagnostics.append(f"{type(exc).__name__}: {exc}")
+
+        return not diagnostics, tuple(diagnostics)
+
     def list_works(self) -> tuple[WorkCatalogEntry, ...]:
         """List Master-side Work discovery metadata."""
         with repository_read(self.paths.master_db) as connection:
@@ -657,6 +917,8 @@ __all__ = [
     "LIVE_MANIFEST_INTEGRITY_MODE",
     "WORK_MANIFEST_FORMAT",
     "WORK_MANIFEST_FORMAT_VERSION",
+    "WORK_RECOVERY_QUARANTINE_DIR",
+    "WORK_STAGING_PREFIX",
     "PortableWorkInspection",
     "WorkCatalogEntry",
     "WorkCreationError",
@@ -666,6 +928,8 @@ __all__ = [
     "WorkLifecycleRepository",
     "WorkManifestError",
     "WorkNotFoundError",
+    "WorkRecoveryError",
+    "WorkRecoveryFinding",
     "WorkUpgradeError",
     "inspect_work_directory",
 ]
