@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from manga_autopilot.storage.migrations import (
+    MASTER_MIGRATIONS,
     DatabaseIdentityMismatchError,
     MigrationResult,
     migrate_master_database,
@@ -96,6 +97,121 @@ def _identity_from_metadata(metadata: dict[str, str]) -> MasterDatabaseIdentity:
     )
 
 
+def _migration_history_is_known_prefix(connection: sqlite3.Connection) -> bool:
+    tables = {
+        str(row["name"])
+        for row in connection.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table'"
+        ).fetchall()
+    }
+    if "schema_migrations" not in tables or "master_metadata" not in tables:
+        return False
+
+    rows = connection.execute(
+        """
+        SELECT version, name, checksum
+        FROM schema_migrations
+        ORDER BY version
+        """
+    ).fetchall()
+    if not rows:
+        return False
+
+    configured = {migration.version: migration for migration in MASTER_MIGRATIONS}
+    for row in rows:
+        version = int(row["version"])
+        migration = configured.get(version)
+        if migration is None:
+            return False
+        if str(row["name"]) != migration.name:
+            return False
+        if str(row["checksum"]) != migration.checksum:
+            return False
+    return True
+
+
+def _table_is_empty(connection: sqlite3.Connection, table: str) -> bool:
+    row = connection.execute(f"SELECT 1 FROM {table} LIMIT 1").fetchone()
+    return row is None
+
+
+def _recover_interrupted_identity_bootstrap(
+    database_path: str | Path,
+    *,
+    database_id: str,
+    created_at: str,
+) -> bool:
+    """Recover only the exact empty-data state left by old Phase A bootstrap."""
+    path = Path(database_path).expanduser().resolve()
+    if not path.is_file() or path.stat().st_size == 0:
+        return False
+
+    try:
+        with read_connection(path) as connection:
+            if not _migration_history_is_known_prefix(connection):
+                return False
+
+            metadata = _read_metadata(connection)
+            if metadata:
+                return False
+
+            tables = {
+                str(row["name"])
+                for row in connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table'"
+                ).fetchall()
+            }
+            required_empty_tables = (
+                "master_commits",
+                "master_entity_revisions",
+                "work_catalog",
+            )
+            if any(table not in tables for table in required_empty_tables):
+                return False
+            if not all(
+                _table_is_empty(connection, table)
+                for table in required_empty_tables
+            ):
+                return False
+    except sqlite3.DatabaseError:
+        return False
+
+    with write_connection(path) as connection:
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            if _read_metadata(connection):
+                connection.rollback()
+                return False
+            if not all(
+                _table_is_empty(connection, table)
+                for table in (
+                    "master_commits",
+                    "master_entity_revisions",
+                    "work_catalog",
+                )
+            ):
+                connection.rollback()
+                return False
+
+            connection.executemany(
+                """
+                INSERT INTO master_metadata (key, value)
+                VALUES (?, ?)
+                """,
+                (
+                    ("database_kind", MASTER_DATABASE_KIND),
+                    ("database_id", database_id),
+                    ("format_version", MASTER_FORMAT_VERSION),
+                    ("created_at", created_at),
+                ),
+            )
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+    return True
+
+
 def read_master_identity(database_path: str | Path) -> MasterDatabaseIdentity:
     """Read and validate required Master database identity metadata."""
     with read_connection(database_path) as connection:
@@ -109,81 +225,37 @@ def bootstrap_master_database(
     database_id: str | None = None,
     app_version: str | None = None,
 ) -> MasterDatabaseBootstrapResult:
-    """Migrate a Master DB and initialize stable identity metadata if needed."""
+    """Migrate and initialize Master identity as one crash-safe operation."""
     if database_id is not None and not database_id.strip():
         raise ValueError("database_id must be non-empty when provided")
+
+    requested_database_id = database_id or _new_master_database_id()
+    created_at = _utc_now_iso()
+
+    _recover_interrupted_identity_bootstrap(
+        database_path,
+        database_id=requested_database_id,
+        created_at=created_at,
+    )
 
     try:
         migration = migrate_master_database(
             database_path,
             app_version=app_version,
+            database_id=requested_database_id,
+            created_at=created_at,
         )
     except DatabaseIdentityMismatchError as exc:
         raise MasterDatabaseIdentityError(
             f"database_kind mismatch: {exc}"
         ) from exc
 
-    requested_database_id = database_id or _new_master_database_id()
-    created_at = _utc_now_iso()
-
-    with write_connection(database_path) as connection:
-        try:
-            connection.execute("BEGIN IMMEDIATE")
-            existing = _read_metadata(connection)
-
-            existing_kind = existing.get("database_kind")
-            accepted_kinds = {MASTER_DATABASE_KIND, *LEGACY_MASTER_DATABASE_KINDS}
-            if existing_kind is not None and existing_kind not in accepted_kinds:
-                raise MasterDatabaseIdentityError(
-                    "database_kind mismatch: "
-                    f"expected {MASTER_DATABASE_KIND!r}, got {existing_kind!r}"
-                )
-
-            existing_format = existing.get("format_version")
-            if existing_format is not None and existing_format != MASTER_FORMAT_VERSION:
-                raise MasterDatabaseIdentityError(
-                    "format_version mismatch: "
-                    f"expected {MASTER_FORMAT_VERSION!r}, got {existing_format!r}"
-                )
-
-            existing_database_id = existing.get("database_id")
-            if (
-                database_id is not None
-                and existing_database_id is not None
-                and existing_database_id != database_id
-            ):
-                raise MasterDatabaseIdentityError(
-                    "database_id mismatch: "
-                    f"expected {database_id!r}, got {existing_database_id!r}"
-                )
-
-            values = {
-                "database_kind": MASTER_DATABASE_KIND,
-                "database_id": existing_database_id or requested_database_id,
-                "format_version": MASTER_FORMAT_VERSION,
-                "created_at": existing.get("created_at") or created_at,
-            }
-            connection.executemany(
-                """
-                INSERT OR IGNORE INTO master_metadata (key, value)
-                VALUES (?, ?)
-                """,
-                tuple(values.items()),
-            )
-            connection.execute(
-                """
-                UPDATE master_metadata
-                SET value = ?
-                WHERE key = 'database_kind' AND value != ?
-                """,
-                (MASTER_DATABASE_KIND, MASTER_DATABASE_KIND),
-            )
-
-            identity = _identity_from_metadata(_read_metadata(connection))
-            connection.commit()
-        except Exception:
-            connection.rollback()
-            raise
+    identity = read_master_identity(database_path)
+    if database_id is not None and identity.database_id != database_id:
+        raise MasterDatabaseIdentityError(
+            "database_id mismatch: "
+            f"expected {database_id!r}, got {identity.database_id!r}"
+        )
 
     return MasterDatabaseBootstrapResult(
         identity=identity,
