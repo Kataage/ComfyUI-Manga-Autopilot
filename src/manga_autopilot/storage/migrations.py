@@ -17,7 +17,7 @@ import json
 import os
 import sqlite3
 import uuid
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -455,6 +455,8 @@ class MigrationRunner:
         identity_table: str | None = None,
         identity_key: str = "database_kind",
         accepted_database_kinds: Iterable[str] = (),
+        required_identity_keys: Iterable[str] = (),
+        expected_identity_values: Mapping[str, str] | None = None,
         identity_migration_version: int | None = None,
         fresh_initializer: InitializationHook | None = None,
     ) -> None:
@@ -469,6 +471,8 @@ class MigrationRunner:
         self.identity_table = identity_table
         self.identity_key = identity_key
         self.accepted_database_kinds = frozenset(accepted_database_kinds)
+        self.required_identity_keys = tuple(required_identity_keys)
+        self.expected_identity_values = dict(expected_identity_values or {})
         self.identity_migration_version = identity_migration_version
         self.fresh_initializer = fresh_initializer
         _validate_migration_sequence(self.migrations)
@@ -629,6 +633,38 @@ class MigrationRunner:
                 f"got {actual_kind!r}; accepted values: {expected}"
             )
 
+        if self.required_identity_keys:
+            placeholders = ", ".join("?" for _ in self.required_identity_keys)
+            rows = connection.execute(
+                f"SELECT key, value FROM {self.identity_table} "
+                f"WHERE key IN ({placeholders})",
+                self.required_identity_keys,
+            ).fetchall()
+            metadata = {
+                str(metadata_row["key"]): str(metadata_row["value"])
+                for metadata_row in rows
+            }
+            missing = [
+                key
+                for key in self.required_identity_keys
+                if not metadata.get(key)
+            ]
+            if missing:
+                raise UnrecognizedDatabaseError(
+                    f"recognized {self.database_kind} database has incomplete "
+                    "identity metadata: "
+                    + ", ".join(sorted(missing))
+                )
+
+            for key, expected_value in self.expected_identity_values.items():
+                actual_value = metadata.get(key)
+                if actual_value != expected_value:
+                    raise DatabaseIdentityMismatchError(
+                        f"database identity mismatch for {self.database_kind} "
+                        f"{key}: got {actual_value!r}, expected "
+                        f"{expected_value!r}"
+                    )
+
     def _prepare_verified_backup(
         self,
         path: Path,
@@ -745,6 +781,13 @@ def migrate_master_database(
         post_integrity_check=post_integrity_check,
         identity_table="master_metadata",
         accepted_database_kinds=("master", "manga_autopilot_master"),
+        required_identity_keys=(
+            "database_kind",
+            "database_id",
+            "format_version",
+            "created_at",
+        ),
+        expected_identity_values={"format_version": "2"},
         identity_migration_version=2,
         fresh_initializer=initialize_identity if fresh else None,
     ).migrate(path)
@@ -794,6 +837,17 @@ def migrate_work_database(
         post_integrity_check=post_integrity_check,
         identity_table="work_database_metadata",
         accepted_database_kinds=("work", "manga_autopilot_work"),
+        required_identity_keys=(
+            "database_kind",
+            "database_id",
+            "format_version",
+            "work_id",
+            "created_at",
+        ),
+        expected_identity_values={
+            "format_version": "2",
+            **({"work_id": work_id} if work_id is not None else {}),
+        },
         identity_migration_version=2,
         fresh_initializer=initialize_identity if fresh else None,
     ).migrate(path)
