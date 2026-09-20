@@ -12,6 +12,7 @@ from manga_autopilot.storage.migrations import (
     MASTER_MIGRATIONS,
     DatabaseIdentityMismatchError,
     MigrationResult,
+    UnrecognizedDatabaseError,
     migrate_master_database,
 )
 from manga_autopilot.storage.paths import UnsafeStoragePathError
@@ -250,10 +251,8 @@ def bootstrap_master_database(
             database_id=requested_database_id,
             created_at=created_at,
         )
-    except DatabaseIdentityMismatchError as exc:
-        raise MasterDatabaseIdentityError(
-            f"database_kind mismatch: {exc}"
-        ) from exc
+    except (DatabaseIdentityMismatchError, UnrecognizedDatabaseError) as exc:
+        raise MasterDatabaseIdentityError(str(exc)) from exc
 
     identity = read_master_identity(database_path)
     if database_id is not None and identity.database_id != database_id:
