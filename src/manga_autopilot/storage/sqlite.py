@@ -7,12 +7,19 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
 
+from manga_autopilot.storage.paths import UnsafeStoragePathError
+
 DEFAULT_BUSY_TIMEOUT_MS = 5_000
 REQUIRED_JOURNAL_MODE = "wal"
 
 
 def _database_path(database_path: str | Path) -> Path:
-    path = Path(database_path).expanduser().resolve()
+    raw = Path(database_path).expanduser().absolute()
+    if raw.is_symlink():
+        raise UnsafeStoragePathError(
+            f"database_path must not be a symlink: {raw}"
+        )
+    path = raw.resolve()
     if path.exists() and path.is_dir():
         raise ValueError(f"database_path must be a file path: {path}")
     return path

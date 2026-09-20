@@ -17,6 +17,8 @@ from manga_autopilot.storage import (
     Migration,
     MigrationError,
     WorkPaths,
+    assert_managed_path,
+    assert_managed_regular_file,
     bootstrap_master_database,
     bootstrap_work_database,
     create_work_commit,
@@ -139,8 +141,12 @@ def _utc_now_iso() -> str:
 
 
 def _write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
+    if path.is_symlink():
+        raise WorkManifestError(f"refusing to replace symlinked JSON file: {path}")
     path.parent.mkdir(parents=True, exist_ok=True)
     temp = path.with_name(path.name + ".tmp")
+    if temp.is_symlink():
+        raise WorkManifestError(f"refusing to use symlinked temp file: {temp}")
     data = (
         json.dumps(payload, ensure_ascii=False, sort_keys=True, indent=2) + "\n"
     ).encode("utf-8")
@@ -156,6 +162,8 @@ def _write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
 
 
 def _read_manifest(path: Path) -> dict[str, Any]:
+    if path.is_symlink():
+        raise WorkManifestError(f"Work manifest must not be a symlink: {path}")
     try:
         raw = path.read_text(encoding="utf-8")
     except FileNotFoundError as exc:
@@ -276,6 +284,17 @@ def inspect_work_directory(
     manifest_path = root / "manifest.json"
     database_path = root / "work.sqlite3"
 
+    assert_managed_regular_file(
+        manifest_path,
+        containment_root=root,
+        field_name="Work manifest",
+    )
+    assert_managed_regular_file(
+        database_path,
+        containment_root=root,
+        field_name="Work database",
+    )
+
     manifest = _read_manifest(manifest_path)
     _validate_manifest(
         manifest,
@@ -344,6 +363,12 @@ class WorkLifecycleRepository:
     ) -> None:
         self.storage_root = ensure_storage_root(storage_root)
         self.paths = storage_paths(self.storage_root)
+        assert_managed_regular_file(
+            self.paths.master_db,
+            containment_root=self.storage_root,
+            field_name="Master database",
+            allow_missing=True,
+        )
         self.app_version = app_version
         self.work_migrations = tuple(work_migrations)
         bootstrap_master_database(
@@ -401,6 +426,11 @@ class WorkLifecycleRepository:
         created_at = _utc_now_iso()
 
         try:
+            assert_managed_path(
+                staging_paths.root,
+                containment_root=self.paths.works,
+                field_name="Work staging directory",
+            )
             staging_paths.root.mkdir(parents=True, exist_ok=False)
             staging_paths.assets.mkdir()
             staging_paths.cache.mkdir()
@@ -831,6 +861,14 @@ class WorkLifecycleRepository:
             )
 
         quarantine_root = self.paths.works / WORK_RECOVERY_QUARANTINE_DIR
+        try:
+            assert_managed_path(
+                quarantine_root,
+                containment_root=self.paths.works,
+                field_name="recovery quarantine",
+            )
+        except ValueError as exc:
+            raise WorkRecoveryError(str(exc)) from exc
         if quarantine_root.is_symlink():
             raise WorkRecoveryError(
                 f"recovery quarantine must not be a symlink: {quarantine_root}"
@@ -839,6 +877,14 @@ class WorkLifecycleRepository:
 
         stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
         destination = quarantine_root / f"{stamp}-{WORK_STAGING_PREFIX[1:]}{work_id}"
+        try:
+            assert_managed_path(
+                destination,
+                containment_root=quarantine_root,
+                field_name="recovery quarantine destination",
+            )
+        except ValueError as exc:
+            raise WorkRecoveryError(str(exc)) from exc
         os.replace(staging, destination)
 
         _write_json_atomic(

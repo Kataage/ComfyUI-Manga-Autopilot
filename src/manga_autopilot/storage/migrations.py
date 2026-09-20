@@ -22,6 +22,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
+from manga_autopilot.storage.paths import UnsafeStoragePathError
 from manga_autopilot.storage.sqlite import read_connection, write_connection
 
 SCHEMA_MIGRATIONS_TABLE = "schema_migrations"
@@ -376,6 +377,15 @@ def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _migration_database_path(database_path: str | Path) -> Path:
+    raw = Path(database_path).expanduser().absolute()
+    if raw.is_symlink():
+        raise UnsafeStoragePathError(
+            f"migration database must not be a symlink: {raw}"
+        )
+    return raw.resolve()
+
+
 def _existing_nonempty_database(path: Path) -> bool:
     return path.exists() and path.is_file() and path.stat().st_size > 0
 
@@ -425,7 +435,7 @@ class MigrationRunner:
 
     def migrate(self, database_path: str | Path) -> MigrationResult:
         """Migrate a database using backup-first, all-or-nothing semantics."""
-        path = Path(database_path).expanduser().resolve()
+        path = _migration_database_path(database_path)
         existed = _existing_nonempty_database(path)
 
         applied = self._inspect_existing_database(path) if existed else {}
@@ -588,6 +598,14 @@ class MigrationRunner:
             f"{path.name}.backup-v{current_version}-to-v{target_version}"
         )
         temp = backup.with_name(backup.name + ".tmp")
+        if backup.is_symlink():
+            raise MigrationBackupError(
+                f"migration backup path must not be a symlink: {backup}"
+            )
+        if temp.is_symlink():
+            raise MigrationBackupError(
+                f"migration backup temp path must not be a symlink: {temp}"
+            )
         if temp.exists():
             temp.unlink()
 
@@ -650,7 +668,7 @@ def migrate_master_database(
     post_integrity_check: IntegrityHook | None = sqlite_post_migration_check,
 ) -> MigrationResult:
     """Migrate a Master database and atomically initialize fresh DB identity."""
-    path = Path(database_path).expanduser().resolve()
+    path = _migration_database_path(database_path)
     fresh = not _existing_nonempty_database(path)
     initial_database_id = database_id or _new_database_id("master")
     initial_created_at = created_at or _utc_now_iso()
@@ -694,7 +712,7 @@ def migrate_work_database(
     post_integrity_check: IntegrityHook | None = sqlite_post_migration_check,
 ) -> MigrationResult:
     """Migrate a Work DB and atomically initialize identity when it is fresh."""
-    path = Path(database_path).expanduser().resolve()
+    path = _migration_database_path(database_path)
     fresh = not _existing_nonempty_database(path)
     if fresh and (work_id is None or not work_id.strip()):
         raise ValueError("work_id is required when migrating a fresh Work database")

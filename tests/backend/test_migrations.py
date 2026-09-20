@@ -20,6 +20,7 @@ from manga_autopilot.storage import (
     MigrationValidationError,
     UnknownAppliedMigrationError,
     UnrecognizedDatabaseError,
+    UnsafeStoragePathError,
     bootstrap_master_database,
     bootstrap_work_database,
     migrate_master_database,
@@ -502,3 +503,39 @@ def test_generic_runner_can_simulate_stranded_work_identity_state(
 
     assert recovered.identity.work_id == "work_recovered"
     assert recovered.identity.database_id == "workdb_recovered"
+
+
+
+def test_migration_rejects_symlinked_database_before_backup_or_mutation(
+    tmp_path: Path,
+) -> None:
+    outside = tmp_path / "outside-master.sqlite3"
+    bootstrap_master_database(outside, database_id="master_external")
+    before = outside.read_bytes()
+
+    managed = tmp_path / "master.sqlite3"
+    try:
+        managed.symlink_to(outside)
+    except OSError:
+        pytest.skip("file symlinks are not supported in this environment")
+
+    next_version = MASTER_MIGRATIONS[-1].version + 1
+    migrations = (
+        *MASTER_MIGRATIONS,
+        Migration(
+            version=next_version,
+            name=f"M{next_version:04d}_must_not_run",
+            statements=("CREATE TABLE must_not_exist (id INTEGER PRIMARY KEY)",),
+        ),
+    )
+
+    with pytest.raises(UnsafeStoragePathError, match="symlink"):
+        migrate_master_database(managed, migrations=migrations)
+
+    assert outside.read_bytes() == before
+    assert not outside.with_name(
+        f"{outside.name}.backup-v{MASTER_MIGRATIONS[-1].version}-to-v{next_version}"
+    ).exists()
+    assert not managed.with_name(
+        f"{managed.name}.backup-v{MASTER_MIGRATIONS[-1].version}-to-v{next_version}"
+    ).exists()

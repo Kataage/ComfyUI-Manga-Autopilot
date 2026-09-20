@@ -105,6 +105,50 @@ def _assert_managed_path(
         )
 
 
+def assert_managed_path(
+    path: str | Path,
+    *,
+    containment_root: str | Path,
+    field_name: str = "managed path",
+) -> Path:
+    """Validate containment and reject symlink/reparse escape components."""
+    candidate = Path(path).expanduser().absolute()
+    root = Path(containment_root).expanduser().resolve()
+    _assert_managed_path(
+        candidate,
+        containment_root=root,
+        field_name=field_name,
+    )
+    return candidate
+
+
+def assert_managed_regular_file(
+    path: str | Path,
+    *,
+    containment_root: str | Path,
+    field_name: str = "managed file",
+    allow_missing: bool = False,
+) -> Path:
+    """Validate one critical managed file without following file symlinks."""
+    candidate = assert_managed_path(
+        path,
+        containment_root=containment_root,
+        field_name=field_name,
+    )
+    if candidate.is_symlink():
+        raise UnsafeStoragePathError(
+            f"{field_name} must not be a symlink: {candidate}"
+        )
+    if candidate.exists():
+        if not candidate.is_file():
+            raise UnsafeStoragePathError(
+                f"{field_name} must be a regular file: {candidate}"
+            )
+    elif not allow_missing:
+        raise FileNotFoundError(f"{field_name} does not exist: {candidate}")
+    return candidate
+
+
 def _ensure_managed_directory(
     path: Path,
     *,
@@ -441,6 +485,8 @@ __all__ = [
     "StoragePaths",
     "UnsafeStoragePathError",
     "WorkPaths",
+    "assert_managed_path",
+    "assert_managed_regular_file",
     "ensure_legacy_project_paths",
     "ensure_project_paths",
     "ensure_storage_root",

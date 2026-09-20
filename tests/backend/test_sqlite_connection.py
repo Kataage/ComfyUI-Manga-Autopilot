@@ -10,6 +10,7 @@ import pytest
 from manga_autopilot.storage import (
     DEFAULT_BUSY_TIMEOUT_MS,
     REQUIRED_JOURNAL_MODE,
+    UnsafeStoragePathError,
     connect_read,
     connect_write,
     read_connection,
@@ -131,3 +132,29 @@ def test_connect_write_returns_row_objects(tmp_path: Path) -> None:
         assert row["value"] == 1
     finally:
         connection.close()
+
+
+
+def test_sqlite_helpers_reject_symlinked_database_file(tmp_path: Path) -> None:
+    outside = tmp_path / "outside.sqlite3"
+    raw = sqlite3.connect(outside)
+    try:
+        raw.execute("CREATE TABLE sentinel (value TEXT)")
+        raw.execute("INSERT INTO sentinel (value) VALUES ('unchanged')")
+        raw.commit()
+    finally:
+        raw.close()
+    before = outside.read_bytes()
+
+    managed = tmp_path / "managed.sqlite3"
+    try:
+        managed.symlink_to(outside)
+    except OSError:
+        pytest.skip("file symlinks are not supported in this environment")
+
+    with pytest.raises(UnsafeStoragePathError, match="symlink"):
+        connect_read(managed)
+    with pytest.raises(UnsafeStoragePathError, match="symlink"):
+        connect_write(managed)
+
+    assert outside.read_bytes() == before
