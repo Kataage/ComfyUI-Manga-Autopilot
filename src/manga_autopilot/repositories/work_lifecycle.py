@@ -252,12 +252,14 @@ def _validate_manifest(
             expected_work_id=expected_work_id,
             expected_database_name=expected_database_name,
         )
-        validate_work_id(str(manifest["work_id"]))
-    except ValueError as exc:
-        raise WorkManifestError(str(exc)) from exc
     except WorkManifestContractError as exc:
         if "manifest Work identity mismatch" in str(exc):
             raise WorkIdentityMismatchError(str(exc)) from exc
+        raise WorkManifestError(str(exc)) from exc
+
+    try:
+        validate_work_id(str(manifest["work_id"]))
+    except ValueError as exc:
         raise WorkManifestError(str(exc)) from exc
 
 
