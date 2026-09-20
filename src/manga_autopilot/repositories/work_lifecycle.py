@@ -14,10 +14,10 @@ from typing import Any
 from manga_autopilot.primitives import new_id, sha256_file
 from manga_autopilot.storage import (
     WORK_MIGRATIONS,
-    Migration,
-    MigrationError,
     WORK_RECOVERY_QUARANTINE_DIR,
     WORK_STAGING_PREFIX,
+    Migration,
+    MigrationError,
     WorkPaths,
     assert_managed_path,
     assert_managed_regular_file,
