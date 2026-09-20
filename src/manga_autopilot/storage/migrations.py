@@ -657,7 +657,7 @@ class MigrationRunner:
         if actual_kind not in self.accepted_database_kinds:
             expected = ", ".join(sorted(self.accepted_database_kinds))
             raise DatabaseIdentityMismatchError(
-                f"database identity mismatch for {self.database_kind}: "
+                f"database_kind mismatch for {self.database_kind} database: "
                 f"got {actual_kind!r}; accepted values: {expected}"
             )
 
@@ -688,9 +688,8 @@ class MigrationRunner:
                 actual_value = metadata.get(key)
                 if actual_value != expected_value:
                     raise DatabaseIdentityMismatchError(
-                        f"database identity mismatch for {self.database_kind} "
-                        f"{key}: got {actual_value!r}, expected "
-                        f"{expected_value!r}"
+                        f"{key} mismatch for {self.database_kind} database: "
+                        f"got {actual_value!r}, expected {expected_value!r}"
                     )
 
     def _prepare_verified_backup(
