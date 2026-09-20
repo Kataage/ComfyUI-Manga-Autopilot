@@ -62,11 +62,39 @@ class MigrationIntegrityError(MigrationError):
     """Raised when an integrity or constraint check fails."""
 
 
-class MigrationBackupError(MigrationError):
+class MigrationBatchError(MigrationError):
+    """Base error carrying structured pending-migration attribution."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        pending_migrations: Sequence[Migration],
+        cause: BaseException | None = None,
+    ) -> None:
+        self.pending_migrations = tuple(pending_migrations)
+        self.pending_versions = tuple(
+            migration.version for migration in self.pending_migrations
+        )
+        self.target_version = max(self.pending_versions, default=None)
+        self.cause = cause
+        pending_ids = ", ".join(
+            f"{migration.version}:{migration.name}"
+            for migration in self.pending_migrations
+        ) or "none"
+        suffix = f"; pending migrations [{pending_ids}]"
+        if self.target_version is not None:
+            suffix += f"; target version {self.target_version}"
+        if cause is not None:
+            suffix += f": {cause}"
+        super().__init__(message + suffix)
+
+
+class MigrationBackupError(MigrationBatchError):
     """Raised when a pre-migration backup cannot be created or verified."""
 
 
-class MigrationValidationError(MigrationError):
+class MigrationValidationError(MigrationBatchError):
     """Raised when post-migration validation fails before commit."""
 
 
@@ -458,7 +486,7 @@ class MigrationRunner:
             backup_path = self._prepare_verified_backup(
                 path,
                 current_version=max(applied, default=0),
-                target_version=max(migration.version for migration in pending),
+                pending_migrations=pending,
             )
 
         with write_connection(path) as connection:
@@ -485,7 +513,9 @@ class MigrationRunner:
                     except Exception as exc:
                         raise MigrationValidationError(
                             "post-migration validation failed before migration "
-                            f"records were committed: {exc}"
+                            "records were committed",
+                            pending_migrations=pending,
+                            cause=exc,
                         ) from exc
 
                 applied_at = _utc_now_iso()
@@ -592,19 +622,24 @@ class MigrationRunner:
         path: Path,
         *,
         current_version: int,
-        target_version: int,
+        pending_migrations: Sequence[Migration],
     ) -> Path:
+        target_version = max(
+            migration.version for migration in pending_migrations
+        )
         backup = path.with_name(
             f"{path.name}.backup-v{current_version}-to-v{target_version}"
         )
         temp = backup.with_name(backup.name + ".tmp")
         if backup.is_symlink():
             raise MigrationBackupError(
-                f"migration backup path must not be a symlink: {backup}"
+                f"migration backup path must not be a symlink: {backup}",
+                pending_migrations=pending_migrations,
             )
         if temp.is_symlink():
             raise MigrationBackupError(
-                f"migration backup temp path must not be a symlink: {temp}"
+                f"migration backup temp path must not be a symlink: {temp}",
+                pending_migrations=pending_migrations,
             )
         if temp.exists():
             temp.unlink()
@@ -614,7 +649,8 @@ class MigrationRunner:
                 checkpoint = source.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
                 if checkpoint is not None and int(checkpoint[0]) != 0:
                     raise MigrationBackupError(
-                        f"WAL checkpoint was busy for {path}: {tuple(checkpoint)}"
+                        f"WAL checkpoint was busy for {path}: {tuple(checkpoint)}",
+                        pending_migrations=pending_migrations,
                     )
 
                 self._validate_identity(
@@ -649,7 +685,9 @@ class MigrationRunner:
             if temp.exists():
                 temp.unlink()
             raise MigrationBackupError(
-                f"failed to create verified backup for {path}: {exc}"
+                f"failed to create verified backup for {path}",
+                pending_migrations=pending_migrations,
+                cause=exc,
             ) from exc
 
 
@@ -760,6 +798,7 @@ __all__ = [
     "Migration",
     "MigrationApplyError",
     "MigrationBackupError",
+    "MigrationBatchError",
     "MigrationDriftError",
     "MigrationError",
     "MigrationIntegrityError",

@@ -14,6 +14,7 @@ from manga_autopilot.storage import (
     DatabaseIdentityMismatchError,
     Migration,
     MigrationApplyError,
+    MigrationBackupError,
     MigrationDriftError,
     MigrationIntegrityError,
     MigrationRunner,
@@ -225,12 +226,22 @@ def test_post_validation_failure_is_not_recorded_or_committed(tmp_path: Path) ->
     def fail_validation(_connection: sqlite3.Connection) -> None:
         raise MigrationIntegrityError("simulated post validation failure")
 
-    with pytest.raises(MigrationValidationError, match="post-migration validation"):
+    with pytest.raises(
+        MigrationValidationError,
+        match="post-migration validation",
+    ) as exc_info:
         migrate_master_database(
             database,
             migrations=migrations,
             post_integrity_check=fail_validation,
         )
+
+    assert exc_info.value.pending_versions == (next_version,)
+    assert exc_info.value.target_version == next_version
+    assert [m.name for m in exc_info.value.pending_migrations] == [
+        f"M{next_version:04d}_validation_test"
+    ]
+    assert isinstance(exc_info.value.cause, MigrationIntegrityError)
 
     with read_connection(database) as connection:
         assert connection.execute(
@@ -539,3 +550,93 @@ def test_migration_rejects_symlinked_database_before_backup_or_mutation(
     assert not managed.with_name(
         f"{managed.name}.backup-v{MASTER_MIGRATIONS[-1].version}-to-v{next_version}"
     ).exists()
+
+
+
+def test_post_validation_failure_reports_multi_pending_migration_ids(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "master.sqlite3"
+    bootstrap_master_database(database, database_id="master_test")
+    first_version = MASTER_MIGRATIONS[-1].version + 1
+    second_version = first_version + 1
+    migrations = (
+        *MASTER_MIGRATIONS,
+        Migration(
+            version=first_version,
+            name=f"M{first_version:04d}_first_pending",
+            statements=("CREATE TABLE pending_first (id INTEGER PRIMARY KEY)",),
+        ),
+        Migration(
+            version=second_version,
+            name=f"M{second_version:04d}_second_pending",
+            statements=("CREATE TABLE pending_second (id INTEGER PRIMARY KEY)",),
+        ),
+    )
+
+    def fail_validation(_connection: sqlite3.Connection) -> None:
+        raise MigrationIntegrityError("simulated batch validation failure")
+
+    with pytest.raises(MigrationValidationError) as exc_info:
+        migrate_master_database(
+            database,
+            migrations=migrations,
+            post_integrity_check=fail_validation,
+        )
+
+    error = exc_info.value
+    assert error.pending_versions == (first_version, second_version)
+    assert error.target_version == second_version
+    assert [migration.name for migration in error.pending_migrations] == [
+        f"M{first_version:04d}_first_pending",
+        f"M{second_version:04d}_second_pending",
+    ]
+    assert "pending migrations" in str(error)
+    assert str(first_version) in str(error)
+    assert str(second_version) in str(error)
+
+
+def test_backup_failure_reports_pending_migration_ids(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "master.sqlite3"
+    bootstrap_master_database(database, database_id="master_test")
+    first_version = MASTER_MIGRATIONS[-1].version + 1
+    second_version = first_version + 1
+    migrations = (
+        *MASTER_MIGRATIONS,
+        Migration(
+            version=first_version,
+            name=f"M{first_version:04d}_backup_first",
+            statements=("CREATE TABLE backup_first (id INTEGER PRIMARY KEY)",),
+        ),
+        Migration(
+            version=second_version,
+            name=f"M{second_version:04d}_backup_second",
+            statements=("CREATE TABLE backup_second (id INTEGER PRIMARY KEY)",),
+        ),
+    )
+
+    backup = database.with_name(
+        f"{database.name}.backup-v{MASTER_MIGRATIONS[-1].version}"
+        f"-to-v{second_version}"
+    )
+    outside = tmp_path / "outside-backup-target"
+    outside.write_bytes(b"do not replace")
+    try:
+        backup.symlink_to(outside)
+    except OSError:
+        pytest.skip("file symlinks are not supported in this environment")
+
+    with pytest.raises(MigrationBackupError) as exc_info:
+        migrate_master_database(database, migrations=migrations)
+
+    error = exc_info.value
+    assert error.pending_versions == (first_version, second_version)
+    assert error.target_version == second_version
+    assert [migration.name for migration in error.pending_migrations] == [
+        f"M{first_version:04d}_backup_first",
+        f"M{second_version:04d}_backup_second",
+    ]
+    assert "target version" in str(error)
+    assert outside.read_bytes() == b"do not replace"
