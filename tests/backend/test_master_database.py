@@ -13,6 +13,7 @@ from manga_autopilot.storage import (
     MASTER_MIGRATIONS,
     MasterDatabaseIdentityError,
     bootstrap_master_database,
+    migrate_master_database,
     read_master_identity,
     write_connection,
 )
@@ -267,9 +268,16 @@ def test_master_entity_revision_requires_existing_commit(tmp_path: Path) -> None
             )
 
 
-def test_bootstrap_upgrades_legacy_master_database_kind_in_place(tmp_path: Path) -> None:
+def test_bootstrap_upgrades_legacy_master_database_kind_via_migration(
+    tmp_path: Path,
+) -> None:
     database = tmp_path / "master.sqlite3"
-    bootstrap_master_database(database, database_id="master_test")
+    legacy_migrations = MASTER_MIGRATIONS[:-1]
+    migrate_master_database(
+        database,
+        migrations=legacy_migrations,
+        database_id="master_test",
+    )
 
     with write_connection(database) as connection:
         connection.execute(
@@ -277,14 +285,42 @@ def test_bootstrap_upgrades_legacy_master_database_kind_in_place(tmp_path: Path)
         )
         connection.commit()
 
-    before = read_master_identity(database)
-    assert before.database_kind == MASTER_DATABASE_KIND
-
     result = bootstrap_master_database(database)
 
     assert result.identity.database_kind == MASTER_DATABASE_KIND
+    assert result.migration.applied_versions == (MASTER_MIGRATIONS[-1].version,)
     with write_connection(database) as connection:
         stored = connection.execute(
             "SELECT value FROM master_metadata WHERE key = 'database_kind'"
         ).fetchone()[0]
     assert stored == MASTER_DATABASE_KIND
+
+
+def test_bootstrap_does_not_repair_incomplete_identity_when_user_data_exists(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "master.sqlite3"
+    bootstrap_master_database(database, database_id="master_test")
+
+    with write_connection(database) as connection:
+        connection.execute(
+            "DELETE FROM master_metadata WHERE key = 'database_id'"
+        )
+        connection.execute(
+            """
+            INSERT INTO master_commits (commit_id, actor_type, created_at)
+            VALUES ('real_data', 'system', '2026-09-20T00:00:00+00:00')
+            """
+        )
+        connection.commit()
+
+    with pytest.raises(MasterDatabaseIdentityError, match="incomplete"):
+        bootstrap_master_database(database)
+
+    with write_connection(database) as connection:
+        assert connection.execute(
+            "SELECT 1 FROM master_commits WHERE commit_id = 'real_data'"
+        ).fetchone() is not None
+        assert connection.execute(
+            "SELECT value FROM master_metadata WHERE key = 'database_id'"
+        ).fetchone() is None

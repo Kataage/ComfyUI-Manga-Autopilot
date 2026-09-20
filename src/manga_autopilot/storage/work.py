@@ -106,6 +106,124 @@ def _identity_from_metadata(metadata: dict[str, str]) -> WorkDatabaseIdentity:
     )
 
 
+def _migration_history_is_known_prefix(
+    connection: sqlite3.Connection,
+    migrations: Iterable[Migration],
+) -> bool:
+    tables = {
+        str(row["name"])
+        for row in connection.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table'"
+        ).fetchall()
+    }
+    if "schema_migrations" not in tables or "work_database_metadata" not in tables:
+        return False
+
+    rows = connection.execute(
+        """
+        SELECT version, name, checksum
+        FROM schema_migrations
+        ORDER BY version
+        """
+    ).fetchall()
+    if not rows:
+        return False
+
+    configured = {migration.version: migration for migration in migrations}
+    for row in rows:
+        version = int(row["version"])
+        migration = configured.get(version)
+        if migration is None:
+            return False
+        if str(row["name"]) != migration.name:
+            return False
+        if str(row["checksum"]) != migration.checksum:
+            return False
+    return True
+
+
+def _table_is_empty(connection: sqlite3.Connection, table: str) -> bool:
+    row = connection.execute(f"SELECT 1 FROM {table} LIMIT 1").fetchone()
+    return row is None
+
+
+def _recover_interrupted_identity_bootstrap(
+    database_path: str | Path,
+    *,
+    work_id: str,
+    database_id: str,
+    created_at: str,
+    migrations: Iterable[Migration],
+) -> bool:
+    """Recover only an empty-data Work DB left by old Phase A bootstrap."""
+    path = Path(database_path).expanduser().resolve()
+    if not path.is_file() or path.stat().st_size == 0:
+        return False
+
+    migration_set = tuple(migrations)
+    try:
+        with read_connection(path) as connection:
+            if not _migration_history_is_known_prefix(connection, migration_set):
+                return False
+
+            metadata = _read_metadata(connection)
+            if metadata:
+                return False
+
+            tables = {
+                str(row["name"])
+                for row in connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table'"
+                ).fetchall()
+            }
+            required_empty_tables = (
+                "commits",
+                "entity_revisions",
+                "work_metadata",
+            )
+            if any(table not in tables for table in required_empty_tables):
+                return False
+            if not all(
+                _table_is_empty(connection, table)
+                for table in required_empty_tables
+            ):
+                return False
+    except sqlite3.DatabaseError:
+        return False
+
+    with write_connection(path) as connection:
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            if _read_metadata(connection):
+                connection.rollback()
+                return False
+            if not all(
+                _table_is_empty(connection, table)
+                for table in ("commits", "entity_revisions", "work_metadata")
+            ):
+                connection.rollback()
+                return False
+
+            connection.executemany(
+                """
+                INSERT INTO work_database_metadata (key, value)
+                VALUES (?, ?)
+                """,
+                (
+                    ("database_kind", WORK_DATABASE_KIND),
+                    ("database_id", database_id),
+                    ("format_version", WORK_FORMAT_VERSION),
+                    ("work_id", work_id),
+                    ("created_at", created_at),
+                ),
+            )
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+    return True
+
+
 def read_work_identity(database_path: str | Path) -> WorkDatabaseIdentity:
     """Read and validate required Work database identity metadata."""
     with read_connection(database_path) as connection:
@@ -121,83 +239,49 @@ def bootstrap_work_database(
     app_version: str | None = None,
     migrations: Iterable[Migration] = WORK_MIGRATIONS,
 ) -> WorkDatabaseBootstrapResult:
-    """Migrate a Work DB and initialize stable identity metadata if needed."""
+    """Migrate and initialize Work identity as one crash-safe operation."""
     if not work_id.strip():
         raise ValueError("work_id must be non-empty")
     if database_id is not None and not database_id.strip():
         raise ValueError("database_id must be non-empty when provided")
 
+    migration_set = tuple(migrations)
+    requested_database_id = database_id or _new_work_database_id()
+    created_at = _utc_now_iso()
+
+    _recover_interrupted_identity_bootstrap(
+        database_path,
+        work_id=work_id,
+        database_id=requested_database_id,
+        created_at=created_at,
+        migrations=migration_set,
+    )
+
     try:
         migration = migrate_work_database(
             database_path,
-            migrations=migrations,
+            migrations=migration_set,
             app_version=app_version,
+            work_id=work_id,
+            database_id=requested_database_id,
+            created_at=created_at,
         )
     except DatabaseIdentityMismatchError as exc:
         raise WorkDatabaseIdentityError(
             f"database_kind mismatch: {exc}"
         ) from exc
 
-    requested_database_id = database_id or _new_work_database_id()
-    created_at = _utc_now_iso()
-
-    with write_connection(database_path) as connection:
-        try:
-            connection.execute("BEGIN IMMEDIATE")
-            existing = _read_metadata(connection)
-
-            existing_kind = existing.get("database_kind")
-            if existing_kind is not None and existing_kind != WORK_DATABASE_KIND:
-                raise WorkDatabaseIdentityError(
-                    "database_kind mismatch: "
-                    f"expected {WORK_DATABASE_KIND!r}, got {existing_kind!r}"
-                )
-
-            existing_format = existing.get("format_version")
-            if existing_format is not None and existing_format != WORK_FORMAT_VERSION:
-                raise WorkDatabaseIdentityError(
-                    "format_version mismatch: "
-                    f"expected {WORK_FORMAT_VERSION!r}, got {existing_format!r}"
-                )
-
-            existing_work_id = existing.get("work_id")
-            if existing_work_id is not None and existing_work_id != work_id:
-                raise WorkDatabaseIdentityError(
-                    "work_id mismatch: "
-                    f"expected {work_id!r}, got {existing_work_id!r}"
-                )
-
-            existing_database_id = existing.get("database_id")
-            if (
-                database_id is not None
-                and existing_database_id is not None
-                and existing_database_id != database_id
-            ):
-                raise WorkDatabaseIdentityError(
-                    "database_id mismatch: "
-                    f"expected {database_id!r}, got {existing_database_id!r}"
-                )
-
-            values = {
-                "database_kind": WORK_DATABASE_KIND,
-                "database_id": existing_database_id or requested_database_id,
-                "format_version": WORK_FORMAT_VERSION,
-                "work_id": existing_work_id or work_id,
-                "created_at": existing.get("created_at") or created_at,
-            }
-            connection.executemany(
-                """
-                INSERT OR IGNORE INTO work_database_metadata (key, value)
-                VALUES (?, ?)
-                """,
-                tuple(values.items()),
-            )
-
-            identity = _identity_from_metadata(_read_metadata(connection))
-            connection.commit()
-        except Exception:
-            connection.rollback()
-            raise
+    identity = read_work_identity(database_path)
+    if identity.work_id != work_id:
+        raise WorkDatabaseIdentityError(
+            "work_id mismatch: "
+            f"expected {work_id!r}, got {identity.work_id!r}"
+        )
+    if database_id is not None and identity.database_id != database_id:
+        raise WorkDatabaseIdentityError(
+            "database_id mismatch: "
+            f"expected {database_id!r}, got {identity.database_id!r}"
+        )
 
     return WorkDatabaseBootstrapResult(
         identity=identity,
