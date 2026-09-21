@@ -8,6 +8,9 @@ import pytest
 from aiohttp import web
 
 from manga_autopilot.comfy_integration import (
+    _build_comfy_client,
+    _build_llm_provider,
+    _default_config_path,
     _resolve_app_and_routes,
     attach_routes_to_prompt_server,
 )
@@ -176,6 +179,157 @@ async def test_character_routes_do_not_500_after_comfyui_startup(aiohttp_client,
     body = await r.json()
     assert body["ok"] is True
     assert body["service"] == "manga_autopilot"
+
+
+def test_build_llm_provider_defaults_to_ollama_when_no_config(tmp_path: Path):
+    """No config.yaml still yields a real provider, not the ``ManualProvider``
+    no-op ``routes.autopilot_routes._llm_provider`` falls back to on its own -
+    ``config.py``'s own documented default (Ollama) applies."""
+
+    from manga_autopilot.services.llm_provider import OllamaProvider
+
+    provider = _build_llm_provider(tmp_path / "does-not-exist.yaml")
+    assert isinstance(provider, OllamaProvider)
+    assert provider.settings.endpoint == "http://127.0.0.1:11434"
+
+
+def test_build_llm_provider_reads_openai_compatible_config(tmp_path: Path):
+    from manga_autopilot.services.llm_provider import OpenAICompatibleProvider
+
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        """
+llm:
+  provider: openai_compatible
+  endpoint: http://127.0.0.1:1234
+  model: my-local-planner
+  timeout_sec: 120
+"""
+    )
+    provider = _build_llm_provider(config_path)
+    assert isinstance(provider, OpenAICompatibleProvider)
+    assert provider.settings.endpoint == "http://127.0.0.1:1234"
+    assert provider.settings.model == "my-local-planner"
+    assert provider.settings.timeout_sec == 120
+
+
+def test_build_llm_provider_accepts_lm_studio_alias(tmp_path: Path):
+    """``lm_studio`` is a friendlier spelling than the generic ``openai_compatible``."""
+
+    from manga_autopilot.services.llm_provider import OpenAICompatibleProvider
+
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        """
+llm:
+  provider: lm_studio
+  endpoint: http://127.0.0.1:1234
+  model: my-local-planner
+"""
+    )
+    provider = _build_llm_provider(config_path)
+    assert isinstance(provider, OpenAICompatibleProvider)
+
+
+def test_default_config_path_honours_env_override(tmp_path: Path, monkeypatch):
+    target = tmp_path / "somewhere" / "config.yaml"
+    monkeypatch.setenv("MANGA_AUTOPILOT_CONFIG_PATH", str(target))
+    assert _default_config_path() == target
+
+
+def test_attach_routes_wires_a_real_llm_provider(monkeypatch):
+    """The live-ComfyUI path must not leave ``manga_llm_provider`` unset -
+    that silently degrades every planning call to the ``ManualProvider``
+    no-op (see ``routes.autopilot_routes._llm_provider``)."""
+
+    import sys
+    import types
+
+    from manga_autopilot.services.llm_provider import LLMProvider
+
+    server = _FakePromptServer()
+    fake_mod = types.ModuleType("server")
+    fake_mod.PromptServer = type("PromptServer", (), {"instance": server})
+    monkeypatch.setitem(sys.modules, "server", fake_mod)
+    monkeypatch.delenv("MANGA_AUTOPILOT_CONFIG_PATH", raising=False)
+
+    assert attach_routes_to_prompt_server() is True
+    assert isinstance(server.app["manga_llm_provider"], LLMProvider)
+
+
+def test_build_comfy_client_defaults_to_local_comfyui(tmp_path: Path):
+    from manga_autopilot.services.comfy_client import ComfyClient
+
+    client = _build_comfy_client(tmp_path / "does-not-exist.yaml")
+    assert isinstance(client, ComfyClient)
+    assert client.base_url == "http://127.0.0.1:8188"
+
+
+def test_build_comfy_client_reads_config(tmp_path: Path):
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        """
+comfyui:
+  base_url: http://192.168.1.20:8188
+  timeout_sec: 120
+"""
+    )
+    client = _build_comfy_client(config_path)
+    assert client.base_url == "http://192.168.1.20:8188"
+    assert client.timeout_sec == 120
+
+
+def test_attach_routes_wires_a_real_comfy_client(monkeypatch):
+    """Without this, a run reaches ``generate_panels`` and fails with
+    ``HTTPServiceUnavailable`` - observed live on 2026-08-30 (see
+    HANDOFF.md), because ``panel_routes._executor`` has no lazy default of
+    its own the way ``workflow_routes._comfy_client`` does."""
+
+    import sys
+    import types
+
+    from manga_autopilot.services.comfy_client import ComfyClient
+
+    server = _FakePromptServer()
+    fake_mod = types.ModuleType("server")
+    fake_mod.PromptServer = type("PromptServer", (), {"instance": server})
+    monkeypatch.setitem(sys.modules, "server", fake_mod)
+    monkeypatch.delenv("MANGA_AUTOPILOT_CONFIG_PATH", raising=False)
+
+    assert attach_routes_to_prompt_server() is True
+    assert isinstance(server.app["manga_comfy_client"], ComfyClient)
+
+
+def test_attach_routes_does_not_override_an_existing_comfy_client(monkeypatch):
+    import sys
+    import types
+
+    server = _FakePromptServer()
+    sentinel = object()
+    server.app["manga_comfy_client"] = sentinel
+    fake_mod = types.ModuleType("server")
+    fake_mod.PromptServer = type("PromptServer", (), {"instance": server})
+    monkeypatch.setitem(sys.modules, "server", fake_mod)
+
+    assert attach_routes_to_prompt_server() is True
+    assert server.app["manga_comfy_client"] is sentinel
+
+
+def test_attach_routes_does_not_override_an_existing_provider(monkeypatch):
+    """A caller (or a future route) that already set a provider must win."""
+
+    import sys
+    import types
+
+    server = _FakePromptServer()
+    sentinel = object()
+    server.app["manga_llm_provider"] = sentinel
+    fake_mod = types.ModuleType("server")
+    fake_mod.PromptServer = type("PromptServer", (), {"instance": server})
+    monkeypatch.setitem(sys.modules, "server", fake_mod)
+
+    assert attach_routes_to_prompt_server() is True
+    assert server.app["manga_llm_provider"] is sentinel
 
 
 async def test_character_routes_no_storage_root_returns_500(aiohttp_client):

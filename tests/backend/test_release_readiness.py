@@ -41,23 +41,56 @@ class TestReleaseArtifactsExist:
 
 
 class TestVersionMetadata:
-    def test_pyproject_version(self):
-        content = (_REPO_ROOT / "pyproject.toml").read_text()
+    """Pin the relationships, not the number.
+
+    Both of these used to assert the literal ``0.1.0-rc1``, so every release
+    edited the test alongside the thing it was checking - which is a test that
+    can only ever agree with whatever was just written. What matters is that
+    the two declarations agree and that the release they name has notes.
+    """
+
+    @staticmethod
+    def _pyproject_version() -> str:
+        content = (_REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8")
         match = re.search(r'^version\s*=\s*"(.+?)"', content, re.MULTILINE)
         assert match, "version not found in pyproject.toml"
-        assert match.group(1) == "0.1.0-rc1"
+        return match.group(1)
 
-    def test_init_version(self):
-        content = (_REPO_ROOT / "src" / "manga_autopilot" / "__init__.py").read_text()
-        assert "__version__ = \"0.1.0-rc1\"" in content
+    def test_pyproject_and_package_versions_agree(self):
+        content = (_REPO_ROOT / "src" / "manga_autopilot" / "__init__.py").read_text(
+            encoding="utf-8"
+        )
+        match = re.search(r'^__version__\s*=\s*"(.+?)"', content, re.MULTILINE)
+        assert match, "__version__ not found in manga_autopilot/__init__.py"
+        assert match.group(1) == self._pyproject_version(), (
+            "pyproject.toml and manga_autopilot.__version__ disagree; the "
+            "release checklist requires both to be bumped together"
+        )
+
+    def test_the_declared_version_has_release_notes(self):
+        version = self._pyproject_version()
+        path = _REPO_ROOT / "docs" / "release" / f"v{version}_release_notes.md"
+        assert path.is_file(), (
+            f"no release notes for the declared version: {path.name}"
+        )
+
+    def test_the_changelog_leads_with_the_declared_version(self):
+        version = self._pyproject_version()
+        content = (_REPO_ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
+        headings = re.findall(r"^## (.+)$", content, re.MULTILINE)
+        assert headings, "CHANGELOG.md has no version headings"
+        assert headings[0].strip() == version, (
+            f"CHANGELOG.md leads with {headings[0].strip()!r}, "
+            f"but pyproject declares {version!r}"
+        )
 
     def test_readme_mentions_v0_1_0_rc1(self):
-        content = (_REPO_ROOT / "README.md").read_text()
+        content = (_REPO_ROOT / "README.md").read_text(encoding="utf-8")
         # Check for version mention in any form (v0.x, v1.0.0, 0.1.0)
         assert "v0.x" in content or "0.1.0" in content or "v1.0" in content
 
     def test_readme_ja_mentions_v0_1_0_rc1(self):
-        content = (_REPO_ROOT / "README.ja.md").read_text()
+        content = (_REPO_ROOT / "README.ja.md").read_text(encoding="utf-8")
         assert "v0.x" in content or "0.1.0" in content or "v1.0" in content
 
 
@@ -66,7 +99,7 @@ class TestVersionMetadata:
 
 class TestReadmeConsistency:
     def test_readme_has_key_sections(self):
-        content = (_REPO_ROOT / "README.md").read_text()
+        content = (_REPO_ROOT / "README.md").read_text(encoding="utf-8")
         sections = [
             "Modal Worker",
             "Artifact Store",
@@ -77,7 +110,7 @@ class TestReadmeConsistency:
             assert section.lower() in content.lower(), f"Missing section: {section}"
 
     def test_readme_ja_has_key_sections(self):
-        content = (_REPO_ROOT / "README.ja.md").read_text()
+        content = (_REPO_ROOT / "README.ja.md").read_text(encoding="utf-8")
         sections = [
             "Modal",
             "アーティファクト",
@@ -113,7 +146,7 @@ class TestSecurityScan:
     def test_no_example_secret_values(self):
         """Check that README/docs don't contain real-looking secrets."""
         for md_file in _REPO_ROOT.glob("*.md"):
-            content = md_file.read_text()
+            content = md_file.read_text(encoding="utf-8")
             # Real AWS key pattern: 20 uppercase chars starting with AKIA
             assert not re.search(r"AKIA[0-9A-Z]{16}", content), (
                 f"Real AWS key found in {md_file.name}"

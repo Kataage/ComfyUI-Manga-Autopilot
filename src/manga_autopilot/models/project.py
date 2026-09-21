@@ -37,9 +37,24 @@ ProjectStatus = Literal[
 
 OutputFormat = Literal["png_pages", "webtoon", "pdf"]
 
+#: Version of the on-disk ``project.json`` layout written by this build.
+#: Version 1 documents predate the field and are migrated lazily on read;
+#: see :mod:`manga_autopilot.services.project_migration`.
+CURRENT_PROJECT_SCHEMA_VERSION = 2
+
 
 def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+class MigrationRecord(BaseModel):
+    """One applied schema migration, kept so old documents stay auditable."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    from_version: int
+    to_version: int
+    migrated_at: str
 
 
 class ProjectGenerationSettings(BaseModel):
@@ -68,9 +83,17 @@ class Project(BaseModel):
     settings: ProjectSettings = Field(default_factory=ProjectSettings)
     created_at: str = Field(default_factory=_utc_now_iso)
     updated_at: str = Field(default_factory=_utc_now_iso)
+    schema_version: int = CURRENT_PROJECT_SCHEMA_VERSION
+    migration_history: list[MigrationRecord] = Field(default_factory=list)
+    generation_profile_id: str = Field(default="", max_length=64)
+    """Selects strict Anima behaviour when it starts with ``anima_``."""
+    license_acknowledged: bool = False
+    """Set once the user has acknowledged the model licence for this profile."""
 
 
 __all__ = [
+    "CURRENT_PROJECT_SCHEMA_VERSION",
+    "MigrationRecord",
     "OutputFormat",
     "Project",
     "ProjectGenerationSettings",

@@ -9,10 +9,12 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
+from pathlib import Path
 
 from PIL import Image, ImageDraw
 
 from manga_autopilot.models.bubble import FontSpec, SpeechBubble, TailTarget
+from manga_autopilot.services.fonts import load_font
 
 
 @dataclass
@@ -90,6 +92,43 @@ def _text_anchor(
     return "la" if direction == "vertical" else "mm"
 
 
+#: Never shrink text below this; past it the line is unreadable anyway and
+#: truncation is the more honest outcome.
+MIN_FONT_SIZE = 8.0
+
+
+def _fit_vertical_size(text: str, height: float, requested: float, line_ratio: float) -> float:
+    """Largest size <= `requested` that fits every character in one column."""
+    if not text:
+        return requested
+    usable = max(1.0, height - 8)
+    ideal = usable / (len(text) * max(0.1, line_ratio))
+    return max(MIN_FONT_SIZE, min(requested, ideal))
+
+
+def _fit_horizontal_size(
+    draw: ImageDraw.ImageDraw,
+    text: str,
+    width: float,
+    requested: float,
+    family: str,
+    font_dir: Path | str | None,
+) -> tuple[float, object]:
+    """Largest size <= `requested` whose rendered width fits, with its face."""
+    usable = max(1.0, width - 8)
+    size = requested
+    while size > MIN_FONT_SIZE:
+        face = load_font(family, size, extra_dir=font_dir)
+        try:
+            measured = draw.textlength(text, font=face)
+        except (AttributeError, TypeError):  # pragma: no cover - very old Pillow
+            return size, face
+        if measured <= usable:
+            return size, face
+        size -= 1
+    return MIN_FONT_SIZE, load_font(family, MIN_FONT_SIZE, extra_dir=font_dir)
+
+
 def _render_text(
     draw: ImageDraw.ImageDraw,
     text: str,
@@ -99,28 +138,45 @@ def _render_text(
     w: float,
     h: float,
     direction: str,
+    font_dir: Path | str | None = None,
 ) -> None:
     if not text:
         return
     color = _hex_to_rgb(font.color)
+    # Without a real face Pillow uses a bitmap font with no CJK glyphs and a
+    # fixed size, which drew Japanese dialogue as nothing inside a perfectly
+    # good bubble.
+    face = load_font(font.family, font.size, extra_dir=font_dir)
     if direction == "vertical":
-        # Render each character on its own line, right-aligned, descending.
-        line_height = max(10, int(font.size * font.line_height))
-        char_x = int(x + w - font.size - 4)
-        cy = int(y + 4)
-        for ch in text:
-            if _should_rotate_vertical_punctuation(ch):
-                # The full glyph rotation requires a TTF renderer; without
-                # one we still draw the character (monospace default). The
-                # classifier is exposed so the bubble service can later
-                # rotate using a real font.
-                draw.text((char_x, cy), ch, fill=color)
-            else:
-                draw.text((char_x, cy), ch, fill=color)
+        # A column down the right side, kept inside the ellipse rather than the
+        # bounding box: at the top and bottom of the column the ellipse is much
+        # narrower than the box, which is where text used to spill outside.
+        # Shrink to fit rather than cutting the line off: a bubble sized for
+        # two characters used to render 「行くぞ」 as 「行く」.
+        size = _fit_vertical_size(text, h, font.size, font.line_height)
+        if size != font.size:
+            face = load_font(font.family, size, extra_dir=font_dir)
+        line_height = max(8, int(size * font.line_height))
+        fits = max(1, int((h - 8) // line_height))
+        shown = text[:fits]
+        block = len(shown) * line_height
+
+        centre_x = x + w / 2
+        centre_y = y + h / 2
+        semi_x, semi_y = w / 2, h / 2
+        extreme = min(block / 2, semi_y)
+        # Half-width of the ellipse at the column's furthest point from centre.
+        narrow = semi_x * math.sqrt(max(0.0, 1.0 - (extreme / semi_y) ** 2))
+        char_x = int(centre_x + max(0.0, narrow - size))
+
+        cy = centre_y - block / 2
+        for ch in shown:
+            # Rotating the glyph itself still needs a separate pass; the
+            # classifier stays exposed so the bubble service can do that.
+            draw.text((char_x, int(cy)), ch, fill=color, font=face)
             cy += line_height
-            if cy > y + h - line_height:
-                break
     else:
+        size, face = _fit_horizontal_size(draw, text, w, font.size, font.family, font_dir)
         anchor = _text_anchor(direction, x, y, w, h)
         try:
             draw.text(
@@ -128,9 +184,15 @@ def _render_text(
                 text,
                 fill=color,
                 anchor=anchor,
+                font=face,
             )
         except TypeError:
-            draw.text((int(x + 4), int(y + h / 2 - font.size / 2)), text, fill=color)
+            draw.text(
+                (int(x + 4), int(y + h / 2 - size / 2)),
+                text,
+                fill=color,
+                font=face,
+            )
 
 
 # Japanese vertical punctuation that traditionally rotates 90deg clockwise.

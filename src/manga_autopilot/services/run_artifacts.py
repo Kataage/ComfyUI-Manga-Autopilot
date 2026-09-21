@@ -24,6 +24,10 @@ _JSON_FILES = (
     "pages.json",
 )
 
+# Files written directly into the run directory. They have no project-root
+# counterpart, so they are reported but never mirrored or overwritten.
+_RUN_ONLY_JSON_FILES = ("snapshot.json",)
+
 # Directories to mirror when they exist on project root.
 _DIR_NAMES = ("jobs", "assets", "exports")
 
@@ -89,7 +93,7 @@ def read_run_artifacts_summary(project_root: Path, run_id: str) -> dict[str, str
     run_dir = project_root / "runs" / run_id
     summary: dict[str, str | None] = {}
 
-    for name in _JSON_FILES:
+    for name in (*_JSON_FILES, *_RUN_ONLY_JSON_FILES):
         p = run_dir / name
         summary[name] = f"runs/{run_id}/{name}" if p.exists() else None
 

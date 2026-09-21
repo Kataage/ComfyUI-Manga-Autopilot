@@ -36,6 +36,23 @@ pip install -e .
 pip install -e ".[dev]"
 ```
 
+**`PATH` 上の `pip` ではなく、ComfyUI 自身のインタプリタを使ってください。**
+ポータブル版やデスクトップ版の ComfyUI は専用の Python を同梱しており、別の
+Python に入れても ComfyUI からは見えません。ComfyUI には `aiohttp`・`pydantic`・
+`PyYAML`・`Pillow` は既にありますが、`jsonschema` はありません。これが無いと
+起動時に `register_all()` が `ModuleNotFoundError` を送出します。その状態でも
+サイドバータブは表示されるため、インストール済みに見えて HTTP ルートが全滅
+します。ComfyUI のコンソールに `Failed to register Manga Autopilot routes` が
+出ていないか確認してください。
+
+```bash
+# 例: Windows の ComfyUI Desktop
+"%LOCALAPPDATA%\Comfy-Desktop\ComfyUI-Installs\<name>\standalone-env\python.exe" -m pip install -e .
+```
+
+ComfyUI-Manager 経由でインストールする場合は `requirements.txt` が使われ、
+同じ依存関係が入ります。
+
 ## 4. ComfyUI の再起動
 
 カスタムノードは `/manga_autopilot/api/...` 配下の HTTP API を登録し、

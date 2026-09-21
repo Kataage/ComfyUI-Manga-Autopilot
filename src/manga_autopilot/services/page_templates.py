@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from typing import Literal
 
@@ -165,6 +166,71 @@ def get_template(template_id: str) -> PageTemplate:
         raise KeyError(f"template not found: {template_id!r}") from exc
 
 
+def layout_catalog(kind: TemplateKind | None = None) -> list[dict[str, object]]:
+    catalog: list[dict[str, object]] = []
+    for template in list_templates(kind):
+        if template.kind == "webtoon":
+            order = sorted(
+                range(len(template.panels)),
+                key=lambda index: template.panels[index].y,
+            )
+        else:
+            order = sorted(
+                range(len(template.panels)),
+                key=lambda index: (
+                    template.panels[index].y,
+                    -template.panels[index].x,
+                ),
+            )
+        catalog.append(
+            {
+                "layout_id": template.template_id,
+                "panel_count": len(template.panels),
+                "reading_order": [index + 1 for index in order],
+            }
+        )
+    return catalog
+
+
+def fallback_grid(
+    panel_count: int,
+    page_width: int = 1200,
+    page_height: int = 1600,
+) -> PageTemplate:
+    if not 1 <= panel_count <= 24:
+        raise ValueError("panel_count must be between 1 and 24")
+    if panel_count == 1:
+        panels = [PanelRect(0.05, 0.05, 0.90, 0.90)]
+    else:
+        columns = 2
+        rows = math.ceil(panel_count / columns)
+        gap = 0.04
+        width = 0.43
+        height = (0.90 - gap * (rows - 1)) / rows
+        panels = []
+        for index in range(panel_count):
+            row = index // columns
+            column = index % columns
+            panels.append(
+                PanelRect(
+                    x=0.05 + column * (width + gap),
+                    y=0.05 + row * (height + gap),
+                    width=width,
+                    height=height,
+                    z_index=index,
+                )
+            )
+    return PageTemplate(
+        template_id=f"fallback_grid_{panel_count}",
+        name=f"Fallback grid {panel_count}",
+        kind="page",
+        description="Deterministic grid used when no registered layout is selected.",
+        page_width=page_width,
+        page_height=page_height,
+        panels=panels,
+    )
+
+
 __all__ = [
     "TemplateKind",
     "PanelRect",
@@ -174,4 +240,6 @@ __all__ = [
     "ALL_TEMPLATES",
     "list_templates",
     "get_template",
+    "layout_catalog",
+    "fallback_grid",
 ]

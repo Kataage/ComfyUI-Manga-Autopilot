@@ -31,7 +31,7 @@ if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
 
-__version__ = "0.1.0-rc1"
+__version__ = "0.1.0-rc2"
 
 NODE_CLASS_MAPPINGS: dict[str, type] = {}
 """Mapping of ComfyUI node class id -> implementation class.

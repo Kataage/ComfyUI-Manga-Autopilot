@@ -12,6 +12,7 @@ Per-project overrides live with the project model.
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Any
 
@@ -33,6 +34,26 @@ class ComfyUISettings(BaseModel):
     timeout_sec: int = 600
     use_websocket: bool = True
     client_id: str = "manga_autopilot_client"
+    install_root: str = ""
+    """Local path to the ComfyUI install, for model fingerprints.
+
+    ComfyUI reports model names but not their paths, so without this a run
+    snapshot records no digests. Both ``models/`` and
+    ``extra_model_paths.yaml`` are consulted. Setting it makes each run hash the weights it
+    used, which costs a few seconds per distinct file.
+    """
+    auth_token_env: str = ""
+    """Name of the environment variable holding the ComfyUI token.
+
+    The token itself is never stored in configuration. Preflight requires this
+    to be set and populated before it will allow a non-loopback endpoint.
+    """
+
+    def auth_is_configured(self) -> bool:
+        """Return whether the named environment variable holds a non-empty value."""
+        if not self.auth_token_env:
+            return False
+        return bool(os.environ.get(self.auth_token_env, "").strip())
 
 
 class GenerationSettings(BaseModel):
@@ -60,6 +81,27 @@ class LLMSettings(BaseModel):
     model: str = "qwen2.5:7b-instruct"
     temperature: float = 0.7
     max_tokens: int = 4096
+    timeout_sec: int = 900
+    """How long to wait for one completion. A local reasoning model can spend
+    minutes on a single planning call, well past aiohttp's 300s default."""
+
+
+class LMStudioSettings(BaseModel):
+    """Settings for the planner model Manga Autopilot may manage itself.
+
+    ``manage_lifecycle`` is opt-in: with it disabled the extension only talks to
+    whatever LM Studio already has loaded and never loads or unloads anything.
+    Models are never downloaded automatically.
+    """
+
+    manage_lifecycle: bool = False
+    cli_path: str = "lms"
+    model_key: str = "qwen3.5-9b"
+    identifier: str = "manga-autopilot-planner"
+    ttl_seconds: int = 900
+    context_length: int = 0
+    gpu_offload: str = ""
+    unload_after_storyboard_approval: bool = True
 
 
 class ModalSettings(BaseModel):
@@ -93,6 +135,7 @@ class AppConfig(BaseModel):
     generation: GenerationSettings = Field(default_factory=GenerationSettings)
     character: CharacterSettings = Field(default_factory=CharacterSettings)
     llm: LLMSettings = Field(default_factory=LLMSettings)
+    lm_studio: LMStudioSettings = Field(default_factory=LMStudioSettings)
     modal: ModalSettings = Field(default_factory=ModalSettings)
     export: ExportSettings = Field(default_factory=ExportSettings)
     security: SecuritySettings = Field(default_factory=SecuritySettings)
@@ -173,6 +216,7 @@ __all__ = [
     "ConfigLoadError",
     "ExportSettings",
     "GenerationSettings",
+    "LMStudioSettings",
     "LLMSettings",
     "ModalSettings",
     "SecuritySettings",

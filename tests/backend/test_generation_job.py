@@ -346,8 +346,12 @@ def test_retry_action_use_fallback_is_distinct() -> None:
 
 # ------------------------------------------------- status transition tests
 def test_generation_job_status_enum_includes_all_lifecycle_states() -> None:
-    """All 10 spec-17.2 lifecycle states must be present and stable."""
-    expected = {
+    """All 10 spec-17.2 lifecycle states must be present and stable.
+
+    Later states may be added - strict Anima runs contributed ``awaiting_review``
+    - but none of the spec states may be removed or renamed.
+    """
+    spec_states = {
         "pending",
         "validating",
         "queued",
@@ -360,7 +364,8 @@ def test_generation_job_status_enum_includes_all_lifecycle_states() -> None:
         "cancelled",
     }
     actual = {s.value for s in JobStatus}
-    assert actual == expected
+    assert spec_states <= actual
+    assert actual - spec_states == {"awaiting_review"}
 
 
 async def test_loop_happy_path_transitions_through_expected_statuses(

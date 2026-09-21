@@ -15,6 +15,7 @@ import { mountPageEditor } from "./page_editor.js";
 import { mountCharacterManager } from "./character_manager.js";
 import { mountProgressMonitor } from "./progress_monitor.js";
 import { mountExportCenter } from "./export_center.js";
+import { mountReviewEditor } from "./review_editor.js";
 
 export const EXTENSION_NAME = "comfyui.manga.autopilot";
 export const SIDEBAR_TAB_ID = "manga-autopilot";
@@ -36,6 +37,9 @@ function resolveMounts() {
         mountExportCenter: mountExportCenter
             || window.MangaAutopilot?.mountExportCenter
             || null,
+        mountReviewEditor: mountReviewEditor
+            || window.MangaAutopilot?.mountReviewEditor
+            || null,
     };
 }
 
@@ -44,6 +48,7 @@ const TABS = [
     { id: "editor", label: "Page Editor" },
     { id: "characters", label: "Character Manager" },
     { id: "progress", label: "Progress" },
+    { id: "reviews", label: "Reviews" },
     { id: "export", label: "Export Center" },
 ];
 
@@ -53,6 +58,10 @@ function createTabBar(onSelect) {
     const bar = document.createElement("div");
     bar.className = "manga-autopilot-tabs";
     bar.style.display = "flex";
+    // ComfyUI's sidebar panel is ~312px wide by default and clips overflow on
+    // the x axis; six tabs in a single row measure ~448px, which pushed the
+    // left-hand tabs out of reach. Wrap instead of overflowing.
+    bar.style.flexWrap = "wrap";
     bar.style.gap = "4px";
     bar.style.borderBottom = "1px solid var(--border-color, #444)";
     bar.style.marginBottom = "12px";
@@ -96,6 +105,7 @@ function createProjectsView() {
 
     const row = document.createElement("div");
     row.style.display = "flex";
+    row.style.flexWrap = "wrap";
     row.style.gap = "8px";
     root.appendChild(row);
 
@@ -177,16 +187,26 @@ function createWorkspaceView() {
     const mounts = resolveMounts();
 
     const showTab = (id) => {
-        if (!activeProjectId) {
-            content.replaceChildren();
-            const msg = document.createElement("p");
-            msg.textContent = "Set an active project id in the Projects tab to continue.";
-            content.appendChild(msg);
-            return;
-        }
         const prev = disposers.get(activeTab);
         if (typeof prev === "function") prev();
         content.replaceChildren();
+
+        // Projects is the only view that can set the active project id, so it
+        // has to render before the guard below - otherwise a fresh workspace
+        // has no way out of "set an active project id".
+        if (id === "projects") {
+            content.appendChild(createProjectsView());
+            activeTab = id;
+            return;
+        }
+
+        if (!activeProjectId) {
+            const msg = document.createElement("p");
+            msg.textContent = "Set an active project id in the Projects tab to continue.";
+            content.appendChild(msg);
+            activeTab = id;
+            return;
+        }
 
         const mountInto = (mountFn, key) => {
             const host = document.createElement("div");
@@ -216,8 +236,8 @@ function createWorkspaceView() {
             mountInto(mounts.mountProgressMonitor, "progress");
         } else if (id === "export") {
             mountInto(mounts.mountExportCenter, "export");
-        } else if (id === "projects") {
-            content.appendChild(createProjectsView());
+        } else if (id === "reviews") {
+            mountInto(mounts.mountReviewEditor, "reviews");
         }
         activeTab = id;
     };
@@ -230,6 +250,9 @@ function createWorkspaceRoot() {
     const root = document.createElement("div");
     root.className = "manga-autopilot-root";
     root.style.padding = "12px";
+    root.style.boxSizing = "border-box";
+    root.style.maxWidth = "100%";
+    root.style.overflowX = "hidden";
     root.style.fontFamily =
         "system-ui, -apple-system, 'Segoe UI', sans-serif";
     root.style.color = "var(--input-text, #ddd)";

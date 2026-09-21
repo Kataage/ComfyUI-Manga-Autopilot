@@ -76,6 +76,31 @@ pytest -m release_gate -q
 |------|--------|------|----|-------|
 | Zip Slip protection | Done | `test_export_security.py` (4 tests) | Yes | Path traversal tests |
 
+### Strict Anima Mode
+
+| Area | Status | Test | CI | Notes |
+|------|--------|------|----|-------|
+| Strict structured planning | Done | `test_json_schema_validator.py`, `test_lm_studio_structured_output.py` | Yes | JSON Schema enforced, repair loop |
+| Story bible + scene state | Done | `test_bible_models.py`, `test_scene_state_reducer.py`, `test_continuity_planning.py` | Yes | Continuity carried between panels |
+| Generation profiles own technical fields | Done | `test_generation_profiles.py`, `test_anima_prompt_builder.py` | Yes | Profile, not LLM, owns steps/CFG/seed |
+| Run snapshot + model fingerprints | Done | `test_run_snapshot.py` | Yes | SHA-256 per model, no secrets |
+| Review gates + invalidation | Done | `test_review_gates.py`, `test_anima_autopilot_e2e.py` | Yes | Image generation waits for Storyboard |
+| Preflight (full, with `/object_info`) | Done | `test_anima_preflight.py` | Yes | All eight checks |
+| Preflight without a live ComfyUI | Done | `test_anima_preflight.py` (5 tests) | Yes | Six checks still run; `comfy.capabilities_unavailable` recorded |
+| Licence gate blocks without `/object_info` | Done | `test_without_capabilities_the_licence_gate_still_blocks` | Yes | The check most at risk of disappearing |
+| Project settings reach the run | Done | `test_autopilot_input_seeding.py` (6 tests) | Yes | `_seed_input_from_project`; body still wins |
+| Strict mode from the project alone | Done | `test_strict_mode_comes_from_the_project_not_the_start_body` | Yes | Profile and licence set only by `PATCH` |
+
+### ComfyUI Extension Loading
+
+| Area | Status | Test | CI | Notes |
+|------|--------|------|----|-------|
+| `requirements.txt` matches `[project].dependencies` | Done | `test_comfyui_requirements.py` (3 tests) | Yes | ComfyUI installs this file, not `pyproject.toml` |
+| Every module-scope third-party import is declared | Done | `test_requirements_pin_every_module_scope_third_party_import` | Yes | Caught `jsonschema` |
+| `WEB_DIRECTORY` + sidebar registration | Done | `test_web_extension.py` (3 tests) | Yes | Structural |
+| Projects tab reachable on a fresh workspace | Done | `test_projects_view_renders_before_the_active_project_guard` | Yes | Found by loading in real ComfyUI |
+| Loaded by a real ComfyUI | Done | Manual, 2026-08-28 | No | ComfyUI 0.30.0 / frontend 1.47.11; sidebar tab, `/api/extensions`, HTTP round trip |
+
 ## v1.0 Scope — Not Included
 
 The following items are **out of scope** for v1.0 and remain in the Planned section:

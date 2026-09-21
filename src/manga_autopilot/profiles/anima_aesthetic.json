@@ -1,0 +1,40 @@
+{
+  "id": "anima_aesthetic",
+  "name": "Anima Aesthetic",
+  "description": "Aesthetic-leaning Anima settings. The model card advises dropping score_* tags for this mode, so score tags are stripped from both prompts.",
+  "assets": {
+    "unet": "silvermoonmixAnima_v23.safetensors",
+    "text_encoder": "qwen_3_06b_base.safetensors",
+    "vae": "qwen_image_vae.safetensors",
+    "loras": []
+  },
+  "generation": {
+    "steps": 32,
+    "cfg": 4.0,
+    "sampler": "er_sde",
+    "scheduler": "simple"
+  },
+  "resolution": {
+    "target_pixels": 1228800,
+    "multiple_of": 64,
+    "min_side": 512,
+    "max_side": 1536,
+    "default_aspect_width": 3.0,
+    "default_aspect_height": 4.0
+  },
+  "candidate_count": 1,
+  "technical_retry_count": 1,
+  "quality_retry_count": 0,
+  "quality_prefix": ["masterpiece", "best quality"],
+  "style_defaults": ["anime", "manga", "clean lineart"],
+  "negative_defaults": ["lowres", "jpeg artifacts", "signature", "username"],
+  "allow_score_tags": false,
+  "license": {
+    "name": "CircleStone Labs Non-Commercial License",
+    "url": "https://huggingface.co/circlestone-labs/Anima",
+    "requires_acknowledgement": true,
+    "allows_bundling": false,
+    "allows_auto_download": false,
+    "notes": "Non-commercial use only. The model card also notes additional NVIDIA derivative-model terms. Weights and LoRAs must be installed by the user; this project never bundles or downloads them."
+  }
+}

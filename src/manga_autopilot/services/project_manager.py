@@ -9,7 +9,6 @@ generation -- those are stitched in by dedicated services on top of it.
 
 from __future__ import annotations
 
-import json
 import re
 import uuid
 from collections.abc import Iterable
@@ -17,7 +16,15 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
-from manga_autopilot.models.project import Project
+from manga_autopilot.models.project import CURRENT_PROJECT_SCHEMA_VERSION, Project
+from manga_autopilot.services.project_migration import (
+    backup_project_document,
+    detect_schema_version,
+    migrate_document,
+    migrate_project_document,
+    read_project_document,
+    write_project_document,
+)
 from manga_autopilot.storage.paths import (
     PROJECTS_SUBDIR,
     ProjectPaths,
@@ -113,12 +120,31 @@ class ProjectManager:
         return project
 
     def _write(self, project: Project) -> None:
+        """Persist ``project`` without discarding fields this build does not model.
+
+        The on-disk document stays the authority for ``schema_version`` and
+        ``migration_history``: a caller holding a stale in-memory Project cannot
+        erase the migration audit trail by saving.
+        """
         paths = project_paths(self.storage_path, project.id)
+        target = paths.project_json
+
+        document: dict = {}
+        if target.exists():
+            existing = read_project_document(target)
+            if detect_schema_version(existing) < CURRENT_PROJECT_SCHEMA_VERSION:
+                backup_project_document(target)
+            document = migrate_document(existing).document
+
+        history = document.get("migration_history", [])
         payload = project.model_dump(mode="json")
-        paths.project_json.write_text(
-            json.dumps(payload, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
+        payload.pop("migration_history", None)
+        payload.pop("schema_version", None)
+
+        document.update(payload)
+        document["schema_version"] = CURRENT_PROJECT_SCHEMA_VERSION
+        document["migration_history"] = history
+        write_project_document(target, document)
 
     # ------------------------------------------------------------------- load
     def load(self, project_id: str) -> Project:
@@ -126,8 +152,8 @@ class ProjectManager:
         paths = project_paths(self.storage_path, project_id)
         if not paths.project_json.exists():
             raise ProjectNotFoundError(project_id)
-        data = json.loads(paths.project_json.read_text(encoding="utf-8"))
-        return Project.model_validate(data)
+        result = migrate_project_document(paths.project_json)
+        return Project.model_validate(result.document)
 
     def exists(self, project_id: str) -> bool:
         paths = project_paths(self.storage_path, project_id)

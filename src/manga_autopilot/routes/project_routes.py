@@ -133,6 +133,12 @@ async def patch_project(request: web.Request) -> web.Response:
         project.language = body["language"]
     if "status" in body and isinstance(body["status"], str):
         project.status = body["status"]
+    if "generation_profile_id" in body and isinstance(body["generation_profile_id"], str):
+        # Selecting an Anima profile is what turns on strict behaviour and the
+        # review gates, so it has to be patchable.
+        project.generation_profile_id = body["generation_profile_id"]
+    if "license_acknowledged" in body and isinstance(body["license_acknowledged"], bool):
+        project.license_acknowledged = body["license_acknowledged"]
     if "settings" in body and isinstance(body["settings"], dict):
         try:
             project.settings = project.settings.model_validate(body["settings"])
