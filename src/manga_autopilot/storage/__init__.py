@@ -31,10 +31,10 @@ from manga_autopilot.storage.migrations import (
     UnrecognizedDatabaseError,
     migrate_master_database,
     migrate_work_database,
-    validate_work_database,
     sqlite_constraint_check,
     sqlite_integrity_check,
     sqlite_post_migration_check,
+    validate_work_database,
 )
 from manga_autopilot.storage.paths import (
     ASSET_SUBDIRS,
