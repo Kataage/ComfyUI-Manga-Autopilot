@@ -30,6 +30,7 @@ from manga_autopilot.storage import (
     repository_read,
     repository_write,
     storage_paths,
+    validate_work_database,
     validate_work_id,
     work_paths,
     write_connection,
@@ -204,14 +205,6 @@ def _target_schema_version(migrations: Iterable[Migration]) -> int:
     return max(versions, default=0)
 
 
-def _read_database_schema_version(database_path: Path) -> int:
-    with repository_read(database_path) as connection:
-        row = connection.execute(
-            "SELECT MAX(version) AS version FROM schema_migrations"
-        ).fetchone()
-    return int(row["version"] or 0)
-
-
 def _live_manifest(
     *,
     work_id: str,
@@ -294,14 +287,18 @@ def inspect_work_directory(
     )
 
     work_id = str(manifest["work_id"])
+    database_validation = validate_work_database(
+        database_path,
+        migrations=migration_set,
+    )
+    database_schema_version = database_validation.current_version
+
     identity = read_work_identity(database_path)
     if identity.work_id != work_id:
         raise WorkIdentityMismatchError(
             f"Work DB identity mismatch: manifest={work_id!r}, "
             f"database={identity.work_id!r}"
         )
-
-    database_schema_version = _read_database_schema_version(database_path)
     manifest_schema_version = int(manifest["work_schema_version"])
     if manifest_schema_version > database_schema_version:
         raise WorkManifestError(

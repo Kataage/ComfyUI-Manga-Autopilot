@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import sqlite3
 from pathlib import Path
 
 import pytest
@@ -593,6 +594,115 @@ def test_recovery_scan_reports_invalid_staging_without_deleting_it(
     assert finding.diagnostics
     assert staging.is_dir()
     assert evidence.read_text(encoding="utf-8") == "keep recovery evidence"
+
+
+@pytest.mark.parametrize(
+    ("recovery_shape", "expected_kind"),
+    [
+        ("staging", "STALE_STAGING_INVALID"),
+        ("orphan", "UNREGISTERED_WORK_INVALID"),
+    ],
+)
+@pytest.mark.parametrize(
+    ("damage_kind", "diagnostic_fragment"),
+    [
+        ("migration_drift", "MigrationDriftError"),
+        ("foreign_key", "foreign_key_check failed"),
+        ("sqlite_corruption", "not a readable SQLite database"),
+    ],
+)
+def test_recovery_rejects_database_damage_normal_open_would_reject(
+    tmp_path: Path,
+    recovery_shape: str,
+    expected_kind: str,
+    damage_kind: str,
+    diagnostic_fragment: str,
+) -> None:
+    repository = WorkLifecycleRepository(tmp_path)
+    work_id = f"work_{recovery_shape}_{damage_kind}"
+    created = repository.create_work(work_id=work_id, title="Damaged Recovery")
+
+    with repository_write(repository.paths.master_db) as connection:
+        connection.execute(
+            "DELETE FROM work_catalog WHERE work_id = ?",
+            (work_id,),
+        )
+
+    if recovery_shape == "staging":
+        recovery_root = tmp_path / "works" / f".creating-{work_id}"
+        os.replace(created.root, recovery_root)
+    else:
+        recovery_root = created.root
+
+    database = recovery_root / "work.sqlite3"
+    if damage_kind == "migration_drift":
+        with repository_write(database) as connection:
+            connection.execute(
+                """
+                UPDATE schema_migrations
+                SET checksum = 'tampered-checksum'
+                WHERE version = (SELECT MAX(version) FROM schema_migrations)
+                """
+            )
+    elif damage_kind == "foreign_key":
+        connection = sqlite3.connect(database)
+        try:
+            connection.execute("PRAGMA foreign_keys = OFF")
+            connection.execute(
+                """
+                INSERT INTO entity_revisions (
+                    id,
+                    entity_type,
+                    entity_id,
+                    entity_revision,
+                    commit_seq,
+                    change_kind,
+                    created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    "revision_corrupt",
+                    "test",
+                    "entity_corrupt",
+                    1,
+                    999999,
+                    "corrupt",
+                    "2026-09-20T00:00:00+00:00",
+                ),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+    else:
+        for suffix in ("-wal", "-shm"):
+            sidecar = database.with_name(database.name + suffix)
+            if sidecar.exists():
+                sidecar.unlink()
+        database.write_bytes(b"not a sqlite database")
+
+    database_bytes_before_scan = database.read_bytes()
+
+    findings = repository.scan_recovery()
+
+    assert len(findings) == 1
+    finding = findings[0]
+    assert finding.kind == expected_kind
+    assert finding.work_id == work_id
+    assert finding.valid is False
+    assert diagnostic_fragment in " ".join(finding.diagnostics)
+    assert database.read_bytes() == database_bytes_before_scan
+
+    if recovery_shape == "staging":
+        assert finding.recommended_action == "quarantine"
+        with pytest.raises(WorkRecoveryError, match="cannot finalize invalid staging"):
+            repository.finalize_staging_work(work_id)
+        assert recovery_root.is_dir()
+    else:
+        assert finding.recommended_action is None
+        with pytest.raises(WorkRecoveryError, match="cannot register invalid orphan"):
+            repository.reconcile_orphan_work(work_id)
+        assert recovery_root.is_dir()
 
 
 def test_quarantine_invalid_staging_preserves_evidence_and_is_idempotent_for_scan(
