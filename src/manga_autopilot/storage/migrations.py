@@ -494,6 +494,22 @@ class MigrationRunner:
         self.fresh_initializer = fresh_initializer
         _validate_migration_sequence(self.migrations)
 
+    def validate_existing(self, database_path: str | Path) -> MigrationResult:
+        """Validate one existing recognized database without mutating it."""
+        path = _migration_database_path(database_path)
+        if not _existing_nonempty_database(path):
+            raise UnrecognizedDatabaseError(
+                f"existing {self.database_kind} database is missing or empty: {path}"
+            )
+
+        applied = self._validate_existing_database(path)
+        return MigrationResult(
+            database_kind=self.database_kind,
+            current_version=max(applied, default=0),
+            applied_versions=(),
+            backup_path=None,
+        )
+
     def migrate(self, database_path: str | Path) -> MigrationResult:
         """Migrate a database using backup-first, all-or-nothing semantics."""
         path = _migration_database_path(database_path)
@@ -537,7 +553,7 @@ class MigrationRunner:
     def _migrate_in_place(self, path: Path) -> MigrationResult:
         existed = _existing_nonempty_database(path)
 
-        applied = self._inspect_existing_database(path) if existed else {}
+        applied = self._validate_existing_database(path) if existed else {}
         pending = tuple(
             migration
             for migration in self.migrations
@@ -545,11 +561,6 @@ class MigrationRunner:
         )
 
         if not pending:
-            if existed:
-                with read_connection(path) as connection:
-                    if self.pre_integrity_check is not None:
-                        self.pre_integrity_check(connection)
-                    sqlite_constraint_check(connection)
             return MigrationResult(
                 database_kind=self.database_kind,
                 current_version=max(applied, default=0),
@@ -624,6 +635,23 @@ class MigrationRunner:
             applied_versions=tuple(m.version for m in pending),
             backup_path=backup_path,
         )
+
+    def _validate_existing_database(
+        self,
+        path: Path,
+    ) -> dict[int, AppliedMigration]:
+        """Validate history, identity, integrity, and constraints read-only."""
+        applied = self._inspect_existing_database(path)
+        try:
+            with read_connection(path) as connection:
+                if self.pre_integrity_check is not None:
+                    self.pre_integrity_check(connection)
+                sqlite_constraint_check(connection)
+        except sqlite3.DatabaseError as exc:
+            raise MigrationIntegrityError(
+                f"SQLite validation failed for {path}: {exc}"
+            ) from exc
+        return applied
 
     def _inspect_existing_database(
         self,
@@ -861,42 +889,16 @@ def migrate_master_database(
     ).migrate(path)
 
 
-def migrate_work_database(
-    database_path: str | Path,
+def _work_migration_runner(
     *,
-    migrations: Iterable[Migration] = WORK_MIGRATIONS,
-    app_version: str | None = None,
-    work_id: str | None = None,
-    database_id: str | None = None,
-    created_at: str | None = None,
-    pre_integrity_check: IntegrityHook | None = sqlite_integrity_check,
-    post_integrity_check: IntegrityHook | None = sqlite_post_migration_check,
-) -> MigrationResult:
-    """Migrate a Work DB and atomically initialize identity when it is fresh."""
-    path = _migration_database_path(database_path)
-    fresh = not _existing_nonempty_database(path)
-    if fresh and (work_id is None or not work_id.strip()):
-        raise ValueError("work_id is required when migrating a fresh Work database")
-
-    initial_database_id = database_id or _new_database_id("workdb")
-    initial_created_at = created_at or _utc_now_iso()
-
-    def initialize_identity(connection: sqlite3.Connection) -> None:
-        assert work_id is not None
-        connection.executemany(
-            """
-            INSERT INTO work_database_metadata (key, value)
-            VALUES (?, ?)
-            """,
-            (
-                ("database_kind", "work"),
-                ("database_id", initial_database_id),
-                ("format_version", "2"),
-                ("work_id", work_id),
-                ("created_at", initial_created_at),
-            ),
-        )
-
+    migrations: Iterable[Migration],
+    app_version: str | None,
+    work_id: str | None,
+    pre_integrity_check: IntegrityHook | None,
+    post_integrity_check: IntegrityHook | None,
+    fresh_initializer: InitializationHook | None,
+) -> MigrationRunner:
+    """Build the canonical Work migration/validation policy."""
     return MigrationRunner(
         database_kind="work",
         migrations=migrations,
@@ -917,6 +919,78 @@ def migrate_work_database(
             **({"work_id": work_id} if work_id is not None else {}),
         },
         identity_migration_version=2,
+        fresh_initializer=fresh_initializer,
+    )
+
+
+def validate_work_database(
+    database_path: str | Path,
+    *,
+    migrations: Iterable[Migration] = WORK_MIGRATIONS,
+    work_id: str | None = None,
+    pre_integrity_check: IntegrityHook | None = sqlite_integrity_check,
+) -> MigrationResult:
+    """Validate an existing Work DB with the same policy used by normal open.
+
+    This path is strictly read-only: it validates recognized migration history
+    (including checksums and prefix ordering), database identity, SQLite
+    integrity, and persisted foreign-key constraints without applying pending
+    migrations or creating migration metadata.
+    """
+    migration_set = tuple(migrations)
+    return _work_migration_runner(
+        migrations=migration_set,
+        app_version=None,
+        work_id=work_id,
+        pre_integrity_check=pre_integrity_check,
+        post_integrity_check=sqlite_post_migration_check,
+        fresh_initializer=None,
+    ).validate_existing(database_path)
+
+
+def migrate_work_database(
+    database_path: str | Path,
+    *,
+    migrations: Iterable[Migration] = WORK_MIGRATIONS,
+    app_version: str | None = None,
+    work_id: str | None = None,
+    database_id: str | None = None,
+    created_at: str | None = None,
+    pre_integrity_check: IntegrityHook | None = sqlite_integrity_check,
+    post_integrity_check: IntegrityHook | None = sqlite_post_migration_check,
+) -> MigrationResult:
+    """Migrate a Work DB and atomically initialize identity when it is fresh."""
+    path = _migration_database_path(database_path)
+    fresh = not _existing_nonempty_database(path)
+    if fresh and (work_id is None or not work_id.strip()):
+        raise ValueError("work_id is required when migrating a fresh Work database")
+
+    migration_set = tuple(migrations)
+    initial_database_id = database_id or _new_database_id("workdb")
+    initial_created_at = created_at or _utc_now_iso()
+
+    def initialize_identity(connection: sqlite3.Connection) -> None:
+        assert work_id is not None
+        connection.executemany(
+            """
+            INSERT INTO work_database_metadata (key, value)
+            VALUES (?, ?)
+            """,
+            (
+                ("database_kind", "work"),
+                ("database_id", initial_database_id),
+                ("format_version", "2"),
+                ("work_id", work_id),
+                ("created_at", initial_created_at),
+            ),
+        )
+
+    return _work_migration_runner(
+        migrations=migration_set,
+        app_version=app_version,
+        work_id=work_id,
+        pre_integrity_check=pre_integrity_check,
+        post_integrity_check=post_integrity_check,
         fresh_initializer=initialize_identity if fresh else None,
     ).migrate(path)
 
@@ -943,6 +1017,7 @@ __all__ = [
     "UnrecognizedDatabaseError",
     "migrate_master_database",
     "migrate_work_database",
+    "validate_work_database",
     "sqlite_constraint_check",
     "sqlite_integrity_check",
     "sqlite_post_migration_check",
