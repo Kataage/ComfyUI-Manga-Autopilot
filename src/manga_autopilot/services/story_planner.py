@@ -11,6 +11,7 @@ from typing import Any
 from manga_autopilot.models.story import Act, StoryPlan
 from manga_autopilot.services.json_schema_validator import validate_llm_output
 from manga_autopilot.services.llm_provider import LLMProvider
+from manga_autopilot.services.semantic_validation import validate_page_sequence
 
 log = logging.getLogger(__name__)
 
@@ -24,6 +25,27 @@ STORY_PLAN_SCHEMA: dict[str, Any] = {
         "theme": {"type": "string"},
         "genre": {"type": "string"},
         "mood": {"type": "string"},
+        "storyBible": {
+            "type": "object",
+            "properties": {
+                "title": {"type": "string"},
+                "genre": {"type": "string"},
+                "tone": {"type": "string"},
+                "theme": {"type": "string"},
+                "world": {"type": "string"},
+                "rules": {"type": "array", "items": {"type": "string"}},
+                "timeline": {"type": "array", "items": {"type": "string"}},
+                "locations": {"type": "object", "additionalProperties": {"type": "string"}},
+                "important_objects": {
+                    "type": "object",
+                    "additionalProperties": {"type": "string"},
+                },
+                "relationships": {"type": "array", "items": {"type": "string"}},
+                "foreshadowing": {"type": "array", "items": {"type": "string"}},
+                "resolved_events": {"type": "array", "items": {"type": "string"}},
+                "unresolved_events": {"type": "array", "items": {"type": "string"}},
+            },
+        },
         "acts": {
             "type": "array",
             "items": {
@@ -50,6 +72,7 @@ STORY_PLAN_SCHEMA: dict[str, Any] = {
                     "emotionalGoal": {"type": "string"},
                     "visualGoal": {"type": "string"},
                     "panelCount": {"type": "integer"},
+                    "layoutId": {"type": "string"},
                     "cliffhanger": {"type": "string"},
                 },
             },
@@ -67,12 +90,22 @@ PROMPT_TEMPLATE = """あなたは漫画原作者です。
 - 言語: {language}
 - ジャンル: {genre}
 - 1ページごとに summary, emotionalGoal, visualGoal, panelCount を含める
+- storyBible に世界、ルール、場所、重要物、関係、伏線、解決済み・未解決イベントを含める
 - セリフは短くする
 - 各ページの目的が重複しないようにする
 - 最終ページには読後感または次への引きを入れる
-
+{layout_rules}
 企画:
 {idea}
+"""
+
+#: Appended when the caller knows which layouts exist. Without it the planner
+#: has no way to know the vocabulary and invents ids like "standard_linear",
+#: which strict validation then rejects - correctly, but only after a full
+#: planning round trip has been paid for.
+LAYOUT_RULES_TEMPLATE = """- layoutId は次の登録済みレイアウトからのみ選ぶ。panelCount は選んだレイアウトのコマ数と一致させる:
+{layout_lines}
+- 上のどれとも合わない場合は layoutId を省略する（自動で等分割グリッドが割り当てられる）
 """
 
 
@@ -83,6 +116,9 @@ class StoryPlanner:
     language: str = "ja"
     genre: str = "fantasy"
     max_repair_attempts: int = 1
+    strict: bool = False
+    layouts: list[dict[str, Any]] = field(default_factory=list)
+    """Registered page layouts, as ``{"layout_id": ..., "panel_count": ...}``."""
     system_prompt: str = (
         "You are a meticulous manga story planner. Always respond with strict JSON only."
     )
@@ -94,16 +130,47 @@ class StoryPlanner:
             page_count=self.page_count,
             language=self.language,
             genre=self.genre,
+            layout_rules=self._layout_rules(),
             idea=idea,
         )
 
+    def _layout_rules(self) -> str:
+        """Describe the registered layouts, so the planner picks from them.
+
+        Strict planning rejects an unregistered ``layoutId``. Telling the model
+        the vocabulary up front is cheaper than discovering it through a failed
+        validation, and much cheaper than a run that plans nothing.
+        """
+        if not self.layouts:
+            return ""
+        lines = chr(10).join(
+            f"  - {item['layout_id']} ({item['panel_count']}コマ)" for item in self.layouts
+        )
+        return LAYOUT_RULES_TEMPLATE.format(layout_lines=lines)
+
     async def plan(self, idea: str) -> StoryPlan:
         prompt = self.build_prompt(idea)
+        validation_options: dict[str, Any] = {}
+        if self.strict:
+            def _validate_semantics(data: dict[str, Any]) -> list[str]:
+                messages = [
+                    f"{issue.path}: {issue.message}"
+                    for issue in validate_page_sequence(
+                        data.get("pages", []),
+                        self.page_count,
+                    )
+                ]
+                if "storyBible" not in data:
+                    messages.append("/storyBible: Story Bible is required in strict mode")
+                return messages
+
+            validation_options["semantic_validator"] = _validate_semantics
         data = await self.provider.complete_json(
             prompt,
             schema=STORY_PLAN_SCHEMA,
             system=self.system_prompt,
             max_repair_attempts=self.max_repair_attempts,
+            **validation_options,
         )
         return self._to_model(data, idea)
 
@@ -122,6 +189,7 @@ class StoryPlanner:
             theme=data.get("theme", ""),
             genre=data.get("genre", self.genre),
             mood=data.get("mood", ""),
+            story_bible=data.get("storyBible") or {},
             acts=acts,
             pages=pages,
         )
@@ -151,6 +219,7 @@ class StoryPlanner:
                     visual_goal=item.get("visualGoal", ""),
                     panel_count=max(1, int(item.get("panelCount", 1))),
                     cliffhanger=item.get("cliffhanger"),
+                    layout_id=item.get("layoutId"),
                 )
             )
         return out

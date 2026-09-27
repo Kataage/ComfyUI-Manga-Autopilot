@@ -17,12 +17,22 @@ GenderExpression = Literal["masculine", "feminine", "androgynous", "ambiguous", 
 
 
 class AssetRef(BaseModel):
-    """Reference to a project asset (image / video / audio)."""
+    """Reference to a project asset (image / video / audio).
+
+    ``path`` is stored project-relative and POSIX-separated so a project
+    directory written on Windows still resolves after being copied to another
+    machine. Callers may pass a native path; it is normalised here.
+    """
 
     asset_id: str = Field(min_length=1, max_length=128)
     kind: Literal["image", "video", "audio"] = "image"
     path: str = Field(min_length=1, max_length=512)
     label: str = Field(default="", max_length=128)
+
+    @field_validator("path")
+    @classmethod
+    def _posix_path(cls, value: str) -> str:
+        return value.replace("\\", "/")
 
 
 class LoraRef(BaseModel):

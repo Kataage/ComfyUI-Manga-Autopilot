@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from pydantic import BaseModel, Field
 
+from manga_autopilot.models.bible import StoryBible
 from manga_autopilot.models.page import PagePlan
 
 
@@ -22,6 +23,7 @@ class StoryPlan(BaseModel):
     theme: str = Field(default="", max_length=256)
     genre: str = Field(default="", max_length=128)
     mood: str = Field(default="", max_length=128)
+    story_bible: StoryBible = Field(default_factory=StoryBible)
     acts: list[Act] = Field(default_factory=list)
     pages: list[PagePlan] = Field(default_factory=list)
 

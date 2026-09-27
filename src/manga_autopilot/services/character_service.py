@@ -245,7 +245,7 @@ class CharacterService:
         asset_ref = AssetRef(
             asset_id=target.stem,
             kind=kind,
-            path=str(target.relative_to(self.project_root)),
+            path=target.relative_to(self.project_root).as_posix(),
             label=label or target.stem,
         )
         new_refs = list(char.reference_images) + [asset_ref]
