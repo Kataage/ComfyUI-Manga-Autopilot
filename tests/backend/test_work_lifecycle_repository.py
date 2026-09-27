@@ -455,6 +455,27 @@ def test_failed_work_upgrade_does_not_expose_partially_upgraded_work(
     assert backup.is_file()
 
 
+def test_open_wraps_migration_drift_as_work_upgrade_error(
+    tmp_path: Path,
+) -> None:
+    repository = WorkLifecycleRepository(tmp_path)
+    created = repository.create_work(work_id="work_001", title="Drifted Work")
+
+    with repository_write(created.database_path) as connection:
+        connection.execute(
+            """
+            UPDATE schema_migrations
+            SET checksum = 'tampered-checksum'
+            WHERE version = (SELECT MAX(version) FROM schema_migrations)
+            """
+        )
+
+    with pytest.raises(WorkUpgradeError, match="failed to upgrade Work") as exc_info:
+        repository.open_work("work_001")
+
+    assert "drift detected" in str(exc_info.value)
+
+
 def test_legacy_v1_live_manifest_is_normalized_without_hash_enforcement(
     tmp_path: Path,
 ) -> None:
