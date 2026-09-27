@@ -494,15 +494,32 @@ class MigrationRunner:
         self.fresh_initializer = fresh_initializer
         _validate_migration_sequence(self.migrations)
 
-    def validate_existing(self, database_path: str | Path) -> MigrationResult:
-        """Validate one existing recognized database without mutating it."""
+    def inspect_existing(self, database_path: str | Path) -> MigrationResult:
+        """Inspect recognized migration history and identity without health scans."""
         path = _migration_database_path(database_path)
         if not _existing_nonempty_database(path):
             raise UnrecognizedDatabaseError(
                 f"existing {self.database_kind} database is missing or empty: {path}"
             )
 
-        applied = self._validate_existing_database(path)
+        applied = self._inspect_existing_database(path)
+        return MigrationResult(
+            database_kind=self.database_kind,
+            current_version=max(applied, default=0),
+            applied_versions=(),
+            backup_path=None,
+        )
+
+    def validate_existing(self, database_path: str | Path) -> MigrationResult:
+        """Fully validate one existing recognized database without mutating it."""
+        path = _migration_database_path(database_path)
+        if not _existing_nonempty_database(path):
+            raise UnrecognizedDatabaseError(
+                f"existing {self.database_kind} database is missing or empty: {path}"
+            )
+
+        applied = self._inspect_existing_database(path)
+        self._validate_existing_sqlite(path)
         return MigrationResult(
             database_kind=self.database_kind,
             current_version=max(applied, default=0),
@@ -553,7 +570,7 @@ class MigrationRunner:
     def _migrate_in_place(self, path: Path) -> MigrationResult:
         existed = _existing_nonempty_database(path)
 
-        applied = self._validate_existing_database(path) if existed else {}
+        applied = self._inspect_existing_database(path) if existed else {}
         pending = tuple(
             migration
             for migration in self.migrations
@@ -561,6 +578,8 @@ class MigrationRunner:
         )
 
         if not pending:
+            if existed:
+                self._validate_existing_sqlite(path)
             return MigrationResult(
                 database_kind=self.database_kind,
                 current_version=max(applied, default=0),
@@ -636,12 +655,8 @@ class MigrationRunner:
             backup_path=backup_path,
         )
 
-    def _validate_existing_database(
-        self,
-        path: Path,
-    ) -> dict[int, AppliedMigration]:
-        """Validate history, identity, integrity, and constraints read-only."""
-        applied = self._inspect_existing_database(path)
+    def _validate_existing_sqlite(self, path: Path) -> None:
+        """Validate existing SQLite integrity and persisted constraints read-only."""
         try:
             with read_connection(path) as connection:
                 if self.pre_integrity_check is not None:
@@ -651,7 +666,6 @@ class MigrationRunner:
             raise MigrationIntegrityError(
                 f"SQLite validation failed for {path}: {exc}"
             ) from exc
-        return applied
 
     def _inspect_existing_database(
         self,
@@ -923,6 +937,24 @@ def _work_migration_runner(
     )
 
 
+def inspect_work_database(
+    database_path: str | Path,
+    *,
+    migrations: Iterable[Migration] = WORK_MIGRATIONS,
+    work_id: str | None = None,
+) -> MigrationResult:
+    """Inspect Work migration history and identity without full SQLite health scans."""
+    migration_set = tuple(migrations)
+    return _work_migration_runner(
+        migrations=migration_set,
+        app_version=None,
+        work_id=work_id,
+        pre_integrity_check=None,
+        post_integrity_check=None,
+        fresh_initializer=None,
+    ).inspect_existing(database_path)
+
+
 def validate_work_database(
     database_path: str | Path,
     *,
@@ -1015,6 +1047,7 @@ __all__ = [
     "MigrationValidationError",
     "UnknownAppliedMigrationError",
     "UnrecognizedDatabaseError",
+    "inspect_work_database",
     "migrate_master_database",
     "migrate_work_database",
     "validate_work_database",
