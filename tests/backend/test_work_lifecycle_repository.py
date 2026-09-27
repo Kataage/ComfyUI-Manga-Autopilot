@@ -46,6 +46,14 @@ def _future_work_migration(*, broken: bool = False) -> tuple[Migration, ...]:
     )
 
 
+def _recovery_tree_snapshot(root: Path) -> dict[str, bytes]:
+    return {
+        path.relative_to(root).as_posix(): path.read_bytes()
+        for path in root.rglob("*")
+        if path.is_file() and not path.is_symlink()
+    }
+
+
 def test_create_open_list_and_reopen_work(tmp_path: Path) -> None:
     repository = WorkLifecycleRepository(tmp_path, app_version="test")
 
@@ -548,8 +556,11 @@ def test_recovery_scan_detects_and_finalizes_complete_stale_staging(
             "DELETE FROM work_catalog WHERE work_id = 'work_staged'"
         )
 
+    recovery_tree_before_scan = _recovery_tree_snapshot(staging)
+
     findings = repository.scan_recovery()
 
+    assert _recovery_tree_snapshot(staging) == recovery_tree_before_scan
     assert len(findings) == 1
     finding = findings[0]
     assert finding.kind == "STALE_STAGING_VALID"
@@ -607,6 +618,7 @@ def test_recovery_scan_reports_invalid_staging_without_deleting_it(
     ("damage_kind", "diagnostic_fragment"),
     [
         ("migration_drift", "MigrationDriftError"),
+        ("non_prefix_history", "ordered configured prefix"),
         ("foreign_key", "foreign_key_check failed"),
         ("sqlite_corruption", "not a readable SQLite database"),
     ],
@@ -643,6 +655,12 @@ def test_recovery_rejects_database_damage_normal_open_would_reject(
                 SET checksum = 'tampered-checksum'
                 WHERE version = (SELECT MAX(version) FROM schema_migrations)
                 """
+            )
+    elif damage_kind == "non_prefix_history":
+        with repository_write(database) as connection:
+            connection.execute(
+                "DELETE FROM schema_migrations WHERE version = ?",
+                (WORK_MIGRATIONS[0].version,),
             )
     elif damage_kind == "foreign_key":
         connection = sqlite3.connect(database)
@@ -681,17 +699,17 @@ def test_recovery_rejects_database_damage_normal_open_would_reject(
                 sidecar.unlink()
         database.write_bytes(b"not a sqlite database")
 
-    database_bytes_before_scan = database.read_bytes()
+    recovery_tree_before_scan = _recovery_tree_snapshot(recovery_root)
 
     findings = repository.scan_recovery()
 
+    assert _recovery_tree_snapshot(recovery_root) == recovery_tree_before_scan
     assert len(findings) == 1
     finding = findings[0]
     assert finding.kind == expected_kind
     assert finding.work_id == work_id
     assert finding.valid is False
     assert diagnostic_fragment in " ".join(finding.diagnostics)
-    assert database.read_bytes() == database_bytes_before_scan
 
     if recovery_shape == "staging":
         assert finding.recommended_action == "quarantine"
