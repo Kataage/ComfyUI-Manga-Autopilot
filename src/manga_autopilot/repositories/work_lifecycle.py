@@ -5,10 +5,12 @@ from __future__ import annotations
 import json
 import os
 import shutil
-from collections.abc import Iterable
+from collections.abc import Iterable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from typing import Any
 
 from manga_autopilot.primitives import new_id, sha256_file
@@ -25,11 +27,13 @@ from manga_autopilot.storage import (
     bootstrap_work_database,
     create_work_commit,
     ensure_storage_root,
+    inspect_work_database,
     migrate_work_database,
     read_work_identity,
     repository_read,
     repository_write,
     storage_paths,
+    validate_work_database,
     validate_work_id,
     work_paths,
     write_connection,
@@ -204,14 +208,6 @@ def _target_schema_version(migrations: Iterable[Migration]) -> int:
     return max(versions, default=0)
 
 
-def _read_database_schema_version(database_path: Path) -> int:
-    with repository_read(database_path) as connection:
-        row = connection.execute(
-            "SELECT MAX(version) AS version FROM schema_migrations"
-        ).fetchone()
-    return int(row["version"] or 0)
-
-
 def _live_manifest(
     *,
     work_id: str,
@@ -263,6 +259,46 @@ def _validate_manifest(
         raise WorkManifestError(str(exc)) from exc
 
 
+@contextmanager
+def _recovery_validation_snapshot(root: Path) -> Iterator[Path]:
+    """Copy recovery-critical SQLite inputs so scanning cannot mutate evidence."""
+    manifest_path = root / "manifest.json"
+    database_path = root / "work.sqlite3"
+
+    assert_managed_regular_file(
+        manifest_path,
+        containment_root=root,
+        field_name="Work manifest",
+    )
+    assert_managed_regular_file(
+        database_path,
+        containment_root=root,
+        field_name="Work database",
+    )
+
+    with TemporaryDirectory(prefix="manga-autopilot-recovery-") as temp_dir:
+        snapshot_root = Path(temp_dir) / root.name
+        snapshot_root.mkdir()
+        shutil.copy2(manifest_path, snapshot_root / manifest_path.name)
+        shutil.copy2(database_path, snapshot_root / database_path.name)
+
+        # Copy durable SQLite sidecars that may contain authoritative committed
+        # state. The WAL index (-shm) is transient and is rebuilt in the
+        # writable temporary snapshot rather than copied from recovery evidence.
+        for suffix in ("-wal", "-journal"):
+            source = database_path.with_name(database_path.name + suffix)
+            if not source.exists() and not source.is_symlink():
+                continue
+            assert_managed_regular_file(
+                source,
+                containment_root=root,
+                field_name=f"Work database sidecar {suffix}",
+            )
+            shutil.copy2(source, snapshot_root / source.name)
+
+        yield snapshot_root
+
+
 def inspect_work_directory(
     work_root: str | Path,
     *,
@@ -294,14 +330,18 @@ def inspect_work_directory(
     )
 
     work_id = str(manifest["work_id"])
+    database_inspection = inspect_work_database(
+        database_path,
+        migrations=migration_set,
+    )
+    database_schema_version = database_inspection.current_version
+
     identity = read_work_identity(database_path)
     if identity.work_id != work_id:
         raise WorkIdentityMismatchError(
             f"Work DB identity mismatch: manifest={work_id!r}, "
             f"database={identity.work_id!r}"
         )
-
-    database_schema_version = _read_database_schema_version(database_path)
     manifest_schema_version = int(manifest["work_schema_version"])
     if manifest_schema_version > database_schema_version:
         raise WorkManifestError(
@@ -538,11 +578,16 @@ class WorkLifecycleRepository:
 
         catalog = _catalog_entry(row)
         root = self._resolve_catalog_path(catalog.relative_work_path)
-        inspection = inspect_work_directory(
-            root,
-            migrations=self.work_migrations,
-            expected_work_id=work_id,
-        )
+        try:
+            inspection = inspect_work_directory(
+                root,
+                migrations=self.work_migrations,
+                expected_work_id=work_id,
+            )
+        except MigrationError as exc:
+            raise WorkUpgradeError(
+                f"failed to upgrade Work {work_id!r} before open: {exc}"
+            ) from exc
         if inspection.work_id != work_id:
             raise WorkIdentityMismatchError(
                 f"portable Work identity mismatch: catalog={work_id!r}, "
@@ -893,23 +938,33 @@ class WorkLifecycleRepository:
         if not root.is_dir():
             return False, (f"recovery entry is not a directory: {root}",)
 
+        snapshot_root: Path | None = None
         try:
-            inspection = inspect_work_directory(
-                root,
-                migrations=self.work_migrations,
-                expected_work_id=expected_work_id,
-            )
-            with repository_read(inspection.database_path) as connection:
-                metadata = connection.execute(
-                    "SELECT work_id FROM work_metadata WHERE work_id = ?",
-                    (inspection.work_id,),
-                ).fetchone()
-            if metadata is None:
-                diagnostics.append(
-                    f"work_metadata row is missing for {inspection.work_id!r}"
+            with _recovery_validation_snapshot(root) as snapshot_root:
+                inspection = inspect_work_directory(
+                    snapshot_root,
+                    migrations=self.work_migrations,
+                    expected_work_id=expected_work_id,
                 )
+                validate_work_database(
+                    inspection.database_path,
+                    migrations=self.work_migrations,
+                    work_id=inspection.work_id,
+                )
+                with repository_read(inspection.database_path) as connection:
+                    metadata = connection.execute(
+                        "SELECT work_id FROM work_metadata WHERE work_id = ?",
+                        (inspection.work_id,),
+                    ).fetchone()
+                if metadata is None:
+                    diagnostics.append(
+                        f"work_metadata row is missing for {inspection.work_id!r}"
+                    )
         except Exception as exc:
-            diagnostics.append(f"{type(exc).__name__}: {exc}")
+            message = str(exc)
+            if snapshot_root is not None:
+                message = message.replace(str(snapshot_root), str(root))
+            diagnostics.append(f"{type(exc).__name__}: {message}")
 
         return not diagnostics, tuple(diagnostics)
 

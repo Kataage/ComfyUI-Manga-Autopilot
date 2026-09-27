@@ -27,11 +27,13 @@ from manga_autopilot.storage import (
     UnsafeStoragePathError,
     bootstrap_master_database,
     bootstrap_work_database,
+    inspect_work_database,
     migrate_master_database,
     migrate_work_database,
     read_connection,
     read_master_identity,
     read_work_identity,
+    validate_work_database,
     write_connection,
 )
 
@@ -375,6 +377,125 @@ def test_master_and_work_versions_can_advance_independently(tmp_path: Path) -> N
 
     assert master_result.current_version == next_version
     assert work_result.current_version == WORK_MIGRATIONS[-1].version
+
+
+def test_work_inspection_is_structural_while_full_validation_checks_constraints(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "work.sqlite3"
+    bootstrap_work_database(database, work_id="work_001")
+
+    raw = sqlite3.connect(database)
+    try:
+        raw.execute("PRAGMA foreign_keys = OFF")
+        raw.execute(
+            """
+            INSERT INTO entity_revisions (
+                id,
+                entity_type,
+                entity_id,
+                entity_revision,
+                commit_seq,
+                change_kind,
+                created_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "revision_orphan",
+                "test",
+                "entity_orphan",
+                1,
+                999999,
+                "corrupt",
+                "2026-09-20T00:00:00+00:00",
+            ),
+        )
+        raw.commit()
+    finally:
+        raw.close()
+
+    inspected = inspect_work_database(database, work_id="work_001")
+
+    assert inspected.current_version == WORK_MIGRATIONS[-1].version
+    with pytest.raises(MigrationIntegrityError, match="foreign_key_check failed"):
+        validate_work_database(database, work_id="work_001")
+
+
+def test_pending_work_migration_can_repair_existing_foreign_key_violation(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "work.sqlite3"
+    bootstrap_work_database(database, work_id="work_001")
+
+    raw = sqlite3.connect(database)
+    try:
+        raw.execute("PRAGMA foreign_keys = OFF")
+        raw.execute(
+            """
+            INSERT INTO entity_revisions (
+                id,
+                entity_type,
+                entity_id,
+                entity_revision,
+                commit_seq,
+                change_kind,
+                created_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "revision_repairable",
+                "test",
+                "entity_repairable",
+                1,
+                999999,
+                "corrupt",
+                "2026-09-20T00:00:00+00:00",
+            ),
+        )
+        raw.commit()
+    finally:
+        raw.close()
+
+    next_version = WORK_MIGRATIONS[-1].version + 1
+    migrations = (
+        *WORK_MIGRATIONS,
+        Migration(
+            version=next_version,
+            name=f"W{next_version:04d}_repair_foreign_key",
+            statements=(
+                """
+                INSERT INTO commits (
+                    commit_seq,
+                    commit_id,
+                    actor_type,
+                    operation_type,
+                    created_at
+                )
+                VALUES (
+                    999999,
+                    'commit_repair_foreign_key',
+                    'system',
+                    'repair_foreign_key',
+                    '2026-09-20T00:00:00+00:00'
+                )
+                """,
+            ),
+        ),
+    )
+
+    result = migrate_work_database(
+        database,
+        migrations=migrations,
+        work_id="work_001",
+    )
+
+    assert result.current_version == next_version
+    assert result.applied_versions == (next_version,)
+    assert result.backup_path is not None
+    with read_connection(database) as connection:
+        assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
 
 
 def test_pre_and_post_integrity_hooks_are_called_for_fresh_database(

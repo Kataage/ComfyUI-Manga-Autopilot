@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import sqlite3
 from pathlib import Path
 
 import pytest
@@ -43,6 +44,14 @@ def _future_work_migration(*, broken: bool = False) -> tuple[Migration, ...]:
             statements=statements,
         ),
     )
+
+
+def _recovery_tree_snapshot(root: Path) -> dict[str, bytes]:
+    return {
+        path.relative_to(root).as_posix(): path.read_bytes()
+        for path in root.rglob("*")
+        if path.is_file() and not path.is_symlink()
+    }
 
 
 def test_create_open_list_and_reopen_work(tmp_path: Path) -> None:
@@ -446,6 +455,27 @@ def test_failed_work_upgrade_does_not_expose_partially_upgraded_work(
     assert backup.is_file()
 
 
+def test_open_wraps_migration_drift_as_work_upgrade_error(
+    tmp_path: Path,
+) -> None:
+    repository = WorkLifecycleRepository(tmp_path)
+    created = repository.create_work(work_id="work_001", title="Drifted Work")
+
+    with repository_write(created.database_path) as connection:
+        connection.execute(
+            """
+            UPDATE schema_migrations
+            SET checksum = 'tampered-checksum'
+            WHERE version = (SELECT MAX(version) FROM schema_migrations)
+            """
+        )
+
+    with pytest.raises(WorkUpgradeError, match="failed to upgrade Work") as exc_info:
+        repository.open_work("work_001")
+
+    assert "drift detected" in str(exc_info.value)
+
+
 def test_legacy_v1_live_manifest_is_normalized_without_hash_enforcement(
     tmp_path: Path,
 ) -> None:
@@ -547,8 +577,11 @@ def test_recovery_scan_detects_and_finalizes_complete_stale_staging(
             "DELETE FROM work_catalog WHERE work_id = 'work_staged'"
         )
 
+    recovery_tree_before_scan = _recovery_tree_snapshot(staging)
+
     findings = repository.scan_recovery()
 
+    assert _recovery_tree_snapshot(staging) == recovery_tree_before_scan
     assert len(findings) == 1
     finding = findings[0]
     assert finding.kind == "STALE_STAGING_VALID"
@@ -593,6 +626,122 @@ def test_recovery_scan_reports_invalid_staging_without_deleting_it(
     assert finding.diagnostics
     assert staging.is_dir()
     assert evidence.read_text(encoding="utf-8") == "keep recovery evidence"
+
+
+@pytest.mark.parametrize(
+    ("recovery_shape", "expected_kind"),
+    [
+        ("staging", "STALE_STAGING_INVALID"),
+        ("orphan", "UNREGISTERED_WORK_INVALID"),
+    ],
+)
+@pytest.mark.parametrize(
+    ("damage_kind", "diagnostic_fragment"),
+    [
+        ("migration_drift", "MigrationDriftError"),
+        ("non_prefix_history", "ordered configured prefix"),
+        ("foreign_key", "foreign_key_check failed"),
+        ("sqlite_corruption", "not a readable SQLite database"),
+    ],
+)
+def test_recovery_rejects_database_damage_normal_open_would_reject(
+    tmp_path: Path,
+    recovery_shape: str,
+    expected_kind: str,
+    damage_kind: str,
+    diagnostic_fragment: str,
+) -> None:
+    repository = WorkLifecycleRepository(tmp_path)
+    work_id = f"work_{recovery_shape}_{damage_kind}"
+    created = repository.create_work(work_id=work_id, title="Damaged Recovery")
+
+    with repository_write(repository.paths.master_db) as connection:
+        connection.execute(
+            "DELETE FROM work_catalog WHERE work_id = ?",
+            (work_id,),
+        )
+
+    if recovery_shape == "staging":
+        recovery_root = tmp_path / "works" / f".creating-{work_id}"
+        os.replace(created.root, recovery_root)
+    else:
+        recovery_root = created.root
+
+    database = recovery_root / "work.sqlite3"
+    if damage_kind == "migration_drift":
+        with repository_write(database) as connection:
+            connection.execute(
+                """
+                UPDATE schema_migrations
+                SET checksum = 'tampered-checksum'
+                WHERE version = (SELECT MAX(version) FROM schema_migrations)
+                """
+            )
+    elif damage_kind == "non_prefix_history":
+        with repository_write(database) as connection:
+            connection.execute(
+                "DELETE FROM schema_migrations WHERE version = ?",
+                (WORK_MIGRATIONS[0].version,),
+            )
+    elif damage_kind == "foreign_key":
+        connection = sqlite3.connect(database)
+        try:
+            connection.execute("PRAGMA foreign_keys = OFF")
+            connection.execute(
+                """
+                INSERT INTO entity_revisions (
+                    id,
+                    entity_type,
+                    entity_id,
+                    entity_revision,
+                    commit_seq,
+                    change_kind,
+                    created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    "revision_corrupt",
+                    "test",
+                    "entity_corrupt",
+                    1,
+                    999999,
+                    "corrupt",
+                    "2026-09-20T00:00:00+00:00",
+                ),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+    else:
+        for suffix in ("-wal", "-shm"):
+            sidecar = database.with_name(database.name + suffix)
+            if sidecar.exists():
+                sidecar.unlink()
+        database.write_bytes(b"not a sqlite database")
+
+    recovery_tree_before_scan = _recovery_tree_snapshot(recovery_root)
+
+    findings = repository.scan_recovery()
+
+    assert _recovery_tree_snapshot(recovery_root) == recovery_tree_before_scan
+    assert len(findings) == 1
+    finding = findings[0]
+    assert finding.kind == expected_kind
+    assert finding.work_id == work_id
+    assert finding.valid is False
+    assert diagnostic_fragment in " ".join(finding.diagnostics)
+
+    if recovery_shape == "staging":
+        assert finding.recommended_action == "quarantine"
+        with pytest.raises(WorkRecoveryError, match="cannot finalize invalid staging"):
+            repository.finalize_staging_work(work_id)
+        assert recovery_root.is_dir()
+    else:
+        assert finding.recommended_action is None
+        with pytest.raises(WorkRecoveryError, match="cannot register invalid orphan"):
+            repository.reconcile_orphan_work(work_id)
+        assert recovery_root.is_dir()
 
 
 def test_quarantine_invalid_staging_preserves_evidence_and_is_idempotent_for_scan(
