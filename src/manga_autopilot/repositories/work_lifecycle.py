@@ -578,11 +578,16 @@ class WorkLifecycleRepository:
 
         catalog = _catalog_entry(row)
         root = self._resolve_catalog_path(catalog.relative_work_path)
-        inspection = inspect_work_directory(
-            root,
-            migrations=self.work_migrations,
-            expected_work_id=work_id,
-        )
+        try:
+            inspection = inspect_work_directory(
+                root,
+                migrations=self.work_migrations,
+                expected_work_id=work_id,
+            )
+        except MigrationError as exc:
+            raise WorkUpgradeError(
+                f"failed to upgrade Work {work_id!r} before open: {exc}"
+            ) from exc
         if inspection.work_id != work_id:
             raise WorkIdentityMismatchError(
                 f"portable Work identity mismatch: catalog={work_id!r}, "
