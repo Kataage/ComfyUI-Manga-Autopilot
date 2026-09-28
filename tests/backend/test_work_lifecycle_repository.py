@@ -1336,6 +1336,46 @@ def test_open_rejects_invalid_work_revision_head_before_side_effects(
     assert catalog_after.manifest_hash == catalog_before.manifest_hash
 
 
+def test_corrupt_work_head_blocks_pending_migration_before_mutation(
+    tmp_path: Path,
+) -> None:
+    base_repository = WorkLifecycleRepository(tmp_path)
+    created = base_repository.create_work(
+        work_id="work_corrupt_before_upgrade",
+        title="Do Not Upgrade Corrupt Head",
+    )
+    old_version = created.schema_version
+    future_migrations = _future_work_migration()
+    target_version = future_migrations[-1].version
+    _damage_work_head(created.database_path, damage_kind="missing_revision")
+
+    upgraded_repository = WorkLifecycleRepository(
+        tmp_path,
+        work_migrations=future_migrations,
+    )
+
+    with pytest.raises(
+        WorkIdentityMismatchError,
+        match="Work head integrity failed",
+    ):
+        upgraded_repository.open_work(created.work_id)
+
+    with repository_read(created.database_path) as connection:
+        actual_version = connection.execute(
+            "SELECT MAX(version) FROM schema_migrations"
+        ).fetchone()[0]
+        upgrade_table = connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE name = 'upgrade_probe'"
+        ).fetchone()
+
+    assert actual_version == old_version
+    assert upgrade_table is None
+    backup = created.database_path.with_name(
+        f"{created.database_path.name}.backup-v{old_version}-to-v{target_version}"
+    )
+    assert not backup.exists()
+
+
 def test_legacy_v1_live_manifest_is_normalized_without_hash_enforcement(
     tmp_path: Path,
 ) -> None:
