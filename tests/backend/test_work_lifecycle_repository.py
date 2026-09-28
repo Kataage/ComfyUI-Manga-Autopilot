@@ -173,7 +173,7 @@ def test_initial_work_transaction_rolls_back_when_revision_recording_fails(
     def fail_revision(*args: object, **kwargs: object) -> None:
         raise RuntimeError("simulated revision failure")
 
-    monkeypatch.setattr(lifecycle_module, "create_entity_revision", fail_revision)
+    monkeypatch.setattr(lifecycle_module, "create_work_entity_revision", fail_revision)
     monkeypatch.setattr(
         lifecycle_module.shutil,
         "rmtree",
