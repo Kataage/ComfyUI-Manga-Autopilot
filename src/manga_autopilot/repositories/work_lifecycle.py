@@ -208,6 +208,65 @@ def _target_schema_version(migrations: Iterable[Migration]) -> int:
     return max(versions, default=0)
 
 
+def _master_lineage_fields(
+    *,
+    universe_source_id: str | None = None,
+    series_source_id: str | None = None,
+    source_checkpoint_id: str | None = None,
+) -> tuple[str, ...]:
+    """Return Master-lineage fields that require immutable Work snapshots."""
+    values = (
+        ("universe_source_id", universe_source_id),
+        ("series_source_id", series_source_id),
+        ("source_checkpoint_id", source_checkpoint_id),
+    )
+    return tuple(name for name, value in values if value is not None)
+
+
+def _unsnapshotted_master_lineage_message(fields: Iterable[str]) -> str:
+    field_list = ", ".join(fields)
+    return (
+        "Master-linked Work state requires immutable source snapshots before "
+        "lineage can be persisted; Phase A supports standalone Work state only. "
+        f"Unsnapshotted lineage fields: {field_list}"
+    )
+
+
+def _persisted_master_lineage_fields(
+    database_path: Path,
+    *,
+    work_id: str,
+) -> tuple[str, ...]:
+    """Read persisted lineage when the Work metadata table already exists."""
+    with repository_read(database_path) as connection:
+        table = connection.execute(
+            """
+            SELECT 1
+            FROM sqlite_master
+            WHERE type = 'table' AND name = 'work_metadata'
+            """
+        ).fetchone()
+        if table is None:
+            return ()
+
+        metadata = connection.execute(
+            """
+            SELECT universe_source_id, series_source_id, source_checkpoint_id
+            FROM work_metadata
+            WHERE work_id = ?
+            """,
+            (work_id,),
+        ).fetchone()
+
+    if metadata is None:
+        return ()
+    return _master_lineage_fields(
+        universe_source_id=metadata["universe_source_id"],
+        series_source_id=metadata["series_source_id"],
+        source_checkpoint_id=metadata["source_checkpoint_id"],
+    )
+
+
 def _live_manifest(
     *,
     work_id: str,
@@ -411,7 +470,11 @@ class WorkLifecycleRepository:
         universe_id: str | None = None,
         series_id: str | None = None,
     ) -> WorkHandle:
-        """Create a self-contained Work and register it in the Master catalog."""
+        """Create a self-contained standalone Work and register it in Master.
+
+        Master-linked lineage is rejected until immutable source snapshots can
+        be persisted inside the Work.
+        """
         for field_name, value in (
             ("title", title),
             ("work_kind", work_kind),
@@ -421,6 +484,15 @@ class WorkLifecycleRepository:
         ):
             if not value.strip():
                 raise ValueError(f"{field_name} must be non-empty")
+
+        lineage_fields = _master_lineage_fields(
+            universe_source_id=universe_id,
+            series_source_id=series_id,
+        )
+        if lineage_fields:
+            raise ValueError(
+                _unsnapshotted_master_lineage_message(lineage_fields)
+            )
 
         resolved_work_id = work_id or new_id("work")
         final_paths = work_paths(self.storage_root, resolved_work_id)
@@ -577,6 +649,15 @@ class WorkLifecycleRepository:
             raise WorkNotFoundError(f"Work is not in Master catalog: {work_id}")
 
         catalog = _catalog_entry(row)
+        catalog_lineage_fields = _master_lineage_fields(
+            universe_source_id=catalog.universe_id,
+            series_source_id=catalog.series_id,
+        )
+        if catalog_lineage_fields:
+            raise WorkIdentityMismatchError(
+                _unsnapshotted_master_lineage_message(catalog_lineage_fields)
+            )
+
         root = self._resolve_catalog_path(catalog.relative_work_path)
         try:
             inspection = inspect_work_directory(
@@ -592,6 +673,15 @@ class WorkLifecycleRepository:
             raise WorkIdentityMismatchError(
                 f"portable Work identity mismatch: catalog={work_id!r}, "
                 f"work={inspection.work_id!r}"
+            )
+
+        persisted_lineage_fields = _persisted_master_lineage_fields(
+            inspection.database_path,
+            work_id=work_id,
+        )
+        if persisted_lineage_fields:
+            raise WorkIdentityMismatchError(
+                _unsnapshotted_master_lineage_message(persisted_lineage_fields)
             )
 
         manifest = _read_manifest(inspection.manifest_path)
@@ -655,6 +745,16 @@ class WorkLifecycleRepository:
         if metadata is None:
             raise WorkIdentityMismatchError(
                 f"Work DB has no authoritative work_metadata row for {work_id!r}"
+            )
+
+        metadata_lineage_fields = _master_lineage_fields(
+            universe_source_id=metadata["universe_source_id"],
+            series_source_id=metadata["series_source_id"],
+            source_checkpoint_id=metadata["source_checkpoint_id"],
+        )
+        if metadata_lineage_fields:
+            raise WorkIdentityMismatchError(
+                _unsnapshotted_master_lineage_message(metadata_lineage_fields)
             )
 
         opened_at = _utc_now_iso()
@@ -953,13 +1053,31 @@ class WorkLifecycleRepository:
                 )
                 with repository_read(inspection.database_path) as connection:
                     metadata = connection.execute(
-                        "SELECT work_id FROM work_metadata WHERE work_id = ?",
+                        """
+                        SELECT
+                            work_id,
+                            universe_source_id,
+                            series_source_id,
+                            source_checkpoint_id
+                        FROM work_metadata
+                        WHERE work_id = ?
+                        """,
                         (inspection.work_id,),
                     ).fetchone()
                 if metadata is None:
                     diagnostics.append(
                         f"work_metadata row is missing for {inspection.work_id!r}"
                     )
+                else:
+                    lineage_fields = _master_lineage_fields(
+                        universe_source_id=metadata["universe_source_id"],
+                        series_source_id=metadata["series_source_id"],
+                        source_checkpoint_id=metadata["source_checkpoint_id"],
+                    )
+                    if lineage_fields:
+                        raise WorkIdentityMismatchError(
+                            _unsnapshotted_master_lineage_message(lineage_fields)
+                        )
         except Exception as exc:
             message = str(exc)
             if snapshot_root is not None:

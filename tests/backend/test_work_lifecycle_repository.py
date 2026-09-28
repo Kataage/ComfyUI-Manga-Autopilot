@@ -90,6 +90,149 @@ def test_create_open_list_and_reopen_work(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize(
+    "lineage_kwargs",
+    [
+        {"universe_id": "universe_001"},
+        {"series_id": "series_001"},
+        {"universe_id": "universe_001", "series_id": "series_001"},
+    ],
+)
+def test_create_work_rejects_master_lineage_without_source_snapshots(
+    tmp_path: Path,
+    lineage_kwargs: dict[str, str],
+) -> None:
+    repository = WorkLifecycleRepository(tmp_path)
+    works_before = tuple(repository.paths.works.iterdir())
+
+    with pytest.raises(ValueError, match="immutable source snapshots"):
+        repository.create_work(
+            work_id="work_linked",
+            title="Must Be Snapshotted",
+            **lineage_kwargs,
+        )
+
+    assert tuple(repository.paths.works.iterdir()) == works_before
+    assert repository.list_works() == ()
+
+
+def test_standalone_work_persists_no_master_lineage_and_reopens(
+    tmp_path: Path,
+) -> None:
+    repository = WorkLifecycleRepository(tmp_path)
+    created = repository.create_work(
+        work_id="work_standalone",
+        title="Standalone",
+    )
+
+    with repository_read(created.database_path) as connection:
+        metadata = connection.execute(
+            """
+            SELECT universe_source_id, series_source_id, source_checkpoint_id
+            FROM work_metadata
+            WHERE work_id = 'work_standalone'
+            """
+        ).fetchone()
+    assert metadata is not None
+    assert tuple(metadata) == (None, None, None)
+
+    listed = repository.list_works()
+    assert len(listed) == 1
+    assert listed[0].universe_id is None
+    assert listed[0].series_id is None
+
+    reopened = WorkLifecycleRepository(tmp_path).open_work("work_standalone")
+    assert reopened.work_id == "work_standalone"
+
+
+@pytest.mark.parametrize(
+    ("storage_location", "column"),
+    [
+        ("catalog", "universe_id"),
+        ("catalog", "series_id"),
+        ("work", "universe_source_id"),
+        ("work", "series_source_id"),
+        ("work", "source_checkpoint_id"),
+    ],
+)
+def test_open_rejects_unsnapshotted_persisted_master_lineage(
+    tmp_path: Path,
+    storage_location: str,
+    column: str,
+) -> None:
+    repository = WorkLifecycleRepository(tmp_path)
+    created = repository.create_work(
+        work_id="work_legacy_linked",
+        title="Legacy Linked",
+    )
+
+    if storage_location == "catalog":
+        with repository_write(repository.paths.master_db) as connection:
+            connection.execute(
+                f"UPDATE work_catalog SET {column} = ? WHERE work_id = ?",
+                ("source_001", created.work_id),
+            )
+    else:
+        with repository_write(created.database_path) as connection:
+            connection.execute(
+                f"UPDATE work_metadata SET {column} = ? WHERE work_id = ?",
+                ("source_001", created.work_id),
+            )
+
+    with pytest.raises(
+        WorkIdentityMismatchError,
+        match="immutable source snapshots",
+    ):
+        repository.open_work(created.work_id)
+
+
+def test_open_rejects_unsnapshotted_lineage_before_upgrade_mutation(
+    tmp_path: Path,
+) -> None:
+    base_repository = WorkLifecycleRepository(tmp_path)
+    created = base_repository.create_work(
+        work_id="work_linked_before_upgrade",
+        title="Linked Before Upgrade",
+    )
+    with repository_write(created.database_path) as connection:
+        connection.execute(
+            """
+            UPDATE work_metadata
+            SET series_source_id = 'series_legacy'
+            WHERE work_id = ?
+            """,
+            (created.work_id,),
+        )
+
+    future_migrations = _future_work_migration()
+    target_version = future_migrations[-1].version
+    repository = WorkLifecycleRepository(
+        tmp_path,
+        work_migrations=future_migrations,
+    )
+
+    with pytest.raises(
+        WorkIdentityMismatchError,
+        match="immutable source snapshots",
+    ):
+        repository.open_work(created.work_id)
+
+    with repository_read(created.database_path) as connection:
+        assert connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE name = 'upgrade_probe'"
+        ).fetchone() is None
+        version = connection.execute(
+            "SELECT MAX(version) FROM schema_migrations"
+        ).fetchone()[0]
+
+    assert version == WORK_MIGRATIONS[-1].version
+    backup = created.database_path.with_name(
+        f"{created.database_path.name}.backup-v{WORK_MIGRATIONS[-1].version}"
+        f"-to-v{target_version}"
+    )
+    assert not backup.exists()
+
+
+@pytest.mark.parametrize(
     "reserved_id",
     [
         ".creating-work_001",
@@ -742,6 +885,61 @@ def test_recovery_rejects_database_damage_normal_open_would_reject(
         with pytest.raises(WorkRecoveryError, match="cannot register invalid orphan"):
             repository.reconcile_orphan_work(work_id)
         assert recovery_root.is_dir()
+
+
+@pytest.mark.parametrize(
+    ("recovery_shape", "expected_kind"),
+    [
+        ("staging", "STALE_STAGING_INVALID"),
+        ("orphan", "UNREGISTERED_WORK_INVALID"),
+    ],
+)
+def test_recovery_rejects_unsnapshotted_master_lineage(
+    tmp_path: Path,
+    recovery_shape: str,
+    expected_kind: str,
+) -> None:
+    repository = WorkLifecycleRepository(tmp_path)
+    work_id = f"work_linked_{recovery_shape}"
+    created = repository.create_work(work_id=work_id, title="Linked Recovery")
+
+    with repository_write(created.database_path) as connection:
+        connection.execute(
+            """
+            UPDATE work_metadata
+            SET universe_source_id = 'universe_legacy'
+            WHERE work_id = ?
+            """,
+            (work_id,),
+        )
+    with repository_write(repository.paths.master_db) as connection:
+        connection.execute(
+            "DELETE FROM work_catalog WHERE work_id = ?",
+            (work_id,),
+        )
+
+    if recovery_shape == "staging":
+        recovery_root = tmp_path / "works" / f".creating-{work_id}"
+        os.replace(created.root, recovery_root)
+    else:
+        recovery_root = created.root
+
+    recovery_tree_before_scan = _recovery_tree_snapshot(recovery_root)
+    findings = repository.scan_recovery()
+
+    assert _recovery_tree_snapshot(recovery_root) == recovery_tree_before_scan
+    assert len(findings) == 1
+    finding = findings[0]
+    assert finding.kind == expected_kind
+    assert finding.valid is False
+    assert "immutable source snapshots" in " ".join(finding.diagnostics)
+
+    if recovery_shape == "staging":
+        with pytest.raises(WorkRecoveryError, match="invalid staging"):
+            repository.finalize_staging_work(work_id)
+    else:
+        with pytest.raises(WorkRecoveryError, match="invalid orphan"):
+            repository.reconcile_orphan_work(work_id)
 
 
 def test_quarantine_invalid_staging_preserves_evidence_and_is_idempotent_for_scan(
