@@ -154,9 +154,27 @@ class LegacyProjectInventoryService:
 
         project_ids: list[str] = []
         for child in sorted(projects_root.iterdir(), key=lambda path: path.name):
-            if child.is_symlink() or not child.is_dir():
+            if child.is_symlink():
+                continue
+            try:
+                assert_managed_path(
+                    child,
+                    containment_root=projects_root,
+                    field_name="legacy project discovery entry",
+                )
+            except UnsafeStoragePathError:
+                continue
+            if not child.is_dir():
                 continue
             project_json = child / "project.json"
+            try:
+                assert_managed_path(
+                    project_json,
+                    containment_root=child,
+                    field_name="legacy project.json",
+                )
+            except UnsafeStoragePathError:
+                continue
             if project_json.is_symlink():
                 continue
             if project_json.is_file():
@@ -234,12 +252,15 @@ class LegacyProjectInventoryService:
         missing_optional_files = tuple(
             filename
             for filename in _OPTIONAL_FILES
-            if not self._is_regular_file(root / filename)
+            if not self._is_regular_file(root / filename, containment_root=root)
         )
         missing_optional_directories = tuple(
             dirname
             for dirname in _OPTIONAL_DIRECTORIES
-            if not self._is_regular_directory(root / dirname)
+            if not self._is_regular_directory(
+                root / dirname,
+                containment_root=root,
+            )
         )
 
         for relative_path in missing_optional_files:
@@ -274,12 +295,32 @@ class LegacyProjectInventoryService:
         )
 
     @staticmethod
-    def _is_regular_file(path: Path) -> bool:
-        return path.is_file() and not path.is_symlink()
+    def _is_regular_file(path: Path, *, containment_root: Path) -> bool:
+        if path.is_symlink():
+            return False
+        try:
+            assert_managed_path(
+                path,
+                containment_root=containment_root,
+                field_name="legacy optional file",
+            )
+        except UnsafeStoragePathError:
+            return False
+        return path.is_file()
 
     @staticmethod
-    def _is_regular_directory(path: Path) -> bool:
-        return path.is_dir() and not path.is_symlink()
+    def _is_regular_directory(path: Path, *, containment_root: Path) -> bool:
+        if path.is_symlink():
+            return False
+        try:
+            assert_managed_path(
+                path,
+                containment_root=containment_root,
+                field_name="legacy optional directory",
+            )
+        except UnsafeStoragePathError:
+            return False
+        return path.is_dir()
 
     @staticmethod
     def _read_project_json(
@@ -378,12 +419,13 @@ class LegacyProjectInventoryService:
         ):
             current = Path(current_root)
 
+            safe_directory_names: list[str] = []
             for name in sorted(directory_names):
                 path = current / name
                 relative = path.relative_to(root)
-                entry = cls._entry_for(path, relative)
-                entries.append(entry)
-                if entry.kind == "symlink":
+                if path.is_symlink():
+                    entry = cls._entry_for(path, relative)
+                    entries.append(entry)
                     warnings.append(
                         LegacyInventoryWarning(
                             code="SYMLINK_ENTRY_IGNORED",
@@ -391,19 +433,42 @@ class LegacyProjectInventoryService:
                             relative_path=entry.relative_path,
                         )
                     )
+                    continue
 
-            # Explicitly prevent traversal into directory symlinks even though
-            # os.walk(followlinks=False) already does so on supported platforms.
-            directory_names[:] = [
-                name for name in directory_names if not (current / name).is_symlink()
-            ]
+                try:
+                    assert_managed_path(
+                        path,
+                        containment_root=root,
+                        field_name="legacy inventory directory",
+                    )
+                except UnsafeStoragePathError as exc:
+                    entry = cls._unsafe_entry_for(path, relative)
+                    entries.append(entry)
+                    warnings.append(
+                        LegacyInventoryWarning(
+                            code="UNSAFE_PATH_ENTRY_IGNORED",
+                            message=(
+                                "legacy directory resolves outside the project "
+                                f"root and was not followed: {exc}"
+                            ),
+                            relative_path=entry.relative_path,
+                            severity="error",
+                        )
+                    )
+                    continue
+
+                entry = cls._entry_for(path, relative)
+                entries.append(entry)
+                safe_directory_names.append(name)
+
+            directory_names[:] = safe_directory_names
 
             for name in sorted(file_names):
                 path = current / name
                 relative = path.relative_to(root)
-                entry = cls._entry_for(path, relative)
-                entries.append(entry)
-                if entry.kind == "symlink":
+                if path.is_symlink():
+                    entry = cls._entry_for(path, relative)
+                    entries.append(entry)
                     warnings.append(
                         LegacyInventoryWarning(
                             code="SYMLINK_ENTRY_IGNORED",
@@ -411,8 +476,48 @@ class LegacyProjectInventoryService:
                             relative_path=entry.relative_path,
                         )
                     )
+                    continue
+
+                try:
+                    assert_managed_path(
+                        path,
+                        containment_root=root,
+                        field_name="legacy inventory file",
+                    )
+                except UnsafeStoragePathError as exc:
+                    entry = cls._unsafe_entry_for(path, relative)
+                    entries.append(entry)
+                    warnings.append(
+                        LegacyInventoryWarning(
+                            code="UNSAFE_PATH_ENTRY_IGNORED",
+                            message=(
+                                "legacy file resolves outside the project root "
+                                f"and was not trusted: {exc}"
+                            ),
+                            relative_path=entry.relative_path,
+                            severity="error",
+                        )
+                    )
+                    continue
+
+                entries.append(cls._entry_for(path, relative))
 
         return tuple(sorted(entries, key=lambda entry: entry.relative_path))
+
+    @staticmethod
+    def _unsafe_entry_for(path: Path, relative: Path) -> LegacyInventoryEntry:
+        """Record an unsafe link/reparse entry without following its target."""
+        try:
+            size_bytes = path.lstat().st_size
+        except OSError:
+            size_bytes = None
+        return LegacyInventoryEntry(
+            relative_path=relative.as_posix(),
+            kind="unsafe_link",
+            category="unsafe_link",
+            recognized=False,
+            size_bytes=size_bytes,
+        )
 
     @staticmethod
     def _entry_for(path: Path, relative: Path) -> LegacyInventoryEntry:
