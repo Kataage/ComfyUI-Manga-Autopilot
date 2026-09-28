@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 
+from manga_autopilot.primitives import canonical_json
 from manga_autopilot.storage import (
     RevisionConflictError,
     TransactionRequiredError,
@@ -14,6 +15,7 @@ from manga_autopilot.storage import (
     bootstrap_master_database,
     bootstrap_work_database,
     connect_write,
+    create_entity_revision,
     create_master_commit,
     create_work_commit,
     repository_read,
@@ -207,6 +209,77 @@ def test_create_work_commit_requires_explicit_transaction(tmp_path: Path) -> Non
                 commit_id="commit_invalid",
                 actor_type="system",
                 operation_type="invalid",
+            )
+    finally:
+        connection.close()
+
+
+def test_create_entity_revision_canonicalizes_state_inside_transaction(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "work.sqlite3"
+    bootstrap_work_database(database, work_id="work_001")
+
+    after_state = {
+        "title": "Initial",
+        "schema_version": 1,
+        "nested": {"z": 2, "a": 1},
+    }
+    with repository_write(database) as connection:
+        commit = create_work_commit(
+            connection,
+            commit_id="commit_revision",
+            actor_type="system",
+            operation_type="create_work",
+            created_at="2026-09-20T00:00:00+00:00",
+        )
+        revision = create_entity_revision(
+            connection,
+            revision_id="revision_001",
+            entity_type="work",
+            entity_id="work_001",
+            entity_revision=1,
+            commit_seq=commit.commit_seq,
+            change_kind="create",
+            after_state=after_state,
+            created_at=commit.created_at,
+        )
+
+    assert revision.before_json is None
+    assert revision.after_json == canonical_json(after_state)
+
+    with repository_read(database) as connection:
+        row = connection.execute(
+            "SELECT * FROM entity_revisions WHERE id = 'revision_001'"
+        ).fetchone()
+
+    assert row is not None
+    assert row["entity_type"] == "work"
+    assert row["entity_id"] == "work_001"
+    assert row["entity_revision"] == 1
+    assert row["commit_seq"] == commit.commit_seq
+    assert row["change_kind"] == "create"
+    assert row["before_json"] is None
+    assert row["after_json"] == canonical_json(after_state)
+    assert row["created_at"] == commit.created_at
+
+
+def test_create_entity_revision_requires_explicit_transaction(tmp_path: Path) -> None:
+    database = tmp_path / "work.sqlite3"
+    bootstrap_work_database(database, work_id="work_001")
+
+    connection = connect_write(database)
+    try:
+        with pytest.raises(TransactionRequiredError):
+            create_entity_revision(
+                connection,
+                revision_id="revision_invalid",
+                entity_type="work",
+                entity_id="work_001",
+                entity_revision=1,
+                commit_seq=1,
+                change_kind="create",
+                after_state={"schema_version": 1},
             )
     finally:
         connection.close()
