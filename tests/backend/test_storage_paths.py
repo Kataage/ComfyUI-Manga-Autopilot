@@ -91,6 +91,29 @@ def test_work_paths_rejects_path_traversal(tmp_path: Path, unsafe_id: str) -> No
         ".internal-future",
     ],
 )
+@pytest.mark.parametrize(
+    "unsafe_id",
+    [
+        "CON",
+        "con.txt",
+        "PRN",
+        "AUX",
+        "NUL",
+        "COM1",
+        "LPT9.log",
+        "work.",
+        "work ",
+        "work:stream",
+        "work*bad",
+    ],
+)
+def test_work_paths_rejects_windows_nonportable_names(
+    tmp_path: Path,
+    unsafe_id: str,
+) -> None:
+    with pytest.raises(ValueError):
+        work_paths(tmp_path, unsafe_id)
+
 def test_work_paths_rejects_reserved_internal_namespace(
     tmp_path: Path,
     reserved_id: str,
