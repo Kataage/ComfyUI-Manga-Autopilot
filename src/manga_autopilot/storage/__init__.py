@@ -98,8 +98,10 @@ from manga_autopilot.storage.work import (
     WorkDatabaseBootstrapResult,
     WorkDatabaseIdentity,
     WorkDatabaseIdentityError,
+    WorkHeadIntegrityError,
     bootstrap_work_database,
     read_work_identity,
+    validate_work_head_integrity,
 )
 from manga_autopilot.storage.work_manifest import (
     LEGACY_WORK_MANIFEST_FORMAT_VERSIONS,
@@ -177,6 +179,7 @@ __all__ = [
     "WorkDatabaseBootstrapResult",
     "WorkDatabaseIdentity",
     "WorkDatabaseIdentityError",
+    "WorkHeadIntegrityError",
     "WorkManifestContractError",
     "WorkCommit",
     "WorkPaths",
@@ -209,6 +212,7 @@ __all__ = [
     "repository_write",
     "read_master_identity",
     "read_work_identity",
+    "validate_work_head_integrity",
     "resolve_storage_root",
     "sqlite_constraint_check",
     "sqlite_integrity_check",
