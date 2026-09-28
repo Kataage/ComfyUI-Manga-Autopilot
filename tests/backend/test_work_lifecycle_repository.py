@@ -1788,6 +1788,32 @@ def test_quarantine_recovers_legacy_receiptless_destination(
     assert repository.scan_recovery() == ()
 
 
+def test_quarantine_rejects_multiple_incomplete_states(
+    tmp_path: Path,
+) -> None:
+    repository = WorkLifecycleRepository(tmp_path)
+    quarantine_root = tmp_path / "works" / ".recovery-quarantine"
+    quarantine_root.mkdir()
+    for stamp in ("20260928T000000000000Z", "20260928T000001000000Z"):
+        destination = (
+            quarantine_root
+            / f"{stamp}-creating-work_ambiguous_quarantine"
+        )
+        destination.mkdir()
+        (destination / "partial.txt").write_text(stamp, encoding="utf-8")
+
+    findings = repository.inspect_quarantine()
+
+    assert len(findings) == 2
+    assert all(
+        finding.kind == "QUARANTINE_INCOMPLETE"
+        and finding.work_id == "work_ambiguous_quarantine"
+        for finding in findings
+    )
+    with pytest.raises(WorkRecoveryError, match="multiple incomplete quarantine"):
+        repository.quarantine_staging_work("work_ambiguous_quarantine")
+
+
 def test_durable_quarantine_move_syncs_source_and_destination_parents(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
