@@ -25,7 +25,7 @@ from manga_autopilot.storage import (
     assert_managed_regular_file,
     bootstrap_master_database,
     bootstrap_work_database,
-    create_entity_revision,
+    create_work_entity_revision,
     create_work_commit,
     ensure_storage_root,
     inspect_work_database,
@@ -616,7 +616,7 @@ class WorkLifecycleRepository:
                         created_at,
                     ),
                 )
-                create_entity_revision(
+                create_work_entity_revision(
                     connection,
                     revision_id=new_id("revision"),
                     entity_type="work",
