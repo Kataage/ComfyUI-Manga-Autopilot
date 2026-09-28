@@ -1680,13 +1680,6 @@ def test_recovery_rejects_database_damage_normal_open_would_reject(
     ],
 )
 @pytest.mark.parametrize(
-    ("recovery_shape", "expected_kind"),
-    [
-        ("staging", "STALE_STAGING_INVALID"),
-        ("orphan", "UNREGISTERED_WORK_INVALID"),
-    ],
-)
-@pytest.mark.parametrize(
     ("damage_kind", "diagnostic_fragment"),
     [
         ("extra_metadata", "exactly one row"),
@@ -1741,6 +1734,13 @@ def test_recovery_rejects_invalid_work_revision_head(
             repository.reconcile_orphan_work(work_id)
 
 
+@pytest.mark.parametrize(
+    ("recovery_shape", "expected_kind"),
+    [
+        ("staging", "STALE_STAGING_INVALID"),
+        ("orphan", "UNREGISTERED_WORK_INVALID"),
+    ],
+)
 def test_recovery_rejects_unsnapshotted_master_lineage(
     tmp_path: Path,
     recovery_shape: str,
