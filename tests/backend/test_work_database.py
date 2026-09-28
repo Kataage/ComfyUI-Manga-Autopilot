@@ -12,10 +12,70 @@ from manga_autopilot.storage import (
     WORK_FORMAT_VERSION,
     WORK_MIGRATIONS,
     WorkDatabaseIdentityError,
+    WorkHeadIntegrityError,
     bootstrap_work_database,
+    read_connection,
     read_work_identity,
+    validate_work_head_integrity,
     write_connection,
 )
+
+
+def _seed_valid_work_head(database: Path, *, work_id: str) -> tuple[int, int]:
+    with write_connection(database) as connection:
+        commit = connection.execute(
+            """
+            INSERT INTO commits (
+                commit_id,
+                actor_type,
+                operation_type,
+                created_at
+            )
+            VALUES (?, 'system', 'create_work', '2026-09-20T00:00:00+00:00')
+            """,
+            (f"commit_{work_id}",),
+        )
+        commit_seq = int(commit.lastrowid)
+        connection.execute(
+            """
+            INSERT INTO work_metadata (
+                work_id,
+                title,
+                work_kind,
+                language,
+                reading_direction,
+                status,
+                current_commit_seq,
+                current_revision,
+                created_at,
+                updated_at
+            )
+            VALUES (?, 'Sample', 'standalone', 'ja',
+                    'RTL_TOP_TO_BOTTOM', 'DRAFT', ?, 1,
+                    '2026-09-20T00:00:00+00:00',
+                    '2026-09-20T00:00:00+00:00')
+            """,
+            (work_id, commit_seq),
+        )
+        connection.execute(
+            """
+            INSERT INTO entity_revisions (
+                id,
+                entity_type,
+                entity_id,
+                entity_revision,
+                commit_seq,
+                change_kind,
+                after_json,
+                created_at
+            )
+            VALUES (?, 'work', ?, 1, ?, 'create', '{}',
+                    '2026-09-20T00:00:00+00:00')
+            """,
+            (f"revision_{work_id}", work_id, commit_seq),
+        )
+        connection.commit()
+    return commit_seq, 1
 
 
 def test_bootstrap_work_database_creates_backbone_without_master_db(tmp_path: Path) -> None:
@@ -312,3 +372,206 @@ def test_work_schema_has_no_foreign_key_to_master_tables(tmp_path: Path) -> None
 
     assert not any(name.startswith("master_") for name in referenced_tables)
     assert referenced_tables <= set(tables)
+
+def test_validate_work_head_integrity_accepts_valid_head(tmp_path: Path) -> None:
+    database = tmp_path / "work.sqlite3"
+    bootstrap_work_database(database, work_id="work_head")
+    commit_seq, revision = _seed_valid_work_head(database, work_id="work_head")
+
+    with read_connection(database) as connection:
+        row = validate_work_head_integrity(
+            connection,
+            expected_work_id="work_head",
+        )
+
+    assert row["current_commit_seq"] == commit_seq
+    assert row["current_revision"] == revision
+
+
+def test_validate_work_head_integrity_rejects_extra_metadata_row(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "work.sqlite3"
+    bootstrap_work_database(database, work_id="work_head")
+    _seed_valid_work_head(database, work_id="work_head")
+
+    with write_connection(database) as connection:
+        connection.execute(
+            """
+            INSERT INTO work_metadata (
+                work_id,
+                title,
+                work_kind,
+                language,
+                reading_direction,
+                status,
+                current_commit_seq,
+                current_revision,
+                created_at,
+                updated_at
+            )
+            SELECT
+                'work_extra',
+                title,
+                work_kind,
+                language,
+                reading_direction,
+                status,
+                current_commit_seq,
+                current_revision,
+                created_at,
+                updated_at
+            FROM work_metadata
+            WHERE work_id = 'work_head'
+            """
+        )
+        connection.commit()
+
+    with read_connection(database) as connection:
+        with pytest.raises(
+            WorkHeadIntegrityError,
+            match="exactly one row",
+        ):
+            validate_work_head_integrity(
+                connection,
+                expected_work_id="work_head",
+            )
+
+
+def test_validate_work_head_integrity_rejects_missing_current_revision(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "work.sqlite3"
+    bootstrap_work_database(database, work_id="work_head")
+    _seed_valid_work_head(database, work_id="work_head")
+
+    with write_connection(database) as connection:
+        connection.execute(
+            "UPDATE work_metadata SET current_revision = 2"
+        )
+        connection.commit()
+
+    with read_connection(database) as connection:
+        with pytest.raises(
+            WorkHeadIntegrityError,
+            match="current Work revision is missing",
+        ):
+            validate_work_head_integrity(
+                connection,
+                expected_work_id="work_head",
+            )
+
+
+def test_validate_work_head_integrity_rejects_revision_commit_mismatch(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "work.sqlite3"
+    bootstrap_work_database(database, work_id="work_head")
+    first_commit, _ = _seed_valid_work_head(database, work_id="work_head")
+
+    with write_connection(database) as connection:
+        second = connection.execute(
+            """
+            INSERT INTO commits (
+                commit_id,
+                parent_commit_seq,
+                actor_type,
+                operation_type,
+                created_at
+            )
+            VALUES ('commit_second', ?, 'human', 'edit_work',
+                    '2026-09-20T00:00:01+00:00')
+            """,
+            (first_commit,),
+        )
+        connection.execute(
+            "UPDATE work_metadata SET current_commit_seq = ?",
+            (int(second.lastrowid),),
+        )
+        connection.commit()
+
+    with read_connection(database) as connection:
+        with pytest.raises(
+            WorkHeadIntegrityError,
+            match="revision/commit mismatch",
+        ):
+            validate_work_head_integrity(
+                connection,
+                expected_work_id="work_head",
+            )
+
+
+def test_validate_work_head_integrity_rejects_missing_current_commit(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "work.sqlite3"
+    bootstrap_work_database(database, work_id="work_head")
+    _seed_valid_work_head(database, work_id="work_head")
+
+    with write_connection(database) as connection:
+        connection.execute(
+            "UPDATE work_metadata SET current_commit_seq = 999999"
+        )
+        connection.commit()
+
+    with read_connection(database) as connection:
+        with pytest.raises(
+            WorkHeadIntegrityError,
+            match="current Work commit is missing",
+        ):
+            validate_work_head_integrity(
+                connection,
+                expected_work_id="work_head",
+            )
+
+
+def test_validate_work_head_integrity_rejects_non_head_current_revision(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "work.sqlite3"
+    bootstrap_work_database(database, work_id="work_head")
+    first_commit, _ = _seed_valid_work_head(database, work_id="work_head")
+
+    with write_connection(database) as connection:
+        second = connection.execute(
+            """
+            INSERT INTO commits (
+                commit_id,
+                parent_commit_seq,
+                actor_type,
+                operation_type,
+                created_at
+            )
+            VALUES ('commit_second', ?, 'human', 'edit_work',
+                    '2026-09-20T00:00:01+00:00')
+            """,
+            (first_commit,),
+        )
+        connection.execute(
+            """
+            INSERT INTO entity_revisions (
+                id,
+                entity_type,
+                entity_id,
+                entity_revision,
+                commit_seq,
+                change_kind,
+                created_at
+            )
+            VALUES ('revision_second', 'work', 'work_head', 2, ?, 'update',
+                    '2026-09-20T00:00:01+00:00')
+            """,
+            (int(second.lastrowid),),
+        )
+        connection.commit()
+
+    with read_connection(database) as connection:
+        with pytest.raises(
+            WorkHeadIntegrityError,
+            match="not the latest Work entity revision",
+        ):
+            validate_work_head_integrity(
+                connection,
+                expected_work_id="work_head",
+            )
+

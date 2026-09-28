@@ -36,6 +36,10 @@ class WorkDatabaseIdentityError(RuntimeError):
     """Raised when Work DB identity metadata is missing or inconsistent."""
 
 
+class WorkHeadIntegrityError(RuntimeError):
+    """Raised when Work metadata does not match its revision/commit head."""
+
+
 @dataclass(frozen=True)
 class WorkDatabaseIdentity:
     """Stable identity metadata for one Work database."""
@@ -231,6 +235,109 @@ def _recover_interrupted_identity_bootstrap(
     return True
 
 
+def validate_work_head_integrity(
+    connection: sqlite3.Connection,
+    *,
+    expected_work_id: str,
+) -> sqlite3.Row:
+    """Validate the authoritative Work metadata row and revision head.
+
+    The Work schema requires exactly one work_metadata row. Its declared
+    current revision must be the latest persisted Work entity revision, and
+    that revision must point at the same existing commit as
+    work_metadata.current_commit_seq.
+    """
+    rows = connection.execute(
+        """
+        SELECT
+            m.*,
+            (
+                SELECT COUNT(*)
+                FROM entity_revisions er
+                WHERE er.entity_type = 'work'
+                  AND er.entity_id = m.work_id
+                  AND er.entity_revision = m.current_revision
+            ) AS current_revision_count,
+            (
+                SELECT er.commit_seq
+                FROM entity_revisions er
+                WHERE er.entity_type = 'work'
+                  AND er.entity_id = m.work_id
+                  AND er.entity_revision = m.current_revision
+                LIMIT 1
+            ) AS revision_commit_seq,
+            (
+                SELECT MAX(er.entity_revision)
+                FROM entity_revisions er
+                WHERE er.entity_type = 'work'
+                  AND er.entity_id = m.work_id
+            ) AS max_work_revision,
+            (
+                SELECT COUNT(*)
+                FROM commits c
+                WHERE c.commit_seq = m.current_commit_seq
+            ) AS current_commit_count
+        FROM work_metadata m
+        ORDER BY m.work_id
+        """
+    ).fetchall()
+
+    if len(rows) != 1:
+        raise WorkHeadIntegrityError(
+            "work_metadata must contain exactly one row; "
+            f"found {len(rows)}"
+        )
+
+    row = rows[0]
+    actual_work_id = str(row["work_id"])
+    if actual_work_id != expected_work_id:
+        raise WorkHeadIntegrityError(
+            "work_metadata work_id mismatch: "
+            f"expected {expected_work_id!r}, got {actual_work_id!r}"
+        )
+
+    current_revision = int(row["current_revision"])
+    current_commit_seq = int(row["current_commit_seq"])
+    if current_revision <= 0:
+        raise WorkHeadIntegrityError(
+            f"current_revision must be > 0; got {current_revision}"
+        )
+    if current_commit_seq <= 0:
+        raise WorkHeadIntegrityError(
+            f"current_commit_seq must be > 0; got {current_commit_seq}"
+        )
+
+    if int(row["current_revision_count"]) != 1:
+        raise WorkHeadIntegrityError(
+            "current Work revision is missing: "
+            f"work_id={actual_work_id!r}, revision={current_revision}"
+        )
+
+    max_work_revision = row["max_work_revision"]
+    if max_work_revision is None or int(max_work_revision) != current_revision:
+        raise WorkHeadIntegrityError(
+            "current_revision is not the latest Work entity revision: "
+            f"declared={current_revision}, latest={max_work_revision}"
+        )
+
+    if int(row["current_commit_count"]) != 1:
+        raise WorkHeadIntegrityError(
+            "current Work commit is missing: "
+            f"commit_seq={current_commit_seq}"
+        )
+
+    revision_commit_seq = int(row["revision_commit_seq"])
+    if revision_commit_seq != current_commit_seq:
+        raise WorkHeadIntegrityError(
+            "current Work revision/commit mismatch: "
+            f"revision {current_revision} uses commit_seq "
+            f"{revision_commit_seq}, but work_metadata declares "
+            f"{current_commit_seq}"
+        )
+
+    return row
+
+
 def read_work_identity(database_path: str | Path) -> WorkDatabaseIdentity:
     """Read and validate required Work database identity metadata."""
     with read_connection(database_path) as connection:
@@ -300,6 +407,8 @@ __all__ = [
     "WorkDatabaseBootstrapResult",
     "WorkDatabaseIdentity",
     "WorkDatabaseIdentityError",
+    "WorkHeadIntegrityError",
     "bootstrap_work_database",
     "read_work_identity",
+    "validate_work_head_integrity",
 ]
