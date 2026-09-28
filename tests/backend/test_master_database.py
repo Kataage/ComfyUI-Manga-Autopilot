@@ -294,6 +294,87 @@ def test_bootstrap_upgrades_legacy_master_database_kind_via_migration(
             "SELECT value FROM master_metadata WHERE key = 'database_kind'"
         ).fetchone()[0]
     assert stored == MASTER_DATABASE_KIND
+    assert result.migration.backup_path is not None
+    with write_connection(result.migration.backup_path) as connection:
+        backup_kind = connection.execute(
+            "SELECT value FROM master_metadata WHERE key = 'database_kind'"
+        ).fetchone()[0]
+        backup_version = connection.execute(
+            "SELECT MAX(version) FROM schema_migrations"
+        ).fetchone()[0]
+    assert backup_kind == "master"
+    assert backup_version == legacy_migrations[-1].version
+
+
+def test_read_master_identity_allows_legacy_kind_before_canonicalization(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "master.sqlite3"
+    legacy_migrations = MASTER_MIGRATIONS[:-1]
+    migrate_master_database(
+        database,
+        migrations=legacy_migrations,
+        database_id="master_legacy_read",
+    )
+    with write_connection(database) as connection:
+        connection.execute(
+            "UPDATE master_metadata SET value = 'master' WHERE key = 'database_kind'"
+        )
+        connection.commit()
+
+    identity = read_master_identity(database)
+
+    assert identity.database_kind == MASTER_DATABASE_KIND
+    assert identity.database_id == "master_legacy_read"
+
+
+def test_current_schema_legacy_master_kind_is_rejected(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "master.sqlite3"
+    bootstrap_master_database(database, database_id="master_current")
+    with write_connection(database) as connection:
+        connection.execute(
+            "UPDATE master_metadata SET value = 'master' WHERE key = 'database_kind'"
+        )
+        connection.commit()
+
+    with pytest.raises(
+        MasterDatabaseIdentityError,
+        match="database_kind mismatch",
+    ):
+        read_master_identity(database)
+
+    with pytest.raises(
+        MasterDatabaseIdentityError,
+        match="database_kind mismatch",
+    ):
+        bootstrap_master_database(database)
+
+
+def test_interrupted_identity_bootstrap_recovers_canonical_kind(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "master.sqlite3"
+    bootstrap_master_database(database, database_id="master_before_interrupt")
+
+    with write_connection(database) as connection:
+        connection.execute("DELETE FROM master_metadata")
+        connection.commit()
+
+    recovered = bootstrap_master_database(
+        database,
+        database_id="master_recovered",
+    )
+
+    assert recovered.identity.database_kind == MASTER_DATABASE_KIND
+    assert recovered.identity.database_id == "master_recovered"
+    assert recovered.migration.applied_versions == ()
+    with write_connection(database) as connection:
+        stored_kind = connection.execute(
+            "SELECT value FROM master_metadata WHERE key = 'database_kind'"
+        ).fetchone()[0]
+    assert stored_kind == MASTER_DATABASE_KIND
 
 
 def test_bootstrap_does_not_repair_incomplete_identity_when_user_data_exists(
