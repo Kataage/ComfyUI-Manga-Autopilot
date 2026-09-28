@@ -787,6 +787,36 @@ def test_recovery_scan_reports_catalog_work_with_missing_critical_file(
     assert [entry.work_id for entry in repository.list_works()] == [created.work_id]
 
 
+def test_recovery_scan_reports_unsafe_catalog_path_without_repair(
+    tmp_path: Path,
+) -> None:
+    repository = WorkLifecycleRepository(tmp_path)
+    created = repository.create_work(
+        work_id="work_unsafe_catalog",
+        title="Unsafe Catalog",
+    )
+    with repository_write(repository.paths.master_db) as connection:
+        connection.execute(
+            """
+            UPDATE work_catalog
+            SET relative_work_path = '../outside'
+            WHERE work_id = ?
+            """,
+            (created.work_id,),
+        )
+
+    findings = repository.scan_recovery()
+
+    assert len(findings) == 1
+    finding = findings[0]
+    assert finding.kind == "CATALOG_WORK_PATH_INVALID"
+    assert finding.work_id == created.work_id
+    assert finding.valid is False
+    assert finding.recommended_action is None
+    assert "unsafe catalog work path" in " ".join(finding.diagnostics)
+    assert [entry.work_id for entry in repository.list_works()] == [created.work_id]
+
+
 def test_catalog_path_escape_is_rejected(tmp_path: Path) -> None:
     repository = WorkLifecycleRepository(tmp_path)
     repository.create_work(work_id="work_001", title="Safe")
