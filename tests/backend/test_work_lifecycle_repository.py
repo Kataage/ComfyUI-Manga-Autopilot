@@ -515,6 +515,132 @@ def test_create_rejects_duplicate_work_id_without_overwrite(tmp_path: Path) -> N
     assert first.database_path.is_file()
 
 
+def test_atomic_json_write_fsyncs_parent_directory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "manifest.json"
+    fsynced: list[Path] = []
+
+    monkeypatch.setattr(
+        lifecycle_module,
+        "_fsync_directory",
+        lambda directory: fsynced.append(Path(directory)),
+    )
+
+    lifecycle_module._write_json_atomic(path, {"work_id": "work_001"})
+
+    assert json.loads(path.read_text(encoding="utf-8")) == {
+        "work_id": "work_001"
+    }
+    assert fsynced == [tmp_path]
+
+
+def test_durable_directory_publish_fsyncs_before_and_after_rename(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / ".creating-work_001"
+    destination = tmp_path / "work_001"
+    source.mkdir()
+    events: list[str] = []
+    original_replace = os.replace
+
+    def record_fsync(path: Path) -> None:
+        events.append(f"fsync:{Path(path).name}")
+
+    def record_replace(
+        src: str | os.PathLike[str],
+        dst: str | os.PathLike[str],
+    ) -> None:
+        events.append("replace")
+        original_replace(src, dst)
+
+    monkeypatch.setattr(lifecycle_module, "_fsync_directory", record_fsync)
+    monkeypatch.setattr(lifecycle_module.os, "replace", record_replace)
+
+    lifecycle_module._durable_replace_directory(source, destination)
+
+    assert destination.is_dir()
+    assert events == [
+        "fsync:.creating-work_001",
+        "replace",
+        f"fsync:{tmp_path.name}",
+    ]
+
+
+def test_create_catalog_registration_happens_after_durable_directory_publish(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repository = WorkLifecycleRepository(tmp_path)
+    events: list[str] = []
+    original_publish = lifecycle_module._durable_replace_directory
+    original_repository_write = lifecycle_module.repository_write
+
+    def record_publish(source: Path, destination: Path) -> None:
+        events.append("publish")
+        original_publish(source, destination)
+
+    def record_repository_write(database_path: str | Path):
+        if Path(database_path).resolve() == repository.paths.master_db.resolve():
+            events.append("master-write")
+        return original_repository_write(database_path)
+
+    monkeypatch.setattr(
+        lifecycle_module,
+        "_durable_replace_directory",
+        record_publish,
+    )
+    monkeypatch.setattr(
+        lifecycle_module,
+        "repository_write",
+        record_repository_write,
+    )
+
+    repository.create_work(work_id="work_ordered", title="Ordered")
+
+    assert "publish" in events
+    assert "master-write" in events
+    assert events.index("publish") < events.index("master-write")
+
+
+def test_parent_directory_fsync_failure_leaves_recoverable_orphan(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repository = WorkLifecycleRepository(tmp_path)
+    original_fsync = lifecycle_module._fsync_directory
+
+    def fail_works_parent(path: Path) -> None:
+        directory = Path(path)
+        if directory.resolve() == repository.paths.works.resolve():
+            raise OSError("simulated parent directory fsync failure")
+        original_fsync(directory)
+
+    monkeypatch.setattr(lifecycle_module, "_fsync_directory", fail_works_parent)
+
+    with pytest.raises(
+        WorkCreationError,
+        match="simulated parent directory fsync failure",
+    ):
+        repository.create_work(
+            work_id="work_fsync_orphan",
+            title="Durability Failure",
+        )
+
+    final_root = tmp_path / "works" / "work_fsync_orphan"
+    assert final_root.is_dir()
+    assert not (tmp_path / "works" / ".creating-work_fsync_orphan").exists()
+    assert repository.list_works() == ()
+
+    findings = repository.scan_recovery()
+    assert len(findings) == 1
+    assert findings[0].kind == "UNREGISTERED_WORK_VALID"
+    assert findings[0].work_id == "work_fsync_orphan"
+    assert findings[0].recommended_action == "register"
+
+
 def test_create_cleans_staging_on_filesystem_finalize_failure(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -596,6 +722,56 @@ def test_catalog_registration_failure_preserves_recoverable_orphan_work(
     assert opened.title == "Will Fail"
     _assert_initial_work_revision(opened.database_path, opened.work_id)
     assert repository.scan_recovery() == ()
+
+
+def test_recovery_scan_reports_catalog_work_with_missing_root(
+    tmp_path: Path,
+) -> None:
+    repository = WorkLifecycleRepository(tmp_path)
+    created = repository.create_work(
+        work_id="work_missing_root",
+        title="Missing Root",
+    )
+
+    shutil.rmtree(created.root)
+
+    findings = repository.scan_recovery()
+
+    assert len(findings) == 1
+    finding = findings[0]
+    assert finding.kind == "CATALOG_WORK_MISSING"
+    assert finding.work_id == created.work_id
+    assert finding.path == created.root
+    assert finding.valid is False
+    assert finding.recommended_action is None
+    assert "missing Work directory" in " ".join(finding.diagnostics)
+    assert [entry.work_id for entry in repository.list_works()] == [created.work_id]
+
+
+@pytest.mark.parametrize("critical_name", ["work.sqlite3", "manifest.json"])
+def test_recovery_scan_reports_catalog_work_with_missing_critical_file(
+    tmp_path: Path,
+    critical_name: str,
+) -> None:
+    repository = WorkLifecycleRepository(tmp_path)
+    created = repository.create_work(
+        work_id=f"work_missing_{critical_name.split('.')[0]}",
+        title="Missing Critical File",
+    )
+    critical_path = created.root / critical_name
+    critical_path.unlink()
+
+    findings = repository.scan_recovery()
+
+    assert len(findings) == 1
+    finding = findings[0]
+    assert finding.kind == "CATALOG_WORK_INCOMPLETE"
+    assert finding.work_id == created.work_id
+    assert finding.path == created.root
+    assert finding.valid is False
+    assert finding.recommended_action is None
+    assert str(critical_path) in " ".join(finding.diagnostics)
+    assert [entry.work_id for entry in repository.list_works()] == [created.work_id]
 
 
 def test_catalog_path_escape_is_rejected(tmp_path: Path) -> None:
