@@ -15,7 +15,7 @@ from manga_autopilot.storage import (
     bootstrap_master_database,
     bootstrap_work_database,
     connect_write,
-    create_entity_revision,
+    create_work_entity_revision,
     create_master_commit,
     create_work_commit,
     repository_read,
@@ -214,7 +214,7 @@ def test_create_work_commit_requires_explicit_transaction(tmp_path: Path) -> Non
         connection.close()
 
 
-def test_create_entity_revision_canonicalizes_state_inside_transaction(
+def test_create_work_entity_revision_canonicalizes_state_inside_transaction(
     tmp_path: Path,
 ) -> None:
     database = tmp_path / "work.sqlite3"
@@ -233,7 +233,7 @@ def test_create_entity_revision_canonicalizes_state_inside_transaction(
             operation_type="create_work",
             created_at="2026-09-20T00:00:00+00:00",
         )
-        revision = create_entity_revision(
+        revision = create_work_entity_revision(
             connection,
             revision_id="revision_001",
             entity_type="work",
@@ -264,14 +264,14 @@ def test_create_entity_revision_canonicalizes_state_inside_transaction(
     assert row["created_at"] == commit.created_at
 
 
-def test_create_entity_revision_requires_explicit_transaction(tmp_path: Path) -> None:
+def test_create_work_entity_revision_requires_explicit_transaction(tmp_path: Path) -> None:
     database = tmp_path / "work.sqlite3"
     bootstrap_work_database(database, work_id="work_001")
 
     connection = connect_write(database)
     try:
         with pytest.raises(TransactionRequiredError):
-            create_entity_revision(
+            create_work_entity_revision(
                 connection,
                 revision_id="revision_invalid",
                 entity_type="work",
