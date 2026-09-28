@@ -1568,12 +1568,286 @@ def test_quarantine_invalid_staging_preserves_evidence_and_is_idempotent_for_sca
 
     receipt = destination.with_name(destination.name + ".recovery.json")
     payload = json.loads(receipt.read_text(encoding="utf-8"))
+    assert payload["protocol_version"] == 1
+    assert payload["state"] == "complete"
     assert payload["work_id"] == "work_broken"
     assert payload["source"] == ".creating-work_broken"
+    assert payload["destination"] == destination.name
     assert payload["reason"] == "incomplete crash state"
+    assert payload["prepared_at"]
+    assert payload["completed_at"]
     assert payload["quarantined_at"]
 
+    inspected = repository.inspect_quarantine()
+    assert len(inspected) == 1
+    assert inspected[0].kind == "QUARANTINE_COMPLETE"
     assert repository.scan_recovery() == ()
+
+
+def test_quarantine_failure_before_receipt_preserves_staging(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repository = WorkLifecycleRepository(tmp_path)
+    staging = tmp_path / "works" / ".creating-work_receipt_fail"
+    staging.mkdir()
+    evidence = staging / "partial.txt"
+    evidence.write_text("keep", encoding="utf-8")
+
+    def fail_write(path: Path, payload: dict[str, object]) -> None:
+        raise OSError("simulated receipt write failure")
+
+    monkeypatch.setattr(lifecycle_module, "_write_json_atomic", fail_write)
+
+    with pytest.raises(OSError, match="receipt write failure"):
+        repository.quarantine_staging_work("work_receipt_fail")
+
+    assert staging.is_dir()
+    assert evidence.read_text(encoding="utf-8") == "keep"
+    assert repository.inspect_quarantine() == ()
+    findings = repository.scan_recovery()
+    assert any(
+        finding.kind == "STALE_STAGING_INVALID"
+        and finding.work_id == "work_receipt_fail"
+        for finding in findings
+    )
+
+
+def test_quarantine_move_failure_is_discoverable_and_retryable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repository = WorkLifecycleRepository(tmp_path)
+    staging = tmp_path / "works" / ".creating-work_move_fail"
+    staging.mkdir()
+    (staging / "partial.txt").write_text("keep", encoding="utf-8")
+    original_move = lifecycle_module._durable_move_directory
+
+    def fail_move(source: Path, destination: Path) -> None:
+        raise OSError("simulated move failure")
+
+    monkeypatch.setattr(lifecycle_module, "_durable_move_directory", fail_move)
+
+    with pytest.raises(OSError, match="move failure"):
+        repository.quarantine_staging_work(
+            "work_move_fail",
+            reason="move failed",
+        )
+
+    assert staging.is_dir()
+    quarantine = repository.inspect_quarantine()
+    assert len(quarantine) == 1
+    assert quarantine[0].kind == "QUARANTINE_INCOMPLETE"
+    receipt = quarantine[0].path
+    payload = json.loads(receipt.read_text(encoding="utf-8"))
+    destination_name = payload["destination"]
+    assert payload["state"] == "prepared"
+
+    monkeypatch.setattr(
+        lifecycle_module,
+        "_durable_move_directory",
+        original_move,
+    )
+    destination = repository.quarantine_staging_work("work_move_fail")
+
+    assert destination.name == destination_name
+    assert not staging.exists()
+    completed = json.loads(receipt.read_text(encoding="utf-8"))
+    assert completed["state"] == "complete"
+    assert completed["reason"] == "move failed"
+    assert repository.scan_recovery() == ()
+    inspected = repository.inspect_quarantine()
+    assert len(inspected) == 1
+    assert inspected[0].kind == "QUARANTINE_COMPLETE"
+
+
+def test_quarantine_parent_fsync_failure_after_move_is_retryable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repository = WorkLifecycleRepository(tmp_path)
+    staging = tmp_path / "works" / ".creating-work_fsync_fail"
+    staging.mkdir()
+    (staging / "partial.txt").write_text("keep", encoding="utf-8")
+    original_fsync = lifecycle_module._fsync_directory
+    calls = 0
+
+    def fail_after_move(path: Path) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 4:
+            raise OSError("simulated source parent fsync failure")
+        original_fsync(path)
+
+    monkeypatch.setattr(lifecycle_module, "_fsync_directory", fail_after_move)
+
+    with pytest.raises(OSError, match="source parent fsync failure"):
+        repository.quarantine_staging_work(
+            "work_fsync_fail",
+            reason="directory sync failed",
+        )
+
+    assert not staging.exists()
+    findings = repository.inspect_quarantine()
+    assert len(findings) == 1
+    assert findings[0].kind == "QUARANTINE_INCOMPLETE"
+    receipt = findings[0].path
+    payload = json.loads(receipt.read_text(encoding="utf-8"))
+    destination = receipt.with_name(payload["destination"])
+    assert destination.is_dir()
+
+    monkeypatch.setattr(lifecycle_module, "_fsync_directory", original_fsync)
+    retried = repository.quarantine_staging_work("work_fsync_fail")
+
+    assert retried == destination
+    completed = json.loads(receipt.read_text(encoding="utf-8"))
+    assert completed["state"] == "complete"
+    assert completed["quarantined_at"]
+    assert repository.scan_recovery() == ()
+
+
+def test_quarantine_receipt_completion_failure_retries_same_destination(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repository = WorkLifecycleRepository(tmp_path)
+    staging = tmp_path / "works" / ".creating-work_complete_fail"
+    staging.mkdir()
+    evidence = staging / "partial.txt"
+    evidence.write_text("keep", encoding="utf-8")
+    original_write = lifecycle_module._write_json_atomic
+    calls = 0
+
+    def fail_second_write(path: Path, payload: dict[str, object]) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise OSError("simulated completion receipt failure")
+        original_write(path, payload)
+
+    monkeypatch.setattr(lifecycle_module, "_write_json_atomic", fail_second_write)
+
+    with pytest.raises(OSError, match="completion receipt failure"):
+        repository.quarantine_staging_work(
+            "work_complete_fail",
+            reason="receipt failed",
+        )
+
+    assert not staging.exists()
+    quarantine = repository.inspect_quarantine()
+    assert len(quarantine) == 1
+    finding = quarantine[0]
+    assert finding.kind == "QUARANTINE_INCOMPLETE"
+    receipt = finding.path
+    prepared = json.loads(receipt.read_text(encoding="utf-8"))
+    destination = receipt.with_name(prepared["destination"])
+    assert destination.is_dir()
+    assert (destination / "partial.txt").read_text(encoding="utf-8") == "keep"
+
+    monkeypatch.setattr(lifecycle_module, "_write_json_atomic", original_write)
+    retried = repository.quarantine_staging_work("work_complete_fail")
+
+    assert retried == destination
+    completed = json.loads(receipt.read_text(encoding="utf-8"))
+    assert completed["state"] == "complete"
+    assert completed["reason"] == "receipt failed"
+    assert repository.scan_recovery() == ()
+
+
+def test_quarantine_recovers_legacy_receiptless_destination(
+    tmp_path: Path,
+) -> None:
+    repository = WorkLifecycleRepository(tmp_path)
+    quarantine_root = tmp_path / "works" / ".recovery-quarantine"
+    quarantine_root.mkdir()
+    destination = (
+        quarantine_root
+        / "20260928T000000000000Z-creating-work_legacy_quarantine"
+    )
+    destination.mkdir()
+    evidence = destination / "partial.txt"
+    evidence.write_text("legacy evidence", encoding="utf-8")
+
+    findings = repository.inspect_quarantine()
+
+    assert len(findings) == 1
+    assert findings[0].kind == "QUARANTINE_INCOMPLETE"
+    assert findings[0].work_id == "work_legacy_quarantine"
+
+    retried = repository.quarantine_staging_work(
+        "work_legacy_quarantine",
+        reason="recovered old crash window",
+    )
+
+    assert retried == destination
+    assert evidence.read_text(encoding="utf-8") == "legacy evidence"
+    receipt = destination.with_name(destination.name + ".recovery.json")
+    payload = json.loads(receipt.read_text(encoding="utf-8"))
+    assert payload["state"] == "complete"
+    assert payload["recovered_receipt"] is True
+    assert repository.scan_recovery() == ()
+
+
+def test_quarantine_rejects_multiple_incomplete_states(
+    tmp_path: Path,
+) -> None:
+    repository = WorkLifecycleRepository(tmp_path)
+    quarantine_root = tmp_path / "works" / ".recovery-quarantine"
+    quarantine_root.mkdir()
+    for stamp in ("20260928T000000000000Z", "20260928T000001000000Z"):
+        destination = (
+            quarantine_root
+            / f"{stamp}-creating-work_ambiguous_quarantine"
+        )
+        destination.mkdir()
+        (destination / "partial.txt").write_text(stamp, encoding="utf-8")
+
+    findings = repository.inspect_quarantine()
+
+    assert len(findings) == 2
+    assert all(
+        finding.kind == "QUARANTINE_INCOMPLETE"
+        and finding.work_id == "work_ambiguous_quarantine"
+        for finding in findings
+    )
+    with pytest.raises(WorkRecoveryError, match="multiple incomplete quarantine"):
+        repository.quarantine_staging_work("work_ambiguous_quarantine")
+
+
+def test_durable_quarantine_move_syncs_source_and_destination_parents(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_parent = tmp_path / "works"
+    destination_parent = source_parent / ".recovery-quarantine"
+    source_parent.mkdir()
+    destination_parent.mkdir()
+    source = source_parent / ".creating-work_sync"
+    source.mkdir()
+    destination = destination_parent / "entry"
+    events: list[tuple[str, Path]] = []
+    original_replace = lifecycle_module.os.replace
+
+    def record_fsync(path: Path) -> None:
+        events.append(("fsync", Path(path)))
+
+    def record_replace(source_path: Path, destination_path: Path) -> None:
+        events.append(("replace", Path(source_path)))
+        original_replace(source_path, destination_path)
+
+    monkeypatch.setattr(lifecycle_module, "_fsync_directory", record_fsync)
+    monkeypatch.setattr(lifecycle_module.os, "replace", record_replace)
+
+    lifecycle_module._durable_move_directory(source, destination)
+
+    assert events == [
+        ("fsync", source),
+        ("replace", source),
+        ("fsync", source_parent),
+        ("fsync", destination_parent),
+    ]
+    assert destination.is_dir()
+    assert not source.exists()
 
 
 def test_finalize_staging_is_idempotent_after_directory_move(

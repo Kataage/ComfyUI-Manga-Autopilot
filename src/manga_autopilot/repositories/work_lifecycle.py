@@ -154,6 +154,8 @@ def _utc_now_iso() -> str:
 
 
 _WORK_CREATION_LOCK_PREFIX = ".work-creation-lock-"
+_QUARANTINE_RECEIPT_SUFFIX = ".recovery.json"
+_QUARANTINE_PROTOCOL_VERSION = 1
 
 
 class _WorkCreationLockActiveError(RuntimeError):
@@ -286,6 +288,15 @@ def _durable_replace_directory(source: Path, destination: Path) -> None:
     _fsync_directory(source)
     os.replace(source, destination)
     _fsync_directory(destination.parent)
+
+
+def _durable_move_directory(source: Path, destination: Path) -> None:
+    """Move a directory durably when source and destination parents differ."""
+    _fsync_directory(source)
+    os.replace(source, destination)
+    _fsync_directory(source.parent)
+    if destination.parent != source.parent:
+        _fsync_directory(destination.parent)
 
 
 def _write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
@@ -1025,6 +1036,179 @@ class WorkLifecycleRepository:
             catalog=refreshed_catalog,
         )
 
+    def inspect_quarantine(self) -> tuple[WorkRecoveryFinding, ...]:
+        """Inspect completed and incomplete quarantine states without mutation."""
+        quarantine_root = self.paths.works / WORK_RECOVERY_QUARANTINE_DIR
+        if not quarantine_root.exists() and not quarantine_root.is_symlink():
+            return ()
+
+        try:
+            assert_managed_path(
+                quarantine_root,
+                containment_root=self.paths.works,
+                field_name="recovery quarantine",
+            )
+        except ValueError as exc:
+            return (
+                WorkRecoveryFinding(
+                    kind="QUARANTINE_INVALID",
+                    path=quarantine_root,
+                    work_id=None,
+                    valid=False,
+                    recommended_action=None,
+                    diagnostics=(str(exc),),
+                ),
+            )
+        if quarantine_root.is_symlink() or not quarantine_root.is_dir():
+            return (
+                WorkRecoveryFinding(
+                    kind="QUARANTINE_INVALID",
+                    path=quarantine_root,
+                    work_id=None,
+                    valid=False,
+                    recommended_action=None,
+                    diagnostics=(
+                        "recovery quarantine must be a real directory: "
+                        f"{quarantine_root}",
+                    ),
+                ),
+            )
+
+        findings: list[WorkRecoveryFinding] = []
+        receipt_destinations: set[Path] = set()
+        for receipt in sorted(
+            quarantine_root.glob(f"*{_QUARANTINE_RECEIPT_SUFFIX}"),
+            key=lambda item: item.name,
+        ):
+            destination = receipt.with_name(
+                receipt.name[: -len(_QUARANTINE_RECEIPT_SUFFIX)]
+            )
+            receipt_destinations.add(destination)
+            try:
+                assert_managed_regular_file(
+                    receipt,
+                    containment_root=quarantine_root,
+                    field_name="quarantine receipt",
+                )
+                payload = json.loads(receipt.read_text(encoding="utf-8"))
+                if not isinstance(payload, dict):
+                    raise ValueError("quarantine receipt root must be an object")
+                raw_work_id = payload.get("work_id")
+                if not isinstance(raw_work_id, str):
+                    raise ValueError("quarantine receipt work_id must be a string")
+                work_id = validate_work_id(raw_work_id)
+                state = payload.get("state", "complete")
+                if state not in {"prepared", "complete"}:
+                    raise ValueError(
+                        f"unsupported quarantine receipt state: {state!r}"
+                    )
+                declared_destination = payload.get("destination")
+                if (
+                    declared_destination is not None
+                    and declared_destination != destination.name
+                ):
+                    raise ValueError(
+                        "quarantine receipt destination does not match filename"
+                    )
+                assert_managed_path(
+                    destination,
+                    containment_root=quarantine_root,
+                    field_name="quarantine evidence destination",
+                )
+            except Exception as exc:
+                findings.append(
+                    WorkRecoveryFinding(
+                        kind="QUARANTINE_INVALID",
+                        path=receipt,
+                        work_id=None,
+                        valid=False,
+                        recommended_action=None,
+                        diagnostics=(f"{type(exc).__name__}: {exc}",),
+                    )
+                )
+                continue
+
+            staging = self.paths.works / f"{WORK_STAGING_PREFIX}{work_id}"
+            destination_exists = (
+                destination.is_dir() and not destination.is_symlink()
+            )
+            staging_exists = staging.exists() or staging.is_symlink()
+
+            if state == "complete" and destination_exists:
+                findings.append(
+                    WorkRecoveryFinding(
+                        kind="QUARANTINE_COMPLETE",
+                        path=destination,
+                        work_id=work_id,
+                        valid=True,
+                        recommended_action=None,
+                        diagnostics=(),
+                    )
+                )
+                continue
+
+            if state == "prepared" and (
+                (staging_exists and not destination_exists)
+                or (destination_exists and not staging_exists)
+            ):
+                findings.append(
+                    WorkRecoveryFinding(
+                        kind="QUARANTINE_INCOMPLETE",
+                        path=receipt,
+                        work_id=work_id,
+                        valid=False,
+                        recommended_action="quarantine",
+                        diagnostics=(
+                            "quarantine protocol is prepared but not complete",
+                        ),
+                    )
+                )
+                continue
+
+            findings.append(
+                WorkRecoveryFinding(
+                    kind="QUARANTINE_INVALID",
+                    path=destination if destination_exists else receipt,
+                    work_id=work_id,
+                    valid=False,
+                    recommended_action=None,
+                    diagnostics=(
+                        "quarantine receipt/filesystem state is inconsistent",
+                    ),
+                )
+            )
+
+        for destination in sorted(
+            (
+                item
+                for item in quarantine_root.iterdir()
+                if item.is_dir() and item not in receipt_destinations
+            ),
+            key=lambda item: item.name,
+        ):
+            marker = f"-{WORK_STAGING_PREFIX[1:]}"
+            _prefix, separator, raw_work_id = destination.name.partition(marker)
+            work_id: str | None = None
+            if separator and raw_work_id:
+                try:
+                    work_id = validate_work_id(raw_work_id)
+                except ValueError:
+                    work_id = None
+            findings.append(
+                WorkRecoveryFinding(
+                    kind="QUARANTINE_INCOMPLETE",
+                    path=destination,
+                    work_id=work_id,
+                    valid=False,
+                    recommended_action="quarantine" if work_id else None,
+                    diagnostics=(
+                        "quarantined evidence directory has no recovery receipt",
+                    ),
+                )
+            )
+
+        return tuple(findings)
+
     def scan_recovery(self) -> tuple[WorkRecoveryFinding, ...]:
         """Detect incomplete Work/catalog states without mutating either side."""
         with repository_read(self.paths.master_db) as connection:
@@ -1035,7 +1219,11 @@ class WorkLifecycleRepository:
         catalog_entries = tuple(_catalog_entry(row) for row in catalog_rows)
         cataloged_ids = {entry.work_id for entry in catalog_entries}
 
-        findings: list[WorkRecoveryFinding] = []
+        findings: list[WorkRecoveryFinding] = [
+            finding
+            for finding in self.inspect_quarantine()
+            if finding.kind != "QUARANTINE_COMPLETE"
+        ]
         for catalog in sorted(catalog_entries, key=lambda entry: entry.work_id):
             relative = Path(catalog.relative_work_path)
             if relative.is_absolute() or ".." in relative.parts:
@@ -1380,17 +1568,12 @@ class WorkLifecycleRepository:
         *,
         reason: str | None = None,
     ) -> Path:
-        """Move stale staging aside without deleting its evidence."""
+        """Move stale staging into a durable, retryable quarantine protocol."""
         work_paths(self.storage_root, work_id)  # validates one safe component
         staging = self.paths.works / f"{WORK_STAGING_PREFIX}{work_id}"
 
         try:
             with _work_creation_lock(self.paths.works, work_id):
-                if not staging.exists() and not staging.is_symlink():
-                    raise WorkRecoveryError(
-                        f"staging Work does not exist for {work_id!r}: {staging}"
-                    )
-
                 quarantine_root = (
                     self.paths.works / WORK_RECOVERY_QUARANTINE_DIR
                 )
@@ -1407,33 +1590,160 @@ class WorkLifecycleRepository:
                         "recovery quarantine must not be a symlink: "
                         f"{quarantine_root}"
                     )
+                quarantine_created = not quarantine_root.exists()
                 quarantine_root.mkdir(exist_ok=True)
+                if quarantine_created:
+                    _fsync_directory(self.paths.works)
 
-                stamp = datetime.now(timezone.utc).strftime(
-                    "%Y%m%dT%H%M%S%fZ"
-                )
-                destination = quarantine_root / (
-                    f"{stamp}-{WORK_STAGING_PREFIX[1:]}{work_id}"
-                )
-                try:
-                    assert_managed_path(
-                        destination,
-                        containment_root=quarantine_root,
-                        field_name="recovery quarantine destination",
+                prepared_candidates: list[
+                    tuple[Path, Path, dict[str, Any]]
+                ] = []
+                completed: list[Path] = []
+                orphaned: list[Path] = []
+                for finding in self.inspect_quarantine():
+                    if finding.work_id != work_id:
+                        continue
+                    if finding.kind == "QUARANTINE_COMPLETE":
+                        completed.append(finding.path)
+                    elif finding.kind == "QUARANTINE_INCOMPLETE":
+                        if finding.path.suffix == ".json":
+                            receipt = finding.path
+                            destination = receipt.with_name(
+                                receipt.name[: -len(_QUARANTINE_RECEIPT_SUFFIX)]
+                            )
+                            try:
+                                payload = json.loads(
+                                    receipt.read_text(encoding="utf-8")
+                                )
+                            except (OSError, json.JSONDecodeError):
+                                continue
+                            if isinstance(payload, dict):
+                                prepared_candidates.append(
+                                    (destination, receipt, payload)
+                                )
+                        elif finding.path.is_dir():
+                            orphaned.append(finding.path)
+
+                if len(prepared_candidates) > 1 or len(orphaned) > 1:
+                    raise WorkRecoveryError(
+                        "multiple incomplete quarantine states exist for "
+                        f"{work_id!r}; manual inspection is required"
                     )
-                except ValueError as exc:
-                    raise WorkRecoveryError(str(exc)) from exc
-                os.replace(staging, destination)
+                if prepared_candidates and orphaned:
+                    raise WorkRecoveryError(
+                        "conflicting quarantine states exist for "
+                        f"{work_id!r}; manual inspection is required"
+                    )
+                prepared = (
+                    prepared_candidates[0] if prepared_candidates else None
+                )
 
-                _write_json_atomic(
-                    destination.with_name(
-                        destination.name + ".recovery.json"
-                    ),
-                    {
+                staging_exists = staging.exists() or staging.is_symlink()
+                if staging_exists and orphaned:
+                    raise WorkRecoveryError(
+                        "receipt-less quarantine evidence already exists for "
+                        f"{work_id!r}; refusing to create another copy"
+                    )
+                if not staging_exists:
+                    if prepared is not None:
+                        destination, receipt, payload = prepared
+                        if not destination.is_dir() or destination.is_symlink():
+                            raise WorkRecoveryError(
+                                "prepared quarantine destination is missing or "
+                                f"invalid: {destination}"
+                            )
+                        _fsync_directory(self.paths.works)
+                        _fsync_directory(quarantine_root)
+                        completed_at = _utc_now_iso()
+                        completed_payload = {
+                            **payload,
+                            "state": "complete",
+                            "completed_at": completed_at,
+                            "quarantined_at": (
+                                payload.get("quarantined_at") or completed_at
+                            ),
+                        }
+                        _write_json_atomic(receipt, completed_payload)
+                        return destination
+                    if orphaned:
+                        destination = sorted(orphaned, key=lambda p: p.name)[-1]
+                        receipt = destination.with_name(
+                            destination.name + _QUARANTINE_RECEIPT_SUFFIX
+                        )
+                        completed_at = _utc_now_iso()
+                        _fsync_directory(self.paths.works)
+                        _fsync_directory(quarantine_root)
+                        _write_json_atomic(
+                            receipt,
+                            {
+                                "protocol_version": _QUARANTINE_PROTOCOL_VERSION,
+                                "state": "complete",
+                                "work_id": work_id,
+                                "source": staging.name,
+                                "destination": destination.name,
+                                "prepared_at": None,
+                                "completed_at": completed_at,
+                                "quarantined_at": completed_at,
+                                "reason": reason,
+                                "recovered_receipt": True,
+                            },
+                        )
+                        return destination
+                    if completed:
+                        return sorted(completed, key=lambda p: p.name)[-1]
+                    raise WorkRecoveryError(
+                        f"staging Work does not exist for {work_id!r}: {staging}"
+                    )
+
+                if prepared is None:
+                    stamp = datetime.now(timezone.utc).strftime(
+                        "%Y%m%dT%H%M%S%fZ"
+                    )
+                    destination = quarantine_root / (
+                        f"{stamp}-{WORK_STAGING_PREFIX[1:]}{work_id}"
+                    )
+                    receipt = destination.with_name(
+                        destination.name + _QUARANTINE_RECEIPT_SUFFIX
+                    )
+                    try:
+                        assert_managed_path(
+                            destination,
+                            containment_root=quarantine_root,
+                            field_name="recovery quarantine destination",
+                        )
+                    except ValueError as exc:
+                        raise WorkRecoveryError(str(exc)) from exc
+                    prepared_at = _utc_now_iso()
+                    payload = {
+                        "protocol_version": _QUARANTINE_PROTOCOL_VERSION,
+                        "state": "prepared",
                         "work_id": work_id,
                         "source": staging.name,
-                        "quarantined_at": _utc_now_iso(),
+                        "destination": destination.name,
+                        "prepared_at": prepared_at,
+                        "completed_at": None,
+                        "quarantined_at": None,
                         "reason": reason,
+                    }
+                    _write_json_atomic(receipt, payload)
+                else:
+                    destination, receipt, payload = prepared
+                    if destination.exists() or destination.is_symlink():
+                        raise WorkRecoveryError(
+                            "prepared quarantine destination already exists "
+                            "while staging is also present"
+                        )
+
+                _durable_move_directory(staging, destination)
+
+                completed_at = _utc_now_iso()
+                _write_json_atomic(
+                    receipt,
+                    {
+                        **payload,
+                        "state": "complete",
+                        "completed_at": completed_at,
+                        "quarantined_at": completed_at,
                     },
                 )
                 return destination
