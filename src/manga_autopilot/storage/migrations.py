@@ -12,6 +12,7 @@ up only when at least one migration is pending.
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import os
@@ -428,6 +429,43 @@ def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+_UNSUPPORTED_DIRECTORY_FSYNC_ERRNOS = frozenset(
+    code
+    for code in (
+        errno.EINVAL,
+        getattr(errno, "ENOTSUP", None),
+        getattr(errno, "EOPNOTSUPP", None),
+    )
+    if code is not None
+)
+
+
+def _fsync_directory(path: Path) -> None:
+    """Persist directory-entry changes where the platform supports it."""
+    if os.name == "nt":
+        # Python cannot portably open directory handles for fsync on Windows.
+        # Publication remains atomic there; Windows durability is covered by
+        # the platform's normal file APIs rather than POSIX emulation.
+        return
+
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as exc:
+        if exc.errno in _UNSUPPORTED_DIRECTORY_FSYNC_ERRNOS:
+            return
+        raise
+
+    try:
+        try:
+            os.fsync(descriptor)
+        except OSError as exc:
+            if exc.errno not in _UNSUPPORTED_DIRECTORY_FSYNC_ERRNOS:
+                raise
+    finally:
+        os.close(descriptor)
+
+
 def _migration_database_path(database_path: str | Path) -> Path:
     raw = Path(database_path).expanduser().absolute()
     if raw.is_symlink():
@@ -593,6 +631,7 @@ class MigrationRunner:
 
             try:
                 os.link(staged, path)
+                _fsync_directory(path.parent)
             except FileExistsError:
                 # Another process won the publication race. Never replace or
                 # delete its database; validate/use the published winner.
@@ -889,6 +928,7 @@ class MigrationRunner:
                 )
 
             os.replace(temp, backup)
+            _fsync_directory(backup.parent)
             return backup
         except MigrationError:
             cleanup_temp_best_effort()
