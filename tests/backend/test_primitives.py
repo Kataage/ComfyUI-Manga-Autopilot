@@ -11,6 +11,7 @@ from pathlib import Path
 
 import pytest
 
+import manga_autopilot.primitives as primitives_module
 from manga_autopilot.primitives import (
     CANONICAL_JSON_VERSION,
     FINGERPRINT_VERSION,
@@ -130,6 +131,24 @@ def test_canonical_json_rejects_non_finite_float(value: float) -> None:
     with pytest.raises(ValueError, match="NaN or Infinity"):
         canonical_json({"score": value})
 
+
+def test_canonical_json_rejects_non_binary64_runtime(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class UnsupportedFloatInfo:
+        radix = 10
+        mant_dig = 16
+        max_exp = 999
+        min_exp = -999
+
+    monkeypatch.setattr(
+        primitives_module.sys,
+        "float_info",
+        UnsupportedFloatInfo(),
+    )
+
+    with pytest.raises(RuntimeError, match="requires IEEE-754 binary64"):
+        canonical_json(0.5)
 
 def test_canonical_json_rejects_decimal_like_numbers_explicitly() -> None:
     with pytest.raises(TypeError, match="decimal.Decimal"):
