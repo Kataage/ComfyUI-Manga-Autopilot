@@ -35,7 +35,9 @@ from manga_autopilot.storage.migrations import (
     sqlite_constraint_check,
     sqlite_integrity_check,
     sqlite_post_migration_check,
+    sqlite_quick_check,
     validate_work_database,
+    verify_work_database_for_open,
 )
 from manga_autopilot.storage.paths import (
     ASSET_SUBDIRS,
@@ -200,6 +202,7 @@ __all__ = [
     "migrate_master_database",
     "migrate_work_database",
     "validate_work_database",
+    "verify_work_database_for_open",
     "project_paths",
     "read_connection",
     "repository_read",
@@ -210,6 +213,7 @@ __all__ = [
     "sqlite_constraint_check",
     "sqlite_integrity_check",
     "sqlite_post_migration_check",
+    "sqlite_quick_check",
     "storage_paths",
     "validate_manifest_common",
     "validate_work_id",

@@ -34,6 +34,7 @@ from manga_autopilot.storage import (
     read_master_identity,
     read_work_identity,
     validate_work_database,
+    verify_work_database_for_open,
     write_connection,
 )
 
@@ -420,6 +421,151 @@ def test_work_inspection_is_structural_while_full_validation_checks_constraints(
     assert inspected.current_version == WORK_MIGRATIONS[-1].version
     with pytest.raises(MigrationIntegrityError, match="foreign_key_check failed"):
         validate_work_database(database, work_id="work_001")
+
+
+def test_fast_work_open_validation_uses_quick_check_and_foreign_keys(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = tmp_path / "work.sqlite3"
+    bootstrap_work_database(database, work_id="work_001")
+
+    calls: list[str] = []
+    original_quick_check = migrations_module.sqlite_quick_check
+    original_constraint_check = migrations_module.sqlite_constraint_check
+
+    def quick_check(connection: sqlite3.Connection) -> None:
+        calls.append("quick")
+        original_quick_check(connection)
+
+    def constraint_check(connection: sqlite3.Connection) -> None:
+        calls.append("foreign_keys")
+        original_constraint_check(connection)
+
+    monkeypatch.setattr(migrations_module, "sqlite_quick_check", quick_check)
+    monkeypatch.setattr(
+        migrations_module,
+        "sqlite_constraint_check",
+        constraint_check,
+    )
+
+    result = verify_work_database_for_open(
+        database,
+        work_id="work_001",
+    )
+
+    assert result.current_version == WORK_MIGRATIONS[-1].version
+    assert result.applied_versions == ()
+    assert result.backup_path is None
+    assert calls == ["quick", "foreign_keys"]
+
+
+def test_fast_work_open_validation_does_not_run_full_integrity_check(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = tmp_path / "work.sqlite3"
+    bootstrap_work_database(database, work_id="work_001")
+
+    def fail_full_integrity(_connection: sqlite3.Connection) -> None:
+        raise AssertionError("full integrity_check must not run on fast open")
+
+    monkeypatch.setattr(
+        migrations_module,
+        "sqlite_integrity_check",
+        fail_full_integrity,
+    )
+
+    result = verify_work_database_for_open(
+        database,
+        work_id="work_001",
+    )
+
+    assert result.current_version == WORK_MIGRATIONS[-1].version
+
+
+def test_fast_work_open_validation_rejects_foreign_key_violation(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "work.sqlite3"
+    bootstrap_work_database(database, work_id="work_001")
+
+    raw = sqlite3.connect(database)
+    try:
+        raw.execute("PRAGMA foreign_keys = OFF")
+        raw.execute(
+            """
+            INSERT INTO entity_revisions (
+                id,
+                entity_type,
+                entity_id,
+                entity_revision,
+                commit_seq,
+                change_kind,
+                created_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "revision_fast_fk",
+                "work",
+                "work_001",
+                1,
+                999999,
+                "corrupt",
+                "2026-09-20T00:00:00+00:00",
+            ),
+        )
+        raw.commit()
+    finally:
+        raw.close()
+
+    with pytest.raises(MigrationIntegrityError, match="foreign_key_check failed"):
+        verify_work_database_for_open(database, work_id="work_001")
+
+
+def test_fast_work_open_validation_surfaces_quick_check_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = tmp_path / "work.sqlite3"
+    bootstrap_work_database(database, work_id="work_001")
+
+    def fail_quick_check(_connection: sqlite3.Connection) -> None:
+        raise MigrationIntegrityError("simulated quick-check corruption")
+
+    monkeypatch.setattr(
+        migrations_module,
+        "sqlite_quick_check",
+        fail_quick_check,
+    )
+
+    with pytest.raises(
+        MigrationIntegrityError,
+        match="simulated quick-check corruption",
+    ):
+        verify_work_database_for_open(database, work_id="work_001")
+
+
+def test_full_work_validation_still_runs_full_integrity_check(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "work.sqlite3"
+    bootstrap_work_database(database, work_id="work_001")
+    calls: list[str] = []
+
+    def full_integrity(connection: sqlite3.Connection) -> None:
+        calls.append("integrity")
+        assert connection.execute("PRAGMA query_only").fetchone()[0] == 1
+
+    result = validate_work_database(
+        database,
+        work_id="work_001",
+        pre_integrity_check=full_integrity,
+    )
+
+    assert result.current_version == WORK_MIGRATIONS[-1].version
+    assert calls == ["integrity"]
 
 
 def test_pending_work_migration_can_repair_existing_foreign_key_violation(

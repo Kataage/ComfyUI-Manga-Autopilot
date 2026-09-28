@@ -326,6 +326,16 @@ def sqlite_integrity_check(connection: sqlite3.Connection) -> None:
         )
 
 
+def sqlite_quick_check(connection: sqlite3.Connection) -> None:
+    """Run SQLite's faster structural check for normal Work open."""
+    rows = connection.execute("PRAGMA quick_check").fetchall()
+    messages = [str(row[0]) for row in rows]
+    if messages != ["ok"]:
+        raise MigrationIntegrityError(
+            "SQLite quick_check failed: " + "; ".join(messages)
+        )
+
+
 def sqlite_constraint_check(connection: sqlite3.Connection) -> None:
     """Reject unresolved SQLite foreign-key violations."""
     rows = connection.execute("PRAGMA foreign_key_check").fetchall()
@@ -955,6 +965,29 @@ def inspect_work_database(
     ).inspect_existing(database_path)
 
 
+def verify_work_database_for_open(
+    database_path: str | Path,
+    *,
+    migrations: Iterable[Migration] = WORK_MIGRATIONS,
+    work_id: str | None = None,
+) -> MigrationResult:
+    """Run the fast validation policy required before normal Work open.
+
+    The fast path validates recognized migration history/checksums/prefix,
+    Work database identity, SQLite quick_check, and foreign-key constraints.
+    It intentionally does not run the full integrity_check.
+    """
+    migration_set = tuple(migrations)
+    return _work_migration_runner(
+        migrations=migration_set,
+        app_version=None,
+        work_id=work_id,
+        pre_integrity_check=sqlite_quick_check,
+        post_integrity_check=None,
+        fresh_initializer=None,
+    ).validate_existing(database_path)
+
+
 def validate_work_database(
     database_path: str | Path,
     *,
@@ -962,12 +995,12 @@ def validate_work_database(
     work_id: str | None = None,
     pre_integrity_check: IntegrityHook | None = sqlite_integrity_check,
 ) -> MigrationResult:
-    """Validate an existing Work DB with the same policy used by normal open.
+    """Fully validate an existing Work DB without applying migrations.
 
-    This path is strictly read-only: it validates recognized migration history
-    (including checksums and prefix ordering), database identity, SQLite
-    integrity, and persisted foreign-key constraints without applying pending
-    migrations or creating migration metadata.
+    This heavier path validates recognized migration history, database
+    identity, full SQLite integrity, and persisted foreign-key constraints.
+    It is intended for recovery, explicit verification, and other paths where
+    full database verification is required.
     """
     migration_set = tuple(migrations)
     return _work_migration_runner(
@@ -1054,4 +1087,6 @@ __all__ = [
     "sqlite_constraint_check",
     "sqlite_integrity_check",
     "sqlite_post_migration_check",
+    "sqlite_quick_check",
+    "verify_work_database_for_open",
 ]
