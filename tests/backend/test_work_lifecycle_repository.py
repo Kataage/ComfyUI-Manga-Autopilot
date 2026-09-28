@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import json
+import multiprocessing
 import os
 import shutil
 import sqlite3
+import threading
 from pathlib import Path
 
 import pytest
@@ -53,6 +55,22 @@ def _recovery_tree_snapshot(root: Path) -> dict[str, bytes]:
         for path in root.rglob("*")
         if path.is_file() and not path.is_symlink()
     }
+
+
+def _hold_work_creation_lock_in_child(
+    storage_root: str,
+    work_id: str,
+    ready: object,
+    release: object,
+) -> None:
+    works_root = Path(storage_root) / "works"
+    staging = works_root / f".creating-{work_id}"
+    with lifecycle_module._work_creation_lock(works_root, work_id):
+        staging.mkdir(exist_ok=False)
+        (staging / "partial.txt").write_text("owned", encoding="utf-8")
+        ready.set()
+        if not release.wait(20):
+            raise RuntimeError("timed out waiting to release child owner")
 
 
 def _assert_initial_work_revision(database: Path, work_id: str) -> None:
@@ -110,6 +128,135 @@ def _assert_initial_work_revision(database: Path, work_id: str) -> None:
         "completed_at": metadata["completed_at"],
     }
     assert revision["after_json"] == canonical_json(expected_state)
+
+
+def test_concurrent_same_work_creator_cannot_delete_owner_staging(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repository = WorkLifecycleRepository(tmp_path)
+    entered = threading.Event()
+    release = threading.Event()
+    owner_errors: list[BaseException] = []
+    owner_handles: list[object] = []
+    original_bootstrap = lifecycle_module.bootstrap_work_database
+
+    def blocking_bootstrap(*args: object, **kwargs: object):
+        if kwargs.get("work_id") == "work_race":
+            entered.set()
+            if not release.wait(20):
+                raise RuntimeError("timed out waiting to continue owner creation")
+        return original_bootstrap(*args, **kwargs)
+
+    monkeypatch.setattr(
+        lifecycle_module,
+        "bootstrap_work_database",
+        blocking_bootstrap,
+    )
+
+    def owner_create() -> None:
+        try:
+            owner_handles.append(
+                repository.create_work(
+                    work_id="work_race",
+                    title="Winning Creator",
+                )
+            )
+        except BaseException as exc:
+            owner_errors.append(exc)
+
+    owner = threading.Thread(target=owner_create)
+    owner.start()
+    assert entered.wait(20)
+
+    staging = tmp_path / "works" / ".creating-work_race"
+    evidence = staging / "owner-evidence.txt"
+    evidence.write_text("do not delete", encoding="utf-8")
+
+    try:
+        with pytest.raises(WorkCreationError, match="already active|already exists"):
+            repository.create_work(
+                work_id="work_race",
+                title="Losing Creator",
+            )
+        assert evidence.read_text(encoding="utf-8") == "do not delete"
+    finally:
+        release.set()
+        owner.join(20)
+
+    assert not owner.is_alive()
+    assert owner_errors == []
+    assert len(owner_handles) == 1
+    final_evidence = tmp_path / "works" / "work_race" / evidence.name
+    assert final_evidence.read_text(encoding="utf-8") == "do not delete"
+    assert [entry.work_id for entry in repository.list_works()] == ["work_race"]
+
+
+def test_active_cross_process_staging_is_not_recoverable(
+    tmp_path: Path,
+) -> None:
+    repository = WorkLifecycleRepository(tmp_path)
+    context = multiprocessing.get_context("spawn")
+    ready = context.Event()
+    release = context.Event()
+    owner = context.Process(
+        target=_hold_work_creation_lock_in_child,
+        args=(str(tmp_path), "work_active", ready, release),
+    )
+    owner.start()
+    assert ready.wait(20)
+
+    staging = tmp_path / "works" / ".creating-work_active"
+    try:
+        findings = repository.scan_recovery()
+        assert len(findings) == 1
+        finding = findings[0]
+        assert finding.kind == "ACTIVE_STAGING"
+        assert finding.work_id == "work_active"
+        assert finding.valid is False
+        assert finding.recommended_action is None
+        assert "active creator" in " ".join(finding.diagnostics)
+
+        with pytest.raises(WorkRecoveryError, match="still active"):
+            repository.finalize_staging_work("work_active")
+        with pytest.raises(WorkRecoveryError, match="still active"):
+            repository.quarantine_staging_work("work_active")
+        assert (staging / "partial.txt").read_text(encoding="utf-8") == "owned"
+    finally:
+        release.set()
+        owner.join(20)
+
+    assert owner.exitcode == 0
+    findings = repository.scan_recovery()
+    assert len(findings) == 1
+    assert findings[0].kind == "STALE_STAGING_INVALID"
+    assert findings[0].recommended_action == "quarantine"
+
+    destination = repository.quarantine_staging_work(
+        "work_active",
+        reason="owner exited",
+    )
+    assert (destination / "partial.txt").read_text(encoding="utf-8") == "owned"
+    assert repository.scan_recovery() == ()
+
+
+def test_create_does_not_clean_up_preexisting_unowned_staging(
+    tmp_path: Path,
+) -> None:
+    repository = WorkLifecycleRepository(tmp_path)
+    staging = tmp_path / "works" / ".creating-work_existing"
+    staging.mkdir()
+    evidence = staging / "partial.txt"
+    evidence.write_text("preexisting evidence", encoding="utf-8")
+
+    with pytest.raises(WorkCreationError, match="staging directory already exists"):
+        repository.create_work(
+            work_id="work_existing",
+            title="Must Not Delete",
+        )
+
+    assert staging.is_dir()
+    assert evidence.read_text(encoding="utf-8") == "preexisting evidence"
 
 
 def test_create_open_list_and_reopen_work(tmp_path: Path) -> None:
