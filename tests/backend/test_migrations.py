@@ -20,6 +20,7 @@ from manga_autopilot.storage import (
     MigrationApplyError,
     MigrationBackupError,
     MigrationDriftError,
+    MigrationError,
     MigrationIntegrityError,
     MigrationRunner,
     MigrationValidationError,
@@ -1194,6 +1195,89 @@ def test_existing_work_with_mismatched_work_id_is_rejected_before_upgrade(
         f"{database.name}.backup-v{WORK_MIGRATIONS[-1].version}-to-v{next_version}"
     ).exists()
 
+def test_fresh_database_publication_fsyncs_parent_after_link(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = tmp_path / "generic.sqlite3"
+    events: list[str] = []
+    original_link = migrations_module.os.link
+
+    def record_link(
+        source: str | bytes | Path,
+        destination: str | bytes | Path,
+        *args: object,
+        **kwargs: object,
+    ) -> None:
+        events.append("link")
+        original_link(source, destination, *args, **kwargs)
+
+    def record_fsync(directory: Path) -> None:
+        assert Path(directory) == tmp_path
+        events.append("fsync-parent")
+
+    monkeypatch.setattr(migrations_module.os, "link", record_link)
+    monkeypatch.setattr(migrations_module, "_fsync_directory", record_fsync)
+
+    result = MigrationRunner(
+        database_kind="test",
+        migrations=(Migration(version=1, name="first"),),
+    ).migrate(database)
+
+    assert result.current_version == 1
+    assert events == ["link", "fsync-parent"]
+
+
+def test_fresh_database_parent_fsync_failure_leaves_retryable_publication(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = tmp_path / "generic.sqlite3"
+    migrations = (Migration(version=1, name="first"),)
+    original_fsync = migrations_module._fsync_directory
+
+    def fail_fsync(_directory: Path) -> None:
+        raise OSError(errno.EIO, "simulated parent directory fsync failure")
+
+    monkeypatch.setattr(migrations_module, "_fsync_directory", fail_fsync)
+
+    with pytest.raises(MigrationError, match="failed to publish fresh database"):
+        MigrationRunner(
+            database_kind="test",
+            migrations=migrations,
+        ).migrate(database)
+
+    assert database.is_file()
+    assert [row["version"] for row in _applied_rows(database)] == [1]
+    assert not list(tmp_path.glob(".generic.sqlite3.init-*"))
+
+    monkeypatch.setattr(
+        migrations_module,
+        "_fsync_directory",
+        original_fsync,
+    )
+    result = MigrationRunner(
+        database_kind="test",
+        migrations=migrations,
+    ).migrate(database)
+
+    assert result.current_version == 1
+    assert result.applied_versions == ()
+
+
+def test_migration_directory_fsync_is_noop_on_windows(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def unexpected_open(*args: object, **kwargs: object) -> int:
+        raise AssertionError("directory open must not be attempted on Windows")
+
+    monkeypatch.setattr(migrations_module.os, "name", "nt")
+    monkeypatch.setattr(migrations_module.os, "open", unexpected_open)
+
+    migrations_module._fsync_directory(tmp_path)
+
+
 def test_concurrent_fresh_master_bootstrap_never_deletes_winner(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1444,6 +1528,69 @@ def test_current_schema_integrity_failure_is_not_reported_as_success(
             migrations=migrations,
             pre_integrity_check=fail_validation,
         ).migrate(database)
+
+def test_backup_parent_fsync_failure_blocks_migration_and_preserves_backup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = tmp_path / "master.sqlite3"
+    bootstrap_master_database(database, database_id="master_test")
+    next_version = MASTER_MIGRATIONS[-1].version + 1
+    migrations = (
+        *MASTER_MIGRATIONS,
+        Migration(
+            version=next_version,
+            name=f"M{next_version:04d}_durability",
+            statements=("CREATE TABLE must_not_run (id INTEGER PRIMARY KEY)",),
+        ),
+    )
+    backup = database.with_name(
+        f"{database.name}.backup-v{MASTER_MIGRATIONS[-1].version}-to-v{next_version}"
+    )
+    original_fsync = migrations_module._fsync_directory
+
+    def fail_fsync(directory: Path) -> None:
+        assert Path(directory) == tmp_path
+        raise OSError(errno.EIO, "simulated backup directory fsync failure")
+
+    monkeypatch.setattr(migrations_module, "_fsync_directory", fail_fsync)
+
+    with pytest.raises(MigrationBackupError) as exc_info:
+        migrate_master_database(database, migrations=migrations)
+
+    error = exc_info.value
+    assert error.pending_versions == (next_version,)
+    assert error.target_version == next_version
+    assert isinstance(error.cause, OSError)
+    assert error.cause.errno == errno.EIO
+    assert backup.is_file()
+
+    with read_connection(database) as connection:
+        assert connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE name = 'must_not_run'"
+        ).fetchone() is None
+        version = connection.execute(
+            f"SELECT MAX(version) FROM {SCHEMA_MIGRATIONS_TABLE}"
+        ).fetchone()[0]
+    assert version == MASTER_MIGRATIONS[-1].version
+
+    with read_connection(backup) as connection:
+        assert connection.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+        version = connection.execute(
+            f"SELECT MAX(version) FROM {SCHEMA_MIGRATIONS_TABLE}"
+        ).fetchone()[0]
+    assert version == MASTER_MIGRATIONS[-1].version
+
+    monkeypatch.setattr(
+        migrations_module,
+        "_fsync_directory",
+        original_fsync,
+    )
+    result = migrate_master_database(database, migrations=migrations)
+
+    assert result.current_version == next_version
+    assert result.backup_path == backup
+
 
 def test_backup_temp_directory_failure_keeps_pending_migration_attribution(
     tmp_path: Path,
