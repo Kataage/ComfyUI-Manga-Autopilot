@@ -153,11 +153,15 @@ def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-_UNSUPPORTED_DIRECTORY_FSYNC_ERRNOS = {
-    errno.EINVAL,
-    errno.ENOTSUP,
-    getattr(errno, "EOPNOTSUPP", errno.ENOTSUP),
-}
+_UNSUPPORTED_DIRECTORY_FSYNC_ERRNOS = frozenset(
+    code
+    for code in (
+        errno.EINVAL,
+        getattr(errno, "ENOTSUP", None),
+        getattr(errno, "EOPNOTSUPP", None),
+    )
+    if code is not None
+)
 
 
 def _fsync_directory(path: Path) -> None:
@@ -930,6 +934,23 @@ class WorkLifecycleRepository:
 
         findings: list[WorkRecoveryFinding] = []
         for catalog in sorted(catalog_entries, key=lambda entry: entry.work_id):
+            catalog_path = self.storage_root / Path(catalog.relative_work_path)
+            if catalog_path.is_symlink():
+                findings.append(
+                    WorkRecoveryFinding(
+                        kind="CATALOG_WORK_PATH_INVALID",
+                        path=catalog_path,
+                        work_id=catalog.work_id,
+                        valid=False,
+                        recommended_action=None,
+                        diagnostics=(
+                            f"catalog Work target must not be a symlink: "
+                            f"{catalog_path}",
+                        ),
+                    )
+                )
+                continue
+
             try:
                 root = self._resolve_catalog_path(catalog.relative_work_path)
             except WorkIdentityMismatchError as exc:
@@ -976,12 +997,16 @@ class WorkLifecycleRepository:
                 )
                 continue
 
-            missing_critical = tuple(
+            invalid_critical = tuple(
                 candidate
                 for candidate in (root / "work.sqlite3", root / "manifest.json")
-                if not candidate.exists()
+                if (
+                    not candidate.exists()
+                    or candidate.is_symlink()
+                    or not candidate.is_file()
+                )
             )
-            if missing_critical:
+            if invalid_critical:
                 findings.append(
                     WorkRecoveryFinding(
                         kind="CATALOG_WORK_INCOMPLETE",
@@ -990,8 +1015,9 @@ class WorkLifecycleRepository:
                         valid=False,
                         recommended_action=None,
                         diagnostics=tuple(
-                            f"cataloged Work is missing critical file: {candidate}"
-                            for candidate in missing_critical
+                            "cataloged Work critical file is missing or invalid: "
+                            f"{candidate}"
+                            for candidate in invalid_critical
                         ),
                     )
                 )
