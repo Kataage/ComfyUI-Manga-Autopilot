@@ -515,6 +515,19 @@ def test_create_rejects_duplicate_work_id_without_overwrite(tmp_path: Path) -> N
     assert first.database_path.is_file()
 
 
+def test_directory_fsync_is_noop_on_windows(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def unexpected_open(*args: object, **kwargs: object) -> int:
+        raise AssertionError("directory open must not be attempted on Windows")
+
+    monkeypatch.setattr(lifecycle_module.os, "name", "nt")
+    monkeypatch.setattr(lifecycle_module.os, "open", unexpected_open)
+
+    lifecycle_module._fsync_directory(tmp_path)
+
+
 def test_atomic_json_write_fsyncs_parent_directory(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
