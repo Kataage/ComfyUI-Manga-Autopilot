@@ -1148,10 +1148,16 @@ class WorkLifecycleRepository:
 
             if entry.name.startswith(WORK_STAGING_PREFIX):
                 work_id = entry.name[len(WORK_STAGING_PREFIX) :] or None
-                if (
-                    work_id is not None
-                    and _work_creation_is_active(self.paths.works, work_id)
-                ):
+                creation_active = False
+                if work_id is not None:
+                    try:
+                        creation_active = _work_creation_is_active(
+                            self.paths.works,
+                            work_id,
+                        )
+                    except ValueError:
+                        creation_active = False
+                if creation_active:
                     findings.append(
                         WorkRecoveryFinding(
                             kind="ACTIVE_STAGING",
@@ -1330,7 +1336,6 @@ class WorkLifecycleRepository:
             )
         return _catalog_entry(row)
 
-
     def finalize_staging_work(self, work_id: str) -> WorkCatalogEntry:
         """Finalize a complete stale staging Work and register it idempotently."""
         final_paths = work_paths(self.storage_root, work_id)
@@ -1436,7 +1441,6 @@ class WorkLifecycleRepository:
             raise WorkRecoveryError(
                 f"Work creation is still active for {work_id!r}"
             ) from exc
-
 
     def _validate_recovery_directory(
         self,
