@@ -934,7 +934,24 @@ class WorkLifecycleRepository:
 
         findings: list[WorkRecoveryFinding] = []
         for catalog in sorted(catalog_entries, key=lambda entry: entry.work_id):
-            catalog_path = self.storage_root / Path(catalog.relative_work_path)
+            relative = Path(catalog.relative_work_path)
+            if relative.is_absolute() or ".." in relative.parts:
+                findings.append(
+                    WorkRecoveryFinding(
+                        kind="CATALOG_WORK_PATH_INVALID",
+                        path=self.storage_root,
+                        work_id=catalog.work_id,
+                        valid=False,
+                        recommended_action=None,
+                        diagnostics=(
+                            f"unsafe catalog work path: "
+                            f"{catalog.relative_work_path!r}",
+                        ),
+                    )
+                )
+                continue
+
+            catalog_path = self.storage_root / relative
             if catalog_path.is_symlink():
                 findings.append(
                     WorkRecoveryFinding(
