@@ -13,7 +13,9 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
+from manga_autopilot.primitives import canonical_json
 from manga_autopilot.storage.sqlite import read_connection, write_connection
 
 
@@ -61,6 +63,21 @@ class MasterCommit:
 
     commit_seq: int
     commit_id: str
+    created_at: str
+
+
+@dataclass(frozen=True)
+class EntityRevision:
+    """Persisted entity revision identity and canonical state snapshots."""
+
+    revision_id: str
+    entity_type: str
+    entity_id: str
+    entity_revision: int
+    commit_seq: int
+    change_kind: str
+    before_json: str | None
+    after_json: str | None
     created_at: str
 
 
@@ -175,6 +192,85 @@ def create_work_commit(
     )
 
 
+def create_entity_revision(
+    connection: sqlite3.Connection,
+    *,
+    revision_id: str,
+    entity_type: str,
+    entity_id: str,
+    entity_revision: int,
+    commit_seq: int,
+    change_kind: str,
+    before_state: Any | None = None,
+    after_state: Any | None = None,
+    created_at: str | None = None,
+) -> EntityRevision:
+    """Insert one canonical entity revision inside the active transaction."""
+    _require_transaction(connection)
+    for field_name, value in (
+        ("revision_id", revision_id),
+        ("entity_type", entity_type),
+        ("entity_id", entity_id),
+        ("change_kind", change_kind),
+    ):
+        if not value.strip():
+            raise ValueError(f"{field_name} must be non-empty")
+    if entity_revision <= 0:
+        raise ValueError("entity_revision must be > 0")
+    if commit_seq <= 0:
+        raise ValueError("commit_seq must be > 0")
+
+    timestamp = created_at or _utc_now_iso()
+    before_json = (
+        canonical_json(before_state)
+        if before_state is not None
+        else None
+    )
+    after_json = (
+        canonical_json(after_state)
+        if after_state is not None
+        else None
+    )
+    connection.execute(
+        """
+        INSERT INTO entity_revisions (
+            id,
+            entity_type,
+            entity_id,
+            entity_revision,
+            commit_seq,
+            change_kind,
+            before_json,
+            after_json,
+            created_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            revision_id,
+            entity_type,
+            entity_id,
+            entity_revision,
+            commit_seq,
+            change_kind,
+            before_json,
+            after_json,
+            timestamp,
+        ),
+    )
+    return EntityRevision(
+        revision_id=revision_id,
+        entity_type=entity_type,
+        entity_id=entity_id,
+        entity_revision=entity_revision,
+        commit_seq=commit_seq,
+        change_kind=change_kind,
+        before_json=before_json,
+        after_json=after_json,
+        created_at=timestamp,
+    )
+
+
 def create_master_commit(
     connection: sqlite3.Connection,
     *,
@@ -222,12 +318,14 @@ def create_master_commit(
 
 
 __all__ = [
+    "EntityRevision",
     "MasterCommit",
     "PersistenceError",
     "RevisionConflictError",
     "TransactionRequiredError",
     "WorkCommit",
     "assert_expected_revision",
+    "create_entity_revision",
     "create_master_commit",
     "create_work_commit",
     "repository_read",
