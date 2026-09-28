@@ -67,7 +67,7 @@ class MasterCommit:
 
 
 @dataclass(frozen=True)
-class EntityRevision:
+class WorkEntityRevision:
     """Persisted entity revision identity and canonical state snapshots."""
 
     revision_id: str
@@ -192,7 +192,7 @@ def create_work_commit(
     )
 
 
-def create_entity_revision(
+def create_work_entity_revision(
     connection: sqlite3.Connection,
     *,
     revision_id: str,
@@ -204,7 +204,7 @@ def create_entity_revision(
     before_state: Any | None = None,
     after_state: Any | None = None,
     created_at: str | None = None,
-) -> EntityRevision:
+) -> WorkEntityRevision:
     """Insert one canonical entity revision inside the active transaction."""
     _require_transaction(connection)
     for field_name, value in (
@@ -258,7 +258,7 @@ def create_entity_revision(
             timestamp,
         ),
     )
-    return EntityRevision(
+    return WorkEntityRevision(
         revision_id=revision_id,
         entity_type=entity_type,
         entity_id=entity_id,
@@ -318,14 +318,14 @@ def create_master_commit(
 
 
 __all__ = [
-    "EntityRevision",
+    "WorkEntityRevision",
     "MasterCommit",
     "PersistenceError",
     "RevisionConflictError",
     "TransactionRequiredError",
     "WorkCommit",
     "assert_expected_revision",
-    "create_entity_revision",
+    "create_work_entity_revision",
     "create_master_commit",
     "create_work_commit",
     "repository_read",
