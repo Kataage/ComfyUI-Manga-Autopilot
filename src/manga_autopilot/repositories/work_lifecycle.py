@@ -435,7 +435,11 @@ class WorkLifecycleRepository:
         universe_id: str | None = None,
         series_id: str | None = None,
     ) -> WorkHandle:
-        """Create a self-contained Work and register it in the Master catalog."""
+        """Create a self-contained standalone Work and register it in Master.
+
+        Master-linked lineage is rejected until immutable source snapshots can
+        be persisted inside the Work.
+        """
         for field_name, value in (
             ("title", title),
             ("work_kind", work_kind),
