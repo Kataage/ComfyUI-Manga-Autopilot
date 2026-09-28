@@ -21,6 +21,7 @@ from manga_autopilot.storage import (
     WORK_STAGING_PREFIX,
     Migration,
     MigrationError,
+    WorkHeadIntegrityError,
     WorkPaths,
     assert_managed_path,
     assert_managed_regular_file,
@@ -36,6 +37,7 @@ from manga_autopilot.storage import (
     repository_write,
     storage_paths,
     validate_work_database,
+    validate_work_head_integrity,
     validate_work_id,
     verify_work_database_for_open,
     work_paths,
@@ -937,6 +939,17 @@ class WorkLifecycleRepository:
                 f"failed to upgrade Work {work_id!r} before open: {exc}"
             ) from exc
 
+        try:
+            with repository_read(inspection.database_path) as connection:
+                metadata = validate_work_head_integrity(
+                    connection,
+                    expected_work_id=work_id,
+                )
+        except WorkHeadIntegrityError as exc:
+            raise WorkIdentityMismatchError(
+                f"Work head integrity failed for {work_id!r}: {exc}"
+            ) from exc
+
         schema_version = migration.current_version
         created_at = str(manifest.get("created_at") or _utc_now_iso())
         normalized_manifest = _live_manifest(
@@ -974,17 +987,6 @@ class WorkLifecycleRepository:
             raise WorkIdentityMismatchError(
                 f"Work DB identity mismatch: catalog={work_id!r}, "
                 f"database={identity.work_id!r}"
-            )
-
-        with repository_read(inspection.database_path) as connection:
-            metadata = connection.execute(
-                "SELECT * FROM work_metadata WHERE work_id = ?",
-                (work_id,),
-            ).fetchone()
-
-        if metadata is None:
-            raise WorkIdentityMismatchError(
-                f"Work DB has no authoritative work_metadata row for {work_id!r}"
             )
 
         metadata_lineage_fields = _master_lineage_fields(
@@ -1783,32 +1785,19 @@ class WorkLifecycleRepository:
                     work_id=inspection.work_id,
                 )
                 with repository_read(inspection.database_path) as connection:
-                    metadata = connection.execute(
-                        """
-                        SELECT
-                            work_id,
-                            universe_source_id,
-                            series_source_id,
-                            source_checkpoint_id
-                        FROM work_metadata
-                        WHERE work_id = ?
-                        """,
-                        (inspection.work_id,),
-                    ).fetchone()
-                if metadata is None:
-                    diagnostics.append(
-                        f"work_metadata row is missing for {inspection.work_id!r}"
+                    metadata = validate_work_head_integrity(
+                        connection,
+                        expected_work_id=inspection.work_id,
                     )
-                else:
-                    lineage_fields = _master_lineage_fields(
-                        universe_source_id=metadata["universe_source_id"],
-                        series_source_id=metadata["series_source_id"],
-                        source_checkpoint_id=metadata["source_checkpoint_id"],
+                lineage_fields = _master_lineage_fields(
+                    universe_source_id=metadata["universe_source_id"],
+                    series_source_id=metadata["series_source_id"],
+                    source_checkpoint_id=metadata["source_checkpoint_id"],
+                )
+                if lineage_fields:
+                    raise WorkIdentityMismatchError(
+                        _unsnapshotted_master_lineage_message(lineage_fields)
                     )
-                    if lineage_fields:
-                        raise WorkIdentityMismatchError(
-                            _unsnapshotted_master_lineage_message(lineage_fields)
-                        )
         except Exception as exc:
             message = str(exc)
             if snapshot_root is not None:
