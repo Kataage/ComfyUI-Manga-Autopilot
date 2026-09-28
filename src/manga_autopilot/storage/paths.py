@@ -48,14 +48,22 @@ WORK_RESERVED_ID_PREFIXES: tuple[str, ...] = (".",)
 ASSET_SUBDIRS: tuple[str, ...] = ("characters", "panels", "pages", "temp")
 EXPORT_SUBDIRS: tuple[str, ...] = ("pages", "webtoon", "pdf")
 
+# Windows reserves the DOS device names below case-insensitively, even when
+# followed by an extension. COM/LPT ports include ASCII digits 1..9 and the
+# ISO-8859-1 superscript digits ¹, ², and ³ (for example COM¹ or LPT².log).
+_WINDOWS_RESERVED_PORT_SUFFIXES = tuple(str(index) for index in range(1, 10)) + (
+    "¹",
+    "²",
+    "³",
+)
 _WINDOWS_RESERVED_DEVICE_NAMES = frozenset(
     {
         "CON",
         "PRN",
         "AUX",
         "NUL",
-        *(f"COM{index}" for index in range(1, 10)),
-        *(f"LPT{index}" for index in range(1, 10)),
+        *(f"COM{suffix}" for suffix in _WINDOWS_RESERVED_PORT_SUFFIXES),
+        *(f"LPT{suffix}" for suffix in _WINDOWS_RESERVED_PORT_SUFFIXES),
     }
 )
 _WINDOWS_INVALID_FILENAME_CHARS = frozenset('<>:"|?*')
