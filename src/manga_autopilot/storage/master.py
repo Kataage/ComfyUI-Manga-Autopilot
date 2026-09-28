@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from manga_autopilot.storage.migrations import (
+    MASTER_DATABASE_KIND_CANONICALIZATION_VERSION,
     MASTER_MIGRATIONS,
     DatabaseIdentityMismatchError,
     MigrationResult,
@@ -71,7 +72,11 @@ def _read_metadata(connection: sqlite3.Connection) -> dict[str, str]:
     return {str(row["key"]): str(row["value"]) for row in rows}
 
 
-def _identity_from_metadata(metadata: dict[str, str]) -> MasterDatabaseIdentity:
+def _identity_from_metadata(
+    metadata: dict[str, str],
+    *,
+    allow_legacy_kind: bool,
+) -> MasterDatabaseIdentity:
     missing = [key for key in _REQUIRED_METADATA_KEYS if not metadata.get(key)]
     if missing:
         raise MasterDatabaseIdentityError(
@@ -79,7 +84,9 @@ def _identity_from_metadata(metadata: dict[str, str]) -> MasterDatabaseIdentity:
             + ", ".join(sorted(missing))
         )
 
-    accepted_kinds = {MASTER_DATABASE_KIND, *LEGACY_MASTER_DATABASE_KINDS}
+    accepted_kinds = {MASTER_DATABASE_KIND}
+    if allow_legacy_kind:
+        accepted_kinds.update(LEGACY_MASTER_DATABASE_KINDS)
     if metadata["database_kind"] not in accepted_kinds:
         raise MasterDatabaseIdentityError(
             "database_kind mismatch: "
@@ -99,7 +106,9 @@ def _identity_from_metadata(metadata: dict[str, str]) -> MasterDatabaseIdentity:
     )
 
 
-def _migration_history_is_known_prefix(connection: sqlite3.Connection) -> bool:
+def _known_migration_history_version(
+    connection: sqlite3.Connection,
+) -> int | None:
     tables = {
         str(row["name"])
         for row in connection.execute(
@@ -107,7 +116,7 @@ def _migration_history_is_known_prefix(connection: sqlite3.Connection) -> bool:
         ).fetchall()
     }
     if "schema_migrations" not in tables or "master_metadata" not in tables:
-        return False
+        return None
 
     rows = connection.execute(
         """
@@ -116,20 +125,21 @@ def _migration_history_is_known_prefix(connection: sqlite3.Connection) -> bool:
         ORDER BY version
         """
     ).fetchall()
-    if not rows:
-        return False
-
-    if len(rows) > len(MASTER_MIGRATIONS):
-        return False
+    if not rows or len(rows) > len(MASTER_MIGRATIONS):
+        return None
 
     for row, migration in zip(rows, MASTER_MIGRATIONS, strict=False):
         if int(row["version"]) != migration.version:
-            return False
+            return None
         if str(row["name"]) != migration.name:
-            return False
+            return None
         if str(row["checksum"]) != migration.checksum:
-            return False
-    return True
+            return None
+    return int(rows[-1]["version"])
+
+
+def _migration_history_is_known_prefix(connection: sqlite3.Connection) -> bool:
+    return _known_migration_history_version(connection) is not None
 
 
 def _table_is_empty(connection: sqlite3.Connection, table: str) -> bool:
@@ -219,10 +229,19 @@ def _recover_interrupted_identity_bootstrap(
 
 
 def read_master_identity(database_path: str | Path) -> MasterDatabaseIdentity:
-    """Read and validate required Master database identity metadata."""
+    """Read and validate Master identity against its known migration generation."""
     with read_connection(database_path) as connection:
         metadata = _read_metadata(connection)
-    return _identity_from_metadata(metadata)
+        history_version = _known_migration_history_version(connection)
+
+    allow_legacy_kind = (
+        history_version is not None
+        and history_version < MASTER_DATABASE_KIND_CANONICALIZATION_VERSION
+    )
+    return _identity_from_metadata(
+        metadata,
+        allow_legacy_kind=allow_legacy_kind,
+    )
 
 
 def bootstrap_master_database(
