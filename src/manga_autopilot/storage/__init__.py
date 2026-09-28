@@ -69,16 +69,16 @@ from manga_autopilot.storage.paths import (
     work_paths,
 )
 from manga_autopilot.storage.repository import (
-    WorkEntityRevision,
     MasterCommit,
     PersistenceError,
     RevisionConflictError,
     TransactionRequiredError,
     WorkCommit,
+    WorkEntityRevision,
     assert_expected_revision,
-    create_work_entity_revision,
     create_master_commit,
     create_work_commit,
+    create_work_entity_revision,
     repository_read,
     repository_write,
 )
