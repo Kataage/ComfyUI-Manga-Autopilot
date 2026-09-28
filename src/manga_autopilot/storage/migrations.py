@@ -449,7 +449,13 @@ def _fsync_directory(path: Path) -> None:
         return
 
     flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
-    descriptor = os.open(path, flags)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as exc:
+        if exc.errno in _UNSUPPORTED_DIRECTORY_FSYNC_ERRNOS:
+            return
+        raise
+
     try:
         try:
             os.fsync(descriptor)
