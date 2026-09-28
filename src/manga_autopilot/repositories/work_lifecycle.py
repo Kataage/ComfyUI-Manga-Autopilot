@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import json
 import os
 import shutil
@@ -152,6 +153,46 @@ def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+_UNSUPPORTED_DIRECTORY_FSYNC_ERRNOS = {
+    errno.EINVAL,
+    errno.ENOTSUP,
+    getattr(errno, "EOPNOTSUPP", errno.ENOTSUP),
+}
+
+
+def _fsync_directory(path: Path) -> None:
+    """Persist directory-entry changes where the platform supports it."""
+    if os.name == "nt":
+        # Python cannot portably open directory handles for fsync on Windows.
+        # Atomic replace still applies there; Windows-specific durability is
+        # covered separately rather than emulating unsafe handle semantics.
+        return
+
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as exc:
+        if exc.errno in _UNSUPPORTED_DIRECTORY_FSYNC_ERRNOS:
+            return
+        raise
+
+    try:
+        try:
+            os.fsync(descriptor)
+        except OSError as exc:
+            if exc.errno not in _UNSUPPORTED_DIRECTORY_FSYNC_ERRNOS:
+                raise
+    finally:
+        os.close(descriptor)
+
+
+def _durable_replace_directory(source: Path, destination: Path) -> None:
+    """Publish a prepared directory before later durable catalog registration."""
+    _fsync_directory(source)
+    os.replace(source, destination)
+    _fsync_directory(destination.parent)
+
+
 def _write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
     if path.is_symlink():
         raise WorkManifestError(f"refusing to replace symlinked JSON file: {path}")
@@ -168,6 +209,7 @@ def _write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temp, path)
+        _fsync_directory(path.parent)
     finally:
         if temp.exists():
             temp.unlink()
@@ -656,7 +698,18 @@ class WorkLifecycleRepository:
             _write_json_atomic(staging_paths.manifest_json, manifest)
             manifest_hash = sha256_file(staging_paths.manifest_json)
 
-            os.replace(staging_paths.root, final_paths.root)
+            # Durability ordering is intentional:
+            # 1. Work DB/manifest content is flushed,
+            # 2. staging directory entries are fsynced where supported,
+            # 3. staging is atomically renamed to its final path,
+            # 4. the Works parent directory is fsynced,
+            # 5. only then may Master durably reference the final Work.
+            #
+            # A crash before step 5 can leave an orphan Work, which recovery
+            # can reconcile. The inverse (durable catalog row with a rename
+            # that was never made durable) is avoided on platforms that expose
+            # directory fsync.
+            _durable_replace_directory(staging_paths.root, final_paths.root)
 
             with repository_write(self.paths.master_db) as connection:
                 connection.execute(
@@ -1038,7 +1091,7 @@ class WorkLifecycleRepository:
                 f"final Work path already exists for {work_id!r}: {final_paths.root}"
             )
 
-        os.replace(staging, final_paths.root)
+        _durable_replace_directory(staging, final_paths.root)
         # If catalog registration fails, leave the finalized Work intact so a
         # later recovery scan can reconcile it without regenerating identity.
         return self.reconcile_orphan_work(work_id)
