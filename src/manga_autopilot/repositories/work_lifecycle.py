@@ -1130,7 +1130,7 @@ class WorkLifecycleRepository:
 
             staging = self.paths.works / f"{WORK_STAGING_PREFIX}{work_id}"
             destination_exists = (
-                destination.exists() and not destination.is_symlink()
+                destination.is_dir() and not destination.is_symlink()
             )
             staging_exists = staging.exists() or staging.is_symlink()
 
@@ -1595,7 +1595,9 @@ class WorkLifecycleRepository:
                 if quarantine_created:
                     _fsync_directory(self.paths.works)
 
-                prepared: tuple[Path, Path, dict[str, Any]] | None = None
+                prepared_candidates: list[
+                    tuple[Path, Path, dict[str, Any]]
+                ] = []
                 completed: list[Path] = []
                 orphaned: list[Path] = []
                 for finding in self.inspect_quarantine():
@@ -1616,11 +1618,32 @@ class WorkLifecycleRepository:
                             except (OSError, json.JSONDecodeError):
                                 continue
                             if isinstance(payload, dict):
-                                prepared = (destination, receipt, payload)
+                                prepared_candidates.append(
+                                    (destination, receipt, payload)
+                                )
                         elif finding.path.is_dir():
                             orphaned.append(finding.path)
 
+                if len(prepared_candidates) > 1 or len(orphaned) > 1:
+                    raise WorkRecoveryError(
+                        "multiple incomplete quarantine states exist for "
+                        f"{work_id!r}; manual inspection is required"
+                    )
+                if prepared_candidates and orphaned:
+                    raise WorkRecoveryError(
+                        "conflicting quarantine states exist for "
+                        f"{work_id!r}; manual inspection is required"
+                    )
+                prepared = (
+                    prepared_candidates[0] if prepared_candidates else None
+                )
+
                 staging_exists = staging.exists() or staging.is_symlink()
+                if staging_exists and orphaned:
+                    raise WorkRecoveryError(
+                        "receipt-less quarantine evidence already exists for "
+                        f"{work_id!r}; refusing to create another copy"
+                    )
                 if not staging_exists:
                     if prepared is not None:
                         destination, receipt, payload = prepared
