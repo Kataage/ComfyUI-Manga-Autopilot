@@ -1149,7 +1149,7 @@ class WorkLifecycleRepository:
                 findings.append(
                     WorkRecoveryFinding(
                         kind="QUARANTINE_INCOMPLETE",
-                        path=destination if destination_exists else receipt,
+                        path=receipt,
                         work_id=work_id,
                         valid=False,
                         recommended_action="quarantine",
