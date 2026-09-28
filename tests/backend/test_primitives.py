@@ -6,11 +6,15 @@ import hashlib
 import json
 import time
 import uuid
+from decimal import Decimal
 from pathlib import Path
 
 import pytest
 
+import manga_autopilot.primitives as primitives_module
 from manga_autopilot.primitives import (
+    CANONICAL_JSON_VERSION,
+    FINGERPRINT_VERSION,
     canonical_json,
     canonical_json_bytes,
     dependency_fingerprint,
@@ -89,9 +93,66 @@ def test_canonical_json_uses_compact_utf8_safe_representation() -> None:
     assert canonical_json_bytes(payload) == serialized.encode("utf-8")
 
 
-def test_canonical_json_rejects_non_json_nan() -> None:
-    with pytest.raises(ValueError):
-        canonical_json({"score": float("nan")})
+def test_canonical_json_v2_numeric_golden_values() -> None:
+    assert CANONICAL_JSON_VERSION == 2
+    assert canonical_json(1) == "1"
+    assert canonical_json(1.0) == "1"
+    assert canonical_json(0.0) == "0"
+    assert canonical_json(-0.0) == "0"
+    assert canonical_json(1.5) == "1.5"
+    assert canonical_json(0.1) == (
+        "0.1000000000000000055511151231257827021181583404541015625"
+    )
+    assert canonical_json(1e-7) == (
+        "0.0000000999999999999999954748111825886258685613938723690807819366455078125"
+    )
+    assert canonical_json(1e20) == "100000000000000000000"
+
+
+def test_canonical_json_numeric_equivalence_produces_same_fingerprint() -> None:
+    assert input_fingerprint({"value": 1}) == input_fingerprint({"value": 1.0})
+    assert input_fingerprint({"value": 0}) == input_fingerprint({"value": -0.0})
+
+
+def test_canonical_json_extreme_finite_floats_round_trip() -> None:
+    values = [
+        float.fromhex("0x0.0000000000001p-1022"),
+        float.fromhex("0x1.fffffffffffffp+1023"),
+    ]
+
+    for value in values:
+        serialized = canonical_json(value)
+        assert json.loads(serialized) == value
+        assert "e" not in serialized.lower()
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
+def test_canonical_json_rejects_non_finite_float(value: float) -> None:
+    with pytest.raises(ValueError, match="NaN or Infinity"):
+        canonical_json({"score": value})
+
+
+def test_canonical_json_rejects_non_binary64_runtime(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class UnsupportedFloatInfo:
+        radix = 10
+        mant_dig = 16
+        max_exp = 999
+        min_exp = -999
+
+    monkeypatch.setattr(
+        primitives_module.sys,
+        "float_info",
+        UnsupportedFloatInfo(),
+    )
+
+    with pytest.raises(RuntimeError, match="requires IEEE-754 binary64"):
+        canonical_json(0.5)
+
+def test_canonical_json_rejects_decimal_like_numbers_explicitly() -> None:
+    with pytest.raises(TypeError, match="decimal.Decimal"):
+        canonical_json({"score": Decimal("1.25")})
 
 
 def test_canonical_json_rejects_non_serializable_values() -> None:
@@ -121,11 +182,19 @@ def test_sha256_file_rejects_invalid_chunk_size(tmp_path: Path) -> None:
         sha256_file(path, chunk_size=0)
 
 
-def test_input_fingerprint_has_explicit_algorithm_prefix() -> None:
+def test_input_fingerprint_has_explicit_versioned_algorithm_prefix() -> None:
     fingerprint = input_fingerprint({"panel": "panel_001", "revision": 4})
 
-    assert fingerprint.startswith("sha256:")
-    assert len(fingerprint) == len("sha256:") + 64
+    assert FINGERPRINT_VERSION == 2
+    assert fingerprint.startswith("sha256:v2:")
+    assert len(fingerprint) == len("sha256:v2:") + 64
+
+
+def test_input_fingerprint_v2_has_golden_numeric_digest() -> None:
+    assert input_fingerprint({"value": 0.1}) == (
+        "sha256:v2:"
+        "f78f3a0e64f80a7808b4b1247f917174d0eb322022fdc0de6f0d74fd496a713d"
+    )
 
 
 def test_dependency_fingerprint_is_stable_and_namespaced() -> None:
