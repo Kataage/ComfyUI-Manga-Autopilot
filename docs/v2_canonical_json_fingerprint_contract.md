@@ -32,7 +32,7 @@ Integers are emitted as their exact base-10 value with no exponent and no unnece
 
 ### Floats
 
-Finite Python floats are treated as IEEE-754 binary64 values. Canonicalization uses `float.as_integer_ratio()` and renders the exact mathematical decimal value of that binary64 number. It does not call `repr()`, `format()`, or the JSON encoder for number rendering.
+Finite Python floats are treated as IEEE-754 binary64 values. Canonicalization verifies the runtime uses binary radix, 53-bit precision, and the binary64 exponent range before serializing a float; an incompatible future runtime fails explicitly instead of silently producing another fingerprint contract. It then uses `float.as_integer_ratio()` and renders the exact mathematical decimal value of that binary64 number. It does not call `repr()`, `format()`, or the JSON encoder for number rendering.
 
 Consequences:
 
