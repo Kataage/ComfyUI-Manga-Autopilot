@@ -185,6 +185,53 @@ def test_open_rejects_unsnapshotted_persisted_master_lineage(
         repository.open_work(created.work_id)
 
 
+def test_open_rejects_unsnapshotted_lineage_before_upgrade_mutation(
+    tmp_path: Path,
+) -> None:
+    base_repository = WorkLifecycleRepository(tmp_path)
+    created = base_repository.create_work(
+        work_id="work_linked_before_upgrade",
+        title="Linked Before Upgrade",
+    )
+    with repository_write(created.database_path) as connection:
+        connection.execute(
+            """
+            UPDATE work_metadata
+            SET series_source_id = 'series_legacy'
+            WHERE work_id = ?
+            """,
+            (created.work_id,),
+        )
+
+    future_migrations = _future_work_migration()
+    target_version = future_migrations[-1].version
+    repository = WorkLifecycleRepository(
+        tmp_path,
+        work_migrations=future_migrations,
+    )
+
+    with pytest.raises(
+        WorkIdentityMismatchError,
+        match="immutable source snapshots",
+    ):
+        repository.open_work(created.work_id)
+
+    with repository_read(created.database_path) as connection:
+        assert connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE name = 'upgrade_probe'"
+        ).fetchone() is None
+        version = connection.execute(
+            "SELECT MAX(version) FROM schema_migrations"
+        ).fetchone()[0]
+
+    assert version == WORK_MIGRATIONS[-1].version
+    backup = created.database_path.with_name(
+        f"{created.database_path.name}.backup-v{WORK_MIGRATIONS[-1].version}"
+        f"-to-v{target_version}"
+    )
+    assert not backup.exists()
+
+
 @pytest.mark.parametrize(
     "reserved_id",
     [
