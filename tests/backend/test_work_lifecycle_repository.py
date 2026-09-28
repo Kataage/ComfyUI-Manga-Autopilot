@@ -1675,7 +1675,7 @@ def test_quarantine_parent_fsync_failure_after_move_is_retryable(
     def fail_after_move(path: Path) -> None:
         nonlocal calls
         calls += 1
-        if calls == 3:
+        if calls == 4:
             raise OSError("simulated source parent fsync failure")
         original_fsync(path)
 
