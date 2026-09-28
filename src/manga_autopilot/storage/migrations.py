@@ -26,6 +26,7 @@ from manga_autopilot.storage.paths import UnsafeStoragePathError
 from manga_autopilot.storage.sqlite import read_connection, write_connection
 
 SCHEMA_MIGRATIONS_TABLE = "schema_migrations"
+MASTER_DATABASE_KIND_CANONICALIZATION_VERSION = 4
 
 _SCHEMA_MIGRATIONS_SQL = f"""
 CREATE TABLE IF NOT EXISTS {SCHEMA_MIGRATIONS_TABLE} (
@@ -482,6 +483,8 @@ class MigrationRunner:
         identity_table: str | None = None,
         identity_key: str = "database_kind",
         accepted_database_kinds: Iterable[str] = (),
+        canonical_database_kind: str | None = None,
+        database_kind_canonicalization_version: int | None = None,
         required_identity_keys: Iterable[str] = (),
         expected_identity_values: Mapping[str, str] | None = None,
         identity_migration_version: int | None = None,
@@ -498,6 +501,32 @@ class MigrationRunner:
         self.identity_table = identity_table
         self.identity_key = identity_key
         self.accepted_database_kinds = frozenset(accepted_database_kinds)
+        self.canonical_database_kind = canonical_database_kind
+        self.database_kind_canonicalization_version = (
+            database_kind_canonicalization_version
+        )
+        if (
+            self.database_kind_canonicalization_version is not None
+            and self.database_kind_canonicalization_version <= 0
+        ):
+            raise ValueError(
+                "database_kind_canonicalization_version must be > 0"
+            )
+        if (
+            self.canonical_database_kind is not None
+            and self.canonical_database_kind not in self.accepted_database_kinds
+        ):
+            raise ValueError(
+                "canonical_database_kind must be one of accepted_database_kinds"
+            )
+        if (
+            self.database_kind_canonicalization_version is not None
+            and self.canonical_database_kind is None
+        ):
+            raise ValueError(
+                "canonical_database_kind is required when "
+                "database_kind_canonicalization_version is set"
+            )
         self.required_identity_keys = tuple(required_identity_keys)
         self.expected_identity_values = dict(expected_identity_values or {})
         self.identity_migration_version = identity_migration_version
@@ -706,6 +735,19 @@ class MigrationRunner:
                 f"existing database is not a readable SQLite database: {path}"
             ) from exc
 
+    def _accepted_kinds_for_history(
+        self,
+        applied: Mapping[int, AppliedMigration],
+    ) -> frozenset[str]:
+        if (
+            self.canonical_database_kind is not None
+            and self.database_kind_canonicalization_version is not None
+            and max(applied, default=0)
+            >= self.database_kind_canonicalization_version
+        ):
+            return frozenset({self.canonical_database_kind})
+        return self.accepted_database_kinds
+
     def _validate_identity(
         self,
         connection: sqlite3.Connection,
@@ -738,8 +780,9 @@ class MigrationRunner:
             )
 
         actual_kind = str(row[0])
-        if actual_kind not in self.accepted_database_kinds:
-            expected = ", ".join(sorted(self.accepted_database_kinds))
+        accepted_kinds = self._accepted_kinds_for_history(applied)
+        if actual_kind not in accepted_kinds:
+            expected = ", ".join(sorted(accepted_kinds))
             raise DatabaseIdentityMismatchError(
                 f"database_kind mismatch for {self.database_kind} database: "
                 f"got {actual_kind!r}; accepted values: {expected}"
@@ -901,6 +944,10 @@ def migrate_master_database(
         post_integrity_check=post_integrity_check,
         identity_table="master_metadata",
         accepted_database_kinds=("master", "manga_autopilot_master"),
+        canonical_database_kind="manga_autopilot_master",
+        database_kind_canonicalization_version=(
+            MASTER_DATABASE_KIND_CANONICALIZATION_VERSION
+        ),
         required_identity_keys=(
             "database_kind",
             "database_id",
@@ -1061,6 +1108,7 @@ def migrate_work_database(
 
 
 __all__ = [
+    "MASTER_DATABASE_KIND_CANONICALIZATION_VERSION",
     "MASTER_MIGRATIONS",
     "SCHEMA_MIGRATIONS_TABLE",
     "WORK_MIGRATIONS",
