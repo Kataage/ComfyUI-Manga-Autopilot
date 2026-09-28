@@ -7,6 +7,7 @@ import json
 import math
 import re
 import secrets
+import sys
 import time
 import uuid
 from pathlib import Path
@@ -51,6 +52,15 @@ def new_id(prefix: str) -> str:
 
 def _canonical_float(value: float) -> str:
     """Serialize one finite binary64 value without runtime float formatting."""
+    if (
+        sys.float_info.radix,
+        sys.float_info.mant_dig,
+        sys.float_info.max_exp,
+        sys.float_info.min_exp,
+    ) != (2, 53, 1024, -1021):
+        raise RuntimeError(
+            "canonical JSON v2 requires IEEE-754 binary64 Python floats"
+        )
     if not math.isfinite(value):
         raise ValueError("canonical JSON does not support NaN or Infinity")
     if value == 0.0:
