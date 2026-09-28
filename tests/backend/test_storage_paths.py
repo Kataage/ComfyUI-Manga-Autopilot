@@ -109,6 +109,12 @@ def test_work_paths_rejects_reserved_internal_namespace(
         "NUL",
         "COM1",
         "LPT9.log",
+        "COM¹",
+        "com²",
+        "CoM³.txt",
+        "LPT¹",
+        "lpt².log",
+        "LpT³",
         "work.",
         "work ",
         "work:stream",
@@ -121,6 +127,34 @@ def test_work_paths_rejects_windows_nonportable_names(
 ) -> None:
     with pytest.raises(ValueError):
         work_paths(tmp_path, unsafe_id)
+
+
+@pytest.mark.parametrize(
+    "unsafe_id",
+    ["COM¹", "com².txt", "LPT³", "lpt¹.log"],
+)
+def test_all_managed_id_paths_reject_superscript_windows_device_names(
+    tmp_path: Path,
+    unsafe_id: str,
+) -> None:
+    with pytest.raises(ValueError, match="Windows-reserved device name"):
+        work_paths(tmp_path, unsafe_id)
+    with pytest.raises(ValueError, match="Windows-reserved device name"):
+        legacy_project_paths(tmp_path, unsafe_id)
+
+    project = project_paths(tmp_path, "project_unicode_safe")
+    with pytest.raises(ValueError, match="Windows-reserved device name"):
+        project.run_dir(unsafe_id)
+
+
+def test_managed_id_paths_accept_legitimate_unicode(tmp_path: Path) -> None:
+    work = work_paths(tmp_path, "作品_第1話")
+    project = legacy_project_paths(tmp_path, "企画_テスト")
+    run = project.run_dir("実行_候補A")
+
+    assert work.work_id == "作品_第1話"
+    assert project.project_id == "企画_テスト"
+    assert run.name == "実行_候補A"
 
 
 def test_legacy_project_paths_has_expected_layout(tmp_path: Path) -> None:
