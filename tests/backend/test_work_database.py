@@ -310,5 +310,11 @@ def test_work_schema_has_no_foreign_key_to_master_tables(tmp_path: Path) -> None
             rows = connection.execute(f"PRAGMA foreign_key_list({table})").fetchall()
             referenced_tables.update(str(row["table"]) for row in rows)
 
+    forbidden_master_tables = {
+        "master_metadata",
+        "master_commits",
+        "master_entity_revisions",
+        "work_catalog",
+    }
     assert not any(name.startswith("master_") for name in referenced_tables)
-    assert referenced_tables <= set(tables)
+    assert referenced_tables.isdisjoint(forbidden_master_tables)
