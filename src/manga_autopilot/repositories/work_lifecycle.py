@@ -1449,13 +1449,18 @@ class WorkLifecycleRepository:
         expected_work_id: str | None,
     ) -> tuple[bool, tuple[str, ...]]:
         diagnostics: list[str] = []
-        if root.is_symlink():
-            return False, (f"symlink recovery entry is not trusted: {root}",)
-        if not root.is_dir():
-            return False, (f"recovery entry is not a directory: {root}",)
-
         snapshot_root: Path | None = None
         try:
+            assert_managed_path(
+                root,
+                containment_root=self.paths.works,
+                field_name="recovery Work root",
+            )
+            if root.is_symlink():
+                return False, (f"symlink recovery entry is not trusted: {root}",)
+            if not root.is_dir():
+                return False, (f"recovery entry is not a directory: {root}",)
+
             with _recovery_validation_snapshot(root) as snapshot_root:
                 inspection = inspect_work_directory(
                     snapshot_root,
