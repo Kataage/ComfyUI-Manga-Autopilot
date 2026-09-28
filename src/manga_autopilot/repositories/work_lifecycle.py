@@ -919,16 +919,83 @@ class WorkLifecycleRepository:
         )
 
     def scan_recovery(self) -> tuple[WorkRecoveryFinding, ...]:
-        """Detect stale staging and unregistered Work directories without mutation."""
+        """Detect incomplete Work/catalog states without mutating either side."""
         with repository_read(self.paths.master_db) as connection:
-            cataloged_ids = {
-                str(row["work_id"])
-                for row in connection.execute(
-                    "SELECT work_id FROM work_catalog"
-                ).fetchall()
-            }
+            catalog_rows = connection.execute(
+                "SELECT * FROM work_catalog"
+            ).fetchall()
+
+        catalog_entries = tuple(_catalog_entry(row) for row in catalog_rows)
+        cataloged_ids = {entry.work_id for entry in catalog_entries}
 
         findings: list[WorkRecoveryFinding] = []
+        for catalog in sorted(catalog_entries, key=lambda entry: entry.work_id):
+            try:
+                root = self._resolve_catalog_path(catalog.relative_work_path)
+            except WorkIdentityMismatchError as exc:
+                findings.append(
+                    WorkRecoveryFinding(
+                        kind="CATALOG_WORK_PATH_INVALID",
+                        path=self.storage_root,
+                        work_id=catalog.work_id,
+                        valid=False,
+                        recommended_action=None,
+                        diagnostics=(str(exc),),
+                    )
+                )
+                continue
+
+            if not root.exists() and not root.is_symlink():
+                findings.append(
+                    WorkRecoveryFinding(
+                        kind="CATALOG_WORK_MISSING",
+                        path=root,
+                        work_id=catalog.work_id,
+                        valid=False,
+                        recommended_action=None,
+                        diagnostics=(
+                            f"catalog points to missing Work directory: {root}",
+                        ),
+                    )
+                )
+                continue
+
+            if root.is_symlink() or not root.is_dir():
+                findings.append(
+                    WorkRecoveryFinding(
+                        kind="CATALOG_WORK_PATH_INVALID",
+                        path=root,
+                        work_id=catalog.work_id,
+                        valid=False,
+                        recommended_action=None,
+                        diagnostics=(
+                            "catalog Work target must be a real directory: "
+                            f"{root}",
+                        ),
+                    )
+                )
+                continue
+
+            missing_critical = tuple(
+                candidate
+                for candidate in (root / "work.sqlite3", root / "manifest.json")
+                if not candidate.exists()
+            )
+            if missing_critical:
+                findings.append(
+                    WorkRecoveryFinding(
+                        kind="CATALOG_WORK_INCOMPLETE",
+                        path=root,
+                        work_id=catalog.work_id,
+                        valid=False,
+                        recommended_action=None,
+                        diagnostics=tuple(
+                            f"cataloged Work is missing critical file: {candidate}"
+                            for candidate in missing_critical
+                        ),
+                    )
+                )
+
         for entry in sorted(self.paths.works.iterdir(), key=lambda path: path.name):
             if entry.name == WORK_RECOVERY_QUARANTINE_DIR:
                 continue
