@@ -310,6 +310,48 @@ def test_wrong_database_identity_is_rejected_before_master_mutation(
         ).fetchone() is None
 
 
+def test_current_master_kind_regression_is_rejected_before_future_backup(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "master.sqlite3"
+    bootstrap_master_database(database, database_id="master_regressed")
+
+    with write_connection(database) as connection:
+        connection.execute(
+            "UPDATE master_metadata SET value = 'master' WHERE key = 'database_kind'"
+        )
+        connection.commit()
+
+    next_version = MASTER_MIGRATIONS[-1].version + 1
+    migrations = (
+        *MASTER_MIGRATIONS,
+        Migration(
+            version=next_version,
+            name=f"M{next_version:04d}_future",
+            statements=("CREATE TABLE future_table (id INTEGER PRIMARY KEY)",),
+        ),
+    )
+
+    with pytest.raises(
+        DatabaseIdentityMismatchError,
+        match="accepted values: manga_autopilot_master",
+    ):
+        migrate_master_database(database, migrations=migrations)
+
+    backup = database.with_name(
+        f"{database.name}.backup-v{MASTER_MIGRATIONS[-1].version}-to-v{next_version}"
+    )
+    assert not backup.exists()
+    with write_connection(database) as connection:
+        assert connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE name = 'future_table'"
+        ).fetchone() is None
+        stored_kind = connection.execute(
+            "SELECT value FROM master_metadata WHERE key = 'database_kind'"
+        ).fetchone()[0]
+    assert stored_kind == "master"
+
+
 def test_checksum_drift_is_rejected(tmp_path: Path) -> None:
     database = tmp_path / "master.sqlite3"
     bootstrap_master_database(database, database_id="master_test")
