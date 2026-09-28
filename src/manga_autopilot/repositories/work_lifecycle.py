@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import json
 import os
 import shutil
@@ -152,6 +153,50 @@ def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+_UNSUPPORTED_DIRECTORY_FSYNC_ERRNOS = frozenset(
+    code
+    for code in (
+        errno.EINVAL,
+        getattr(errno, "ENOTSUP", None),
+        getattr(errno, "EOPNOTSUPP", None),
+    )
+    if code is not None
+)
+
+
+def _fsync_directory(path: Path) -> None:
+    """Persist directory-entry changes where the platform supports it."""
+    if os.name == "nt":
+        # Python cannot portably open directory handles for fsync on Windows.
+        # Atomic replace still applies there; Windows-specific durability is
+        # covered separately rather than emulating unsafe handle semantics.
+        return
+
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as exc:
+        if exc.errno in _UNSUPPORTED_DIRECTORY_FSYNC_ERRNOS:
+            return
+        raise
+
+    try:
+        try:
+            os.fsync(descriptor)
+        except OSError as exc:
+            if exc.errno not in _UNSUPPORTED_DIRECTORY_FSYNC_ERRNOS:
+                raise
+    finally:
+        os.close(descriptor)
+
+
+def _durable_replace_directory(source: Path, destination: Path) -> None:
+    """Publish a prepared directory before later durable catalog registration."""
+    _fsync_directory(source)
+    os.replace(source, destination)
+    _fsync_directory(destination.parent)
+
+
 def _write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
     if path.is_symlink():
         raise WorkManifestError(f"refusing to replace symlinked JSON file: {path}")
@@ -168,6 +213,7 @@ def _write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temp, path)
+        _fsync_directory(path.parent)
     finally:
         if temp.exists():
             temp.unlink()
@@ -656,7 +702,18 @@ class WorkLifecycleRepository:
             _write_json_atomic(staging_paths.manifest_json, manifest)
             manifest_hash = sha256_file(staging_paths.manifest_json)
 
-            os.replace(staging_paths.root, final_paths.root)
+            # Durability ordering is intentional:
+            # 1. Work DB/manifest content is flushed,
+            # 2. staging directory entries are fsynced where supported,
+            # 3. staging is atomically renamed to its final path,
+            # 4. the Works parent directory is fsynced,
+            # 5. only then may Master durably reference the final Work.
+            #
+            # A crash before step 5 can leave an orphan Work, which recovery
+            # can reconcile. The inverse (durable catalog row with a rename
+            # that was never made durable) is avoided on platforms that expose
+            # directory fsync.
+            _durable_replace_directory(staging_paths.root, final_paths.root)
 
             with repository_write(self.paths.master_db) as connection:
                 connection.execute(
@@ -866,16 +923,122 @@ class WorkLifecycleRepository:
         )
 
     def scan_recovery(self) -> tuple[WorkRecoveryFinding, ...]:
-        """Detect stale staging and unregistered Work directories without mutation."""
+        """Detect incomplete Work/catalog states without mutating either side."""
         with repository_read(self.paths.master_db) as connection:
-            cataloged_ids = {
-                str(row["work_id"])
-                for row in connection.execute(
-                    "SELECT work_id FROM work_catalog"
-                ).fetchall()
-            }
+            catalog_rows = connection.execute(
+                "SELECT * FROM work_catalog"
+            ).fetchall()
+
+        catalog_entries = tuple(_catalog_entry(row) for row in catalog_rows)
+        cataloged_ids = {entry.work_id for entry in catalog_entries}
 
         findings: list[WorkRecoveryFinding] = []
+        for catalog in sorted(catalog_entries, key=lambda entry: entry.work_id):
+            relative = Path(catalog.relative_work_path)
+            if relative.is_absolute() or ".." in relative.parts:
+                findings.append(
+                    WorkRecoveryFinding(
+                        kind="CATALOG_WORK_PATH_INVALID",
+                        path=self.storage_root,
+                        work_id=catalog.work_id,
+                        valid=False,
+                        recommended_action=None,
+                        diagnostics=(
+                            f"unsafe catalog work path: "
+                            f"{catalog.relative_work_path!r}",
+                        ),
+                    )
+                )
+                continue
+
+            catalog_path = self.storage_root / relative
+            if catalog_path.is_symlink():
+                findings.append(
+                    WorkRecoveryFinding(
+                        kind="CATALOG_WORK_PATH_INVALID",
+                        path=catalog_path,
+                        work_id=catalog.work_id,
+                        valid=False,
+                        recommended_action=None,
+                        diagnostics=(
+                            f"catalog Work target must not be a symlink: "
+                            f"{catalog_path}",
+                        ),
+                    )
+                )
+                continue
+
+            try:
+                root = self._resolve_catalog_path(catalog.relative_work_path)
+            except WorkIdentityMismatchError as exc:
+                findings.append(
+                    WorkRecoveryFinding(
+                        kind="CATALOG_WORK_PATH_INVALID",
+                        path=self.storage_root,
+                        work_id=catalog.work_id,
+                        valid=False,
+                        recommended_action=None,
+                        diagnostics=(str(exc),),
+                    )
+                )
+                continue
+
+            if not root.exists() and not root.is_symlink():
+                findings.append(
+                    WorkRecoveryFinding(
+                        kind="CATALOG_WORK_MISSING",
+                        path=root,
+                        work_id=catalog.work_id,
+                        valid=False,
+                        recommended_action=None,
+                        diagnostics=(
+                            f"catalog points to missing Work directory: {root}",
+                        ),
+                    )
+                )
+                continue
+
+            if root.is_symlink() or not root.is_dir():
+                findings.append(
+                    WorkRecoveryFinding(
+                        kind="CATALOG_WORK_PATH_INVALID",
+                        path=root,
+                        work_id=catalog.work_id,
+                        valid=False,
+                        recommended_action=None,
+                        diagnostics=(
+                            "catalog Work target must be a real directory: "
+                            f"{root}",
+                        ),
+                    )
+                )
+                continue
+
+            invalid_critical = tuple(
+                candidate
+                for candidate in (root / "work.sqlite3", root / "manifest.json")
+                if (
+                    not candidate.exists()
+                    or candidate.is_symlink()
+                    or not candidate.is_file()
+                )
+            )
+            if invalid_critical:
+                findings.append(
+                    WorkRecoveryFinding(
+                        kind="CATALOG_WORK_INCOMPLETE",
+                        path=root,
+                        work_id=catalog.work_id,
+                        valid=False,
+                        recommended_action=None,
+                        diagnostics=tuple(
+                            "cataloged Work critical file is missing or invalid: "
+                            f"{candidate}"
+                            for candidate in invalid_critical
+                        ),
+                    )
+                )
+
         for entry in sorted(self.paths.works.iterdir(), key=lambda path: path.name):
             if entry.name == WORK_RECOVERY_QUARANTINE_DIR:
                 continue
@@ -1038,7 +1201,7 @@ class WorkLifecycleRepository:
                 f"final Work path already exists for {work_id!r}: {final_paths.root}"
             )
 
-        os.replace(staging, final_paths.root)
+        _durable_replace_directory(staging, final_paths.root)
         # If catalog registration fails, leave the finalized Work intact so a
         # later recovery scan can reconcile it without regenerating identity.
         return self.reconcile_orphan_work(work_id)
