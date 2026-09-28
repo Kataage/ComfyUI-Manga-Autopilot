@@ -232,6 +232,41 @@ def _unsnapshotted_master_lineage_message(fields: Iterable[str]) -> str:
     )
 
 
+def _persisted_master_lineage_fields(
+    database_path: Path,
+    *,
+    work_id: str,
+) -> tuple[str, ...]:
+    """Read persisted lineage when the Work metadata table already exists."""
+    with repository_read(database_path) as connection:
+        table = connection.execute(
+            """
+            SELECT 1
+            FROM sqlite_master
+            WHERE type = 'table' AND name = 'work_metadata'
+            """
+        ).fetchone()
+        if table is None:
+            return ()
+
+        metadata = connection.execute(
+            """
+            SELECT universe_source_id, series_source_id, source_checkpoint_id
+            FROM work_metadata
+            WHERE work_id = ?
+            """,
+            (work_id,),
+        ).fetchone()
+
+    if metadata is None:
+        return ()
+    return _master_lineage_fields(
+        universe_source_id=metadata["universe_source_id"],
+        series_source_id=metadata["series_source_id"],
+        source_checkpoint_id=metadata["source_checkpoint_id"],
+    )
+
+
 def _live_manifest(
     *,
     work_id: str,
@@ -638,6 +673,15 @@ class WorkLifecycleRepository:
             raise WorkIdentityMismatchError(
                 f"portable Work identity mismatch: catalog={work_id!r}, "
                 f"work={inspection.work_id!r}"
+            )
+
+        persisted_lineage_fields = _persisted_master_lineage_fields(
+            inspection.database_path,
+            work_id=work_id,
+        )
+        if persisted_lineage_fields:
+            raise WorkIdentityMismatchError(
+                _unsnapshotted_master_lineage_message(persisted_lineage_fields)
             )
 
         manifest = _read_manifest(inspection.manifest_path)
