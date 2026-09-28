@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import sqlite3
 import threading
 from concurrent.futures import ThreadPoolExecutor
@@ -1470,7 +1471,8 @@ def test_backup_temp_directory_failure_keeps_pending_migration_attribution(
     error = exc_info.value
     assert error.pending_versions == (next_version,)
     assert error.target_version == next_version
-    assert isinstance(error.cause, IsADirectoryError)
+    assert isinstance(error.cause, OSError)
+    assert error.cause.errno in {errno.EACCES, errno.EISDIR, errno.EPERM}
     assert temp.is_dir()
     assert not backup.exists()
     with read_connection(database) as connection:

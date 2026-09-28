@@ -31,3 +31,32 @@ jobs:
         run: ruff check .
       - name: Run pytest
         run: pytest tests/backend/ -q
+
+  windows-persistence:
+    name: windows persistence safety (python 3.11)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+      - name: Install package + dev deps
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev]"
+      - name: Run focused Windows persistence safety suite
+        run: >-
+          python -m pytest
+          tests/backend/test_windows_storage_safety.py
+          tests/backend/test_storage_paths.py
+          tests/backend/test_sqlite_connection.py
+          tests/backend/test_master_database.py
+          tests/backend/test_work_database.py
+          tests/backend/test_migrations.py
+          tests/backend/test_work_manifest.py
+          tests/backend/test_repository_transactions.py
+          tests/backend/test_work_lifecycle_repository.py
+          -q

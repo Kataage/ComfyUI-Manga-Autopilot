@@ -99,6 +99,30 @@ def test_work_paths_rejects_reserved_internal_namespace(
         work_paths(tmp_path, reserved_id)
 
 
+@pytest.mark.parametrize(
+    "unsafe_id",
+    [
+        "CON",
+        "con.txt",
+        "PRN",
+        "AUX",
+        "NUL",
+        "COM1",
+        "LPT9.log",
+        "work.",
+        "work ",
+        "work:stream",
+        "work*bad",
+    ],
+)
+def test_work_paths_rejects_windows_nonportable_names(
+    tmp_path: Path,
+    unsafe_id: str,
+) -> None:
+    with pytest.raises(ValueError):
+        work_paths(tmp_path, unsafe_id)
+
+
 def test_legacy_project_paths_has_expected_layout(tmp_path: Path) -> None:
     paths = legacy_project_paths(tmp_path, "proj_001")
     assert paths.project_id == "proj_001"

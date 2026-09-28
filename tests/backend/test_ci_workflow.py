@@ -45,3 +45,17 @@ def test_ci_workflow_runs_pytest_and_ruff() -> None:
     flat = "\n".join(str(s.get("run", "")) for s in steps)
     assert "pytest" in flat
     assert "ruff" in flat
+
+
+def test_ci_workflow_has_windows_persistence_job() -> None:
+    data = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))
+    job = data["jobs"]["windows-persistence"]
+
+    assert job["runs-on"] == "windows-latest"
+    steps = job["steps"]
+    flat = "\n".join(str(step.get("run", "")) for step in steps)
+    assert "test_windows_storage_safety.py" in flat
+    assert "test_storage_paths.py" in flat
+    assert "test_sqlite_connection.py" in flat
+    assert "test_migrations.py" in flat
+    assert "test_work_lifecycle_repository.py" in flat
