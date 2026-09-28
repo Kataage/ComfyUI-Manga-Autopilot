@@ -663,14 +663,42 @@ def test_legitimate_work_db_edit_does_not_trigger_false_hash_corruption(
     created = repository.create_work(work_id="work_001", title="Catalog Title")
 
     with repository_write(created.database_path) as connection:
+        metadata = connection.execute(
+            "SELECT * FROM work_metadata WHERE work_id = 'work_001'"
+        ).fetchone()
+        assert metadata is not None
+        previous_revision = int(metadata["current_revision"])
+        commit = create_work_commit(
+            connection,
+            commit_id="commit_authoritative_title_edit",
+            actor_type="human",
+            operation_type="edit_work",
+            parent_commit_seq=int(metadata["current_commit_seq"]),
+            reason="test authoritative Work DB edit",
+            created_at="2026-09-20T01:00:00+00:00",
+        )
+        create_work_entity_revision(
+            connection,
+            revision_id="revision_authoritative_title_edit",
+            entity_type="work",
+            entity_id="work_001",
+            entity_revision=previous_revision + 1,
+            commit_seq=commit.commit_seq,
+            change_kind="update",
+            before_state={"title": str(metadata["title"])},
+            after_state={"title": "Authoritative DB Title"},
+            created_at="2026-09-20T01:00:00+00:00",
+        )
         connection.execute(
             """
             UPDATE work_metadata
             SET title = 'Authoritative DB Title',
-                current_revision = current_revision + 1,
+                current_commit_seq = ?,
+                current_revision = ?,
                 updated_at = '2026-09-20T01:00:00+00:00'
             WHERE work_id = 'work_001'
-            """
+            """,
+            (commit.commit_seq, previous_revision + 1),
         )
 
     opened = repository.open_work("work_001")
