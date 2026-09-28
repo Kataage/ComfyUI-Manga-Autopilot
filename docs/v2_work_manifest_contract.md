@@ -60,6 +60,23 @@ exact packaged bytes against the digest.
 `app_version` identifies the application version that wrote the package
 manifest; it does not mean the Work originated with that version.
 
+## Version field types
+
+`format_version` and `work_schema_version` are JSON integer fields. Readers
+require Python's built-in `int` values after JSON decoding; booleans and
+floating-point values are not accepted even when Python equality would make
+them compare equal to an integer.
+
+For example, all of the following are invalid:
+
+- `"format_version": true`
+- `"format_version": 2.0`
+- `"work_schema_version": true`
+- `"work_schema_version": 1.0`
+
+This strict boundary prevents malformed manifests from being treated as legacy
+or current manifests and then silently normalized during open or recovery.
+
 ## Compatibility
 
 - Format v2 is canonical for live and package manifests.
