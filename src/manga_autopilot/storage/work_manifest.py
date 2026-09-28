@@ -114,6 +114,10 @@ def validate_manifest_common(
         WORK_MANIFEST_FORMAT_VERSION,
         *LEGACY_WORK_MANIFEST_FORMAT_VERSIONS,
     }
+    if type(format_version) is not int:
+        raise WorkManifestContractError(
+            "Work manifest format_version must be an integer"
+        )
     if format_version not in accepted_versions:
         raise WorkManifestContractError(
             f"unsupported Work manifest format_version: {format_version!r}"
@@ -137,12 +141,12 @@ def validate_manifest_common(
         )
 
     schema_version = manifest.get("work_schema_version")
-    if not isinstance(schema_version, int) or schema_version < 1:
+    if type(schema_version) is not int or schema_version < 1:
         raise WorkManifestContractError(
             "Work manifest work_schema_version must be a positive integer"
         )
 
-    return int(format_version)
+    return format_version
 
 
 def is_canonical_live_manifest(manifest: dict[str, Any]) -> bool:
@@ -150,7 +154,10 @@ def is_canonical_live_manifest(manifest: dict[str, Any]) -> bool:
     integrity = manifest.get("integrity")
     return (
         manifest.get("format") == WORK_MANIFEST_FORMAT
+        and type(manifest.get("format_version")) is int
         and manifest.get("format_version") == WORK_MANIFEST_FORMAT_VERSION
+        and type(manifest.get("work_schema_version")) is int
+        and int(manifest["work_schema_version"]) >= 1
         and isinstance(integrity, dict)
         and integrity.get("mode") == LIVE_MANIFEST_INTEGRITY_MODE
         and integrity.get("database_hash_policy") == LIVE_MANIFEST_HASH_POLICY
@@ -213,8 +220,8 @@ def _validate_common_inputs(
         raise ValueError("work_id must be non-empty")
     if not database_name or "/" in database_name or "\\" in database_name:
         raise ValueError("database_name must be one filename")
-    if work_schema_version < 1:
-        raise ValueError("work_schema_version must be positive")
+    if type(work_schema_version) is not int or work_schema_version < 1:
+        raise ValueError("work_schema_version must be a positive integer")
     if not created_at:
         raise ValueError("created_at must be non-empty")
 
