@@ -922,6 +922,17 @@ class WorkLifecycleRepository:
         manifest = _read_manifest(inspection.manifest_path)
 
         try:
+            with repository_read(inspection.database_path) as connection:
+                validate_work_head_integrity(
+                    connection,
+                    expected_work_id=work_id,
+                )
+        except WorkHeadIntegrityError as exc:
+            raise WorkIdentityMismatchError(
+                f"Work head integrity failed for {work_id!r}: {exc}"
+            ) from exc
+
+        try:
             if inspection.upgrade_required:
                 migration = migrate_work_database(
                     inspection.database_path,
