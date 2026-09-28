@@ -1404,6 +1404,97 @@ def test_corrupt_work_head_blocks_pending_migration_before_mutation(
     assert not backup.exists()
 
 
+@pytest.mark.parametrize(
+    ("field_name", "invalid_value"),
+    [
+        ("format_version", True),
+        ("format_version", False),
+        ("format_version", 1.0),
+        ("format_version", 2.0),
+        ("work_schema_version", True),
+        ("work_schema_version", False),
+        ("work_schema_version", 1.0),
+        ("work_schema_version", 2.0),
+    ],
+)
+def test_open_rejects_non_integer_manifest_versions_without_normalizing(
+    tmp_path: Path,
+    field_name: str,
+    invalid_value: object,
+) -> None:
+    repository = WorkLifecycleRepository(tmp_path)
+    created = repository.create_work(
+        work_id="work_strict_manifest",
+        title="Strict Manifest",
+    )
+    manifest = json.loads(created.manifest_path.read_text(encoding="utf-8"))
+    manifest[field_name] = invalid_value
+    malformed_bytes = json.dumps(
+        manifest,
+        ensure_ascii=False,
+        sort_keys=True,
+    ).encode("utf-8")
+    created.manifest_path.write_bytes(malformed_bytes)
+
+    with pytest.raises(
+        lifecycle_module.WorkManifestError,
+        match=field_name,
+    ):
+        repository.open_work(created.work_id)
+
+    assert created.manifest_path.read_bytes() == malformed_bytes
+
+
+@pytest.mark.parametrize(
+    ("field_name", "invalid_value"),
+    [
+        ("format_version", True),
+        ("format_version", 2.0),
+        ("work_schema_version", True),
+        ("work_schema_version", 1.0),
+    ],
+)
+def test_recovery_rejects_non_integer_manifest_versions(
+    tmp_path: Path,
+    field_name: str,
+    invalid_value: object,
+) -> None:
+    repository = WorkLifecycleRepository(tmp_path)
+    created = repository.create_work(
+        work_id="work_strict_recovery",
+        title="Strict Recovery",
+    )
+    staging = repository.paths.works / ".creating-work_strict_recovery"
+    os.replace(created.root, staging)
+    with repository_write(repository.paths.master_db) as connection:
+        connection.execute(
+            "DELETE FROM work_catalog WHERE work_id = ?",
+            (created.work_id,),
+        )
+
+    manifest_path = staging / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest[field_name] = invalid_value
+    malformed_bytes = json.dumps(
+        manifest,
+        ensure_ascii=False,
+        sort_keys=True,
+    ).encode("utf-8")
+    manifest_path.write_bytes(malformed_bytes)
+    before = _recovery_tree_snapshot(staging)
+
+    findings = repository.scan_recovery()
+
+    assert _recovery_tree_snapshot(staging) == before
+    assert len(findings) == 1
+    finding = findings[0]
+    assert finding.kind == "STALE_STAGING_INVALID"
+    assert finding.valid is False
+    assert finding.recommended_action == "quarantine"
+    assert any(field_name in diagnostic for diagnostic in finding.diagnostics)
+    assert manifest_path.read_bytes() == malformed_bytes
+
+
 def test_legacy_v1_live_manifest_is_normalized_without_hash_enforcement(
     tmp_path: Path,
 ) -> None:
