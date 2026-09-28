@@ -2,13 +2,22 @@
 
 from __future__ import annotations
 
+import json
 import os
+import shutil
 import subprocess
 from pathlib import Path
 
 import pytest
 
-from manga_autopilot.repositories import WorkLifecycleRepository
+from manga_autopilot.migration.legacy_inventory import (
+    LegacyProjectInventoryService,
+)
+from manga_autopilot.repositories import (
+    WorkIdentityMismatchError,
+    WorkLifecycleRepository,
+    WorkRecoveryError,
+)
 from manga_autopilot.storage import (
     WORK_MIGRATIONS,
     Migration,
@@ -58,6 +67,134 @@ def test_windows_junction_escape_is_rejected(tmp_path: Path) -> None:
             os.rmdir(junction)
 
     assert outside.is_dir()
+
+
+def test_windows_unregistered_work_junction_escape_is_invalid(
+    tmp_path: Path,
+) -> None:
+    managed = WorkLifecycleRepository(tmp_path / "managed")
+    external = WorkLifecycleRepository(tmp_path / "external")
+    external_work = external.create_work(
+        work_id="work_windows_junction",
+        title="External Work",
+    )
+    target_manifest = external_work.manifest_path.read_bytes()
+
+    junction = managed.paths.works / external_work.work_id
+    _create_junction(junction, external_work.root)
+
+    findings = managed.scan_recovery()
+
+    finding = next(item for item in findings if item.path == junction)
+    assert finding.kind == "UNREGISTERED_WORK_INVALID"
+    assert finding.valid is False
+    assert finding.recommended_action is None
+    assert "outside managed storage root" in " ".join(finding.diagnostics)
+
+    with pytest.raises(WorkRecoveryError, match="cannot register invalid orphan"):
+        managed.reconcile_orphan_work(external_work.work_id)
+
+    assert external_work.manifest_path.read_bytes() == target_manifest
+    assert managed.list_works() == ()
+
+
+def test_windows_cataloged_work_junction_escape_is_rejected_on_open(
+    tmp_path: Path,
+) -> None:
+    managed = WorkLifecycleRepository(tmp_path / "managed")
+    created = managed.create_work(
+        work_id="work_windows_catalog_junction",
+        title="Managed Work",
+    )
+    shutil.rmtree(created.root)
+
+    external = WorkLifecycleRepository(tmp_path / "external")
+    external_work = external.create_work(
+        work_id=created.work_id,
+        title="External Work",
+    )
+    target_manifest = external_work.manifest_path.read_bytes()
+    _create_junction(created.root, external_work.root)
+
+    findings = managed.scan_recovery()
+
+    finding = next(item for item in findings if item.work_id == created.work_id)
+    assert finding.kind == "CATALOG_WORK_PATH_INVALID"
+    assert finding.valid is False
+    with pytest.raises(
+        WorkIdentityMismatchError,
+        match="catalog work path escapes works root",
+    ):
+        managed.open_work(created.work_id)
+
+    assert external_work.manifest_path.read_bytes() == target_manifest
+
+
+def test_windows_staging_junction_escape_is_not_finalizable(
+    tmp_path: Path,
+) -> None:
+    managed = WorkLifecycleRepository(tmp_path / "managed")
+    external = WorkLifecycleRepository(tmp_path / "external")
+    external_work = external.create_work(
+        work_id="work_windows_staging_junction",
+        title="External Work",
+    )
+    target_manifest = external_work.manifest_path.read_bytes()
+
+    staging = managed.paths.works / (
+        ".creating-" + external_work.work_id
+    )
+    _create_junction(staging, external_work.root)
+
+    findings = managed.scan_recovery()
+
+    finding = next(item for item in findings if item.path == staging)
+    assert finding.kind == "STALE_STAGING_INVALID"
+    assert finding.valid is False
+    assert finding.recommended_action == "quarantine"
+    assert "outside managed storage root" in " ".join(finding.diagnostics)
+
+    with pytest.raises(WorkRecoveryError, match="cannot finalize invalid staging"):
+        managed.finalize_staging_work(external_work.work_id)
+
+    assert external_work.manifest_path.read_bytes() == target_manifest
+
+
+def test_windows_legacy_inventory_does_not_traverse_nested_junction(
+    tmp_path: Path,
+) -> None:
+    storage = tmp_path / "storage"
+    project = storage / "projects" / "legacy_junction"
+    project.mkdir(parents=True)
+    (project / "project.json").write_text(
+        json.dumps({"id": "legacy_junction", "title": "Legacy"}),
+        encoding="utf-8",
+    )
+
+    outside = tmp_path / "outside-assets"
+    outside.mkdir()
+    secret = outside / "secret.bin"
+    secret.write_bytes(b"do not read or change")
+    before = secret.read_bytes()
+
+    assets = project / "assets"
+    _create_junction(assets, outside)
+
+    report = LegacyProjectInventoryService(storage).inventory_project(
+        "legacy_junction"
+    )
+
+    by_path = {entry.relative_path: entry for entry in report.entries}
+    assert by_path["assets"].kind == "unsafe_link"
+    assert by_path["assets"].recognized is False
+    assert "assets/secret.bin" not in by_path
+    assert "assets" in report.missing_optional_directories
+    assert any(
+        warning.code == "UNSAFE_PATH_ENTRY_IGNORED"
+        and warning.relative_path == "assets"
+        for warning in report.warnings
+    )
+    assert secret.read_bytes() == before
 
 
 @pytest.mark.parametrize("critical_name", ["manifest.json", "work.sqlite3"])
