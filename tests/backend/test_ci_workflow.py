@@ -46,6 +46,7 @@ def test_ci_workflow_runs_pytest_and_ruff() -> None:
     assert "pytest" in flat
     assert "ruff" in flat
 
+
 def test_ci_workflow_has_windows_persistence_job() -> None:
     data = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))
     job = data["jobs"]["windows-persistence"]
