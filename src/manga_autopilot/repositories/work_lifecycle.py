@@ -1148,6 +1148,25 @@ class WorkLifecycleRepository:
 
             if entry.name.startswith(WORK_STAGING_PREFIX):
                 work_id = entry.name[len(WORK_STAGING_PREFIX) :] or None
+                if (
+                    work_id is not None
+                    and _work_creation_is_active(self.paths.works, work_id)
+                ):
+                    findings.append(
+                        WorkRecoveryFinding(
+                            kind="ACTIVE_STAGING",
+                            path=entry,
+                            work_id=work_id,
+                            valid=False,
+                            recommended_action=None,
+                            diagnostics=(
+                                "Work staging is owned by an active creator; "
+                                "recovery mutation is not allowed",
+                            ),
+                        )
+                    )
+                    continue
+
                 valid, diagnostics = self._validate_recovery_directory(
                     entry,
                     expected_work_id=work_id,
@@ -1175,6 +1194,29 @@ class WorkLifecycleRepository:
             if entry.name in cataloged_ids:
                 continue
 
+            try:
+                creation_active = _work_creation_is_active(
+                    self.paths.works,
+                    entry.name,
+                )
+            except ValueError:
+                creation_active = False
+            if creation_active:
+                findings.append(
+                    WorkRecoveryFinding(
+                        kind="ACTIVE_WORK_CREATION",
+                        path=entry,
+                        work_id=entry.name,
+                        valid=False,
+                        recommended_action=None,
+                        diagnostics=(
+                            "final Work path is still owned by an active creator; "
+                            "catalog recovery is not allowed",
+                        ),
+                    )
+                )
+                continue
+
             valid, diagnostics = self._validate_recovery_directory(
                 entry,
                 expected_work_id=entry.name,
@@ -1198,6 +1240,16 @@ class WorkLifecycleRepository:
 
     def reconcile_orphan_work(self, work_id: str) -> WorkCatalogEntry:
         """Register a valid finalized Work that is missing from Master catalog."""
+        try:
+            with _work_creation_lock(self.paths.works, work_id):
+                return self._reconcile_orphan_work_owned(work_id)
+        except _WorkCreationLockActiveError as exc:
+            raise WorkRecoveryError(
+                f"Work creation is still active for {work_id!r}"
+            ) from exc
+
+    def _reconcile_orphan_work_owned(self, work_id: str) -> WorkCatalogEntry:
+        """Register an orphan while the caller owns the Work lifecycle lock."""
         final_paths = work_paths(self.storage_root, work_id)
         relative_work_path = final_paths.root.relative_to(self.storage_root).as_posix()
 
@@ -1278,36 +1330,44 @@ class WorkLifecycleRepository:
             )
         return _catalog_entry(row)
 
+
     def finalize_staging_work(self, work_id: str) -> WorkCatalogEntry:
         """Finalize a complete stale staging Work and register it idempotently."""
         final_paths = work_paths(self.storage_root, work_id)
         staging = self.paths.works / f"{WORK_STAGING_PREFIX}{work_id}"
 
-        if not staging.exists() and not staging.is_symlink():
-            if final_paths.root.exists() and not final_paths.root.is_symlink():
-                return self.reconcile_orphan_work(work_id)
-            raise WorkRecoveryError(
-                f"staging Work does not exist for {work_id!r}: {staging}"
-            )
+        try:
+            with _work_creation_lock(self.paths.works, work_id):
+                if not staging.exists() and not staging.is_symlink():
+                    if final_paths.root.exists() and not final_paths.root.is_symlink():
+                        return self._reconcile_orphan_work_owned(work_id)
+                    raise WorkRecoveryError(
+                        f"staging Work does not exist for {work_id!r}: {staging}"
+                    )
 
-        valid, diagnostics = self._validate_recovery_directory(
-            staging,
-            expected_work_id=work_id,
-        )
-        if not valid:
-            raise WorkRecoveryError(
-                f"cannot finalize invalid staging Work {work_id!r}: "
-                + "; ".join(diagnostics)
-            )
-        if final_paths.root.exists() or final_paths.root.is_symlink():
-            raise WorkRecoveryError(
-                f"final Work path already exists for {work_id!r}: {final_paths.root}"
-            )
+                valid, diagnostics = self._validate_recovery_directory(
+                    staging,
+                    expected_work_id=work_id,
+                )
+                if not valid:
+                    raise WorkRecoveryError(
+                        f"cannot finalize invalid staging Work {work_id!r}: "
+                        + "; ".join(diagnostics)
+                    )
+                if final_paths.root.exists() or final_paths.root.is_symlink():
+                    raise WorkRecoveryError(
+                        f"final Work path already exists for {work_id!r}: "
+                        f"{final_paths.root}"
+                    )
 
-        _durable_replace_directory(staging, final_paths.root)
-        # If catalog registration fails, leave the finalized Work intact so a
-        # later recovery scan can reconcile it without regenerating identity.
-        return self.reconcile_orphan_work(work_id)
+                _durable_replace_directory(staging, final_paths.root)
+                # If catalog registration fails, leave the finalized Work intact
+                # so a later scan can reconcile it without regenerating identity.
+                return self._reconcile_orphan_work_owned(work_id)
+        except _WorkCreationLockActiveError as exc:
+            raise WorkRecoveryError(
+                f"Work creation is still active for {work_id!r}"
+            ) from exc
 
     def quarantine_staging_work(
         self,
@@ -1318,48 +1378,65 @@ class WorkLifecycleRepository:
         """Move stale staging aside without deleting its evidence."""
         work_paths(self.storage_root, work_id)  # validates one safe component
         staging = self.paths.works / f"{WORK_STAGING_PREFIX}{work_id}"
-        if not staging.exists() and not staging.is_symlink():
-            raise WorkRecoveryError(
-                f"staging Work does not exist for {work_id!r}: {staging}"
-            )
 
-        quarantine_root = self.paths.works / WORK_RECOVERY_QUARANTINE_DIR
         try:
-            assert_managed_path(
-                quarantine_root,
-                containment_root=self.paths.works,
-                field_name="recovery quarantine",
-            )
-        except ValueError as exc:
-            raise WorkRecoveryError(str(exc)) from exc
-        if quarantine_root.is_symlink():
+            with _work_creation_lock(self.paths.works, work_id):
+                if not staging.exists() and not staging.is_symlink():
+                    raise WorkRecoveryError(
+                        f"staging Work does not exist for {work_id!r}: {staging}"
+                    )
+
+                quarantine_root = (
+                    self.paths.works / WORK_RECOVERY_QUARANTINE_DIR
+                )
+                try:
+                    assert_managed_path(
+                        quarantine_root,
+                        containment_root=self.paths.works,
+                        field_name="recovery quarantine",
+                    )
+                except ValueError as exc:
+                    raise WorkRecoveryError(str(exc)) from exc
+                if quarantine_root.is_symlink():
+                    raise WorkRecoveryError(
+                        "recovery quarantine must not be a symlink: "
+                        f"{quarantine_root}"
+                    )
+                quarantine_root.mkdir(exist_ok=True)
+
+                stamp = datetime.now(timezone.utc).strftime(
+                    "%Y%m%dT%H%M%S%fZ"
+                )
+                destination = quarantine_root / (
+                    f"{stamp}-{WORK_STAGING_PREFIX[1:]}{work_id}"
+                )
+                try:
+                    assert_managed_path(
+                        destination,
+                        containment_root=quarantine_root,
+                        field_name="recovery quarantine destination",
+                    )
+                except ValueError as exc:
+                    raise WorkRecoveryError(str(exc)) from exc
+                os.replace(staging, destination)
+
+                _write_json_atomic(
+                    destination.with_name(
+                        destination.name + ".recovery.json"
+                    ),
+                    {
+                        "work_id": work_id,
+                        "source": staging.name,
+                        "quarantined_at": _utc_now_iso(),
+                        "reason": reason,
+                    },
+                )
+                return destination
+        except _WorkCreationLockActiveError as exc:
             raise WorkRecoveryError(
-                f"recovery quarantine must not be a symlink: {quarantine_root}"
-            )
-        quarantine_root.mkdir(exist_ok=True)
+                f"Work creation is still active for {work_id!r}"
+            ) from exc
 
-        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
-        destination = quarantine_root / f"{stamp}-{WORK_STAGING_PREFIX[1:]}{work_id}"
-        try:
-            assert_managed_path(
-                destination,
-                containment_root=quarantine_root,
-                field_name="recovery quarantine destination",
-            )
-        except ValueError as exc:
-            raise WorkRecoveryError(str(exc)) from exc
-        os.replace(staging, destination)
-
-        _write_json_atomic(
-            destination.with_name(destination.name + ".recovery.json"),
-            {
-                "work_id": work_id,
-                "source": staging.name,
-                "quarantined_at": _utc_now_iso(),
-                "reason": reason,
-            },
-        )
-        return destination
 
     def _validate_recovery_directory(
         self,
