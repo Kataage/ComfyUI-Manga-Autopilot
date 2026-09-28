@@ -15,9 +15,9 @@ from manga_autopilot.storage import (
     bootstrap_master_database,
     bootstrap_work_database,
     connect_write,
-    create_work_entity_revision,
     create_master_commit,
     create_work_commit,
+    create_work_entity_revision,
     repository_read,
     repository_write,
 )
