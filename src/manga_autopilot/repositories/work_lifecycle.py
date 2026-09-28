@@ -1110,6 +1110,11 @@ class WorkLifecycleRepository:
                     raise ValueError(
                         "quarantine receipt destination does not match filename"
                     )
+                assert_managed_path(
+                    destination,
+                    containment_root=quarantine_root,
+                    field_name="quarantine evidence destination",
+                )
             except Exception as exc:
                 findings.append(
                     WorkRecoveryFinding(
@@ -1626,13 +1631,13 @@ class WorkLifecycleRepository:
                             )
                         _fsync_directory(self.paths.works)
                         _fsync_directory(quarantine_root)
+                        completed_at = _utc_now_iso()
                         completed_payload = {
                             **payload,
                             "state": "complete",
-                            "completed_at": _utc_now_iso(),
-                            "quarantined_at": payload.get(
-                                "quarantined_at",
-                                _utc_now_iso(),
+                            "completed_at": completed_at,
+                            "quarantined_at": (
+                                payload.get("quarantined_at") or completed_at
                             ),
                         }
                         _write_json_atomic(receipt, completed_payload)
