@@ -26,6 +26,7 @@ from manga_autopilot.storage import (
     bootstrap_master_database,
     bootstrap_work_database,
     create_work_commit,
+    create_work_entity_revision,
     ensure_storage_root,
     inspect_work_database,
     migrate_work_database,
@@ -265,6 +266,41 @@ def _persisted_master_lineage_fields(
         series_source_id=metadata["series_source_id"],
         source_checkpoint_id=metadata["source_checkpoint_id"],
     )
+
+
+def _work_revision_state(
+    *,
+    work_id: str,
+    universe_source_id: str | None,
+    series_source_id: str | None,
+    source_checkpoint_id: str | None,
+    title: str,
+    work_kind: str,
+    language: str,
+    reading_direction: str,
+    status: str,
+    current_revision: int,
+    created_at: str,
+    updated_at: str,
+    completed_at: str | None,
+) -> dict[str, Any]:
+    """Return the canonical semantic Work state stored in revision history."""
+    return {
+        "schema_version": 1,
+        "work_id": work_id,
+        "universe_source_id": universe_source_id,
+        "series_source_id": series_source_id,
+        "source_checkpoint_id": source_checkpoint_id,
+        "title": title,
+        "work_kind": work_kind,
+        "language": language,
+        "reading_direction": reading_direction,
+        "status": status,
+        "current_revision": current_revision,
+        "created_at": created_at,
+        "updated_at": updated_at,
+        "completed_at": completed_at,
+    }
 
 
 def _live_manifest(
@@ -579,6 +615,31 @@ class WorkLifecycleRepository:
                         created_at,
                         created_at,
                     ),
+                )
+                create_work_entity_revision(
+                    connection,
+                    revision_id=new_id("revision"),
+                    entity_type="work",
+                    entity_id=resolved_work_id,
+                    entity_revision=1,
+                    commit_seq=commit.commit_seq,
+                    change_kind="create",
+                    after_state=_work_revision_state(
+                        work_id=resolved_work_id,
+                        universe_source_id=universe_id,
+                        series_source_id=series_id,
+                        source_checkpoint_id=None,
+                        title=title,
+                        work_kind=work_kind,
+                        language=language,
+                        reading_direction=reading_direction,
+                        status=status,
+                        current_revision=1,
+                        created_at=created_at,
+                        updated_at=created_at,
+                        completed_at=None,
+                    ),
+                    created_at=created_at,
                 )
 
             with write_connection(staging_paths.work_db) as connection:

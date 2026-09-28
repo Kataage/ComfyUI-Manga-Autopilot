@@ -11,6 +11,7 @@ from pathlib import Path
 import pytest
 
 import manga_autopilot.repositories.work_lifecycle as lifecycle_module
+from manga_autopilot.primitives import canonical_json
 from manga_autopilot.repositories import (
     WorkCreationError,
     WorkIdentityMismatchError,
@@ -54,6 +55,63 @@ def _recovery_tree_snapshot(root: Path) -> dict[str, bytes]:
     }
 
 
+def _assert_initial_work_revision(database: Path, work_id: str) -> None:
+    with repository_read(database) as connection:
+        commits = connection.execute(
+            "SELECT * FROM commits ORDER BY commit_seq"
+        ).fetchall()
+        metadata = connection.execute(
+            "SELECT * FROM work_metadata WHERE work_id = ?",
+            (work_id,),
+        ).fetchone()
+        revisions = connection.execute(
+            """
+            SELECT *
+            FROM entity_revisions
+            WHERE entity_type = 'work' AND entity_id = ?
+            ORDER BY entity_revision
+            """,
+            (work_id,),
+        ).fetchall()
+
+    assert len(commits) == 1
+    assert metadata is not None
+    assert len(revisions) == 1
+
+    commit = commits[0]
+    revision = revisions[0]
+    assert commit["actor_type"] == "system"
+    assert commit["operation_type"] == "create_work"
+    assert metadata["current_commit_seq"] == commit["commit_seq"]
+    assert metadata["current_revision"] == 1
+
+    assert revision["entity_type"] == "work"
+    assert revision["entity_id"] == work_id
+    assert revision["entity_revision"] == 1
+    assert revision["commit_seq"] == commit["commit_seq"]
+    assert revision["change_kind"] == "create"
+    assert revision["before_json"] is None
+    assert revision["created_at"] == commit["created_at"]
+
+    expected_state = {
+        "schema_version": 1,
+        "work_id": work_id,
+        "universe_source_id": metadata["universe_source_id"],
+        "series_source_id": metadata["series_source_id"],
+        "source_checkpoint_id": metadata["source_checkpoint_id"],
+        "title": metadata["title"],
+        "work_kind": metadata["work_kind"],
+        "language": metadata["language"],
+        "reading_direction": metadata["reading_direction"],
+        "status": metadata["status"],
+        "current_revision": metadata["current_revision"],
+        "created_at": metadata["created_at"],
+        "updated_at": metadata["updated_at"],
+        "completed_at": metadata["completed_at"],
+    }
+    assert revision["after_json"] == canonical_json(expected_state)
+
+
 def test_create_open_list_and_reopen_work(tmp_path: Path) -> None:
     repository = WorkLifecycleRepository(tmp_path, app_version="test")
 
@@ -87,6 +145,71 @@ def test_create_open_list_and_reopen_work(tmp_path: Path) -> None:
     assert reopened.current_commit_seq == created.current_commit_seq
     assert reopened.catalog.last_opened_at is not None
     assert reopened.migration_backup_path is None
+    _assert_initial_work_revision(created.database_path, created.work_id)
+
+
+def test_initial_work_revision_survives_reopen_without_duplication(
+    tmp_path: Path,
+) -> None:
+    repository = WorkLifecycleRepository(tmp_path)
+    created = repository.create_work(
+        work_id="work_revision",
+        title="Revision History",
+    )
+    _assert_initial_work_revision(created.database_path, created.work_id)
+
+    reopened = WorkLifecycleRepository(tmp_path).open_work(created.work_id)
+
+    assert reopened.current_revision == 1
+    _assert_initial_work_revision(reopened.database_path, reopened.work_id)
+
+
+def test_initial_work_transaction_rolls_back_when_revision_recording_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repository = WorkLifecycleRepository(tmp_path)
+
+    def fail_revision(*args: object, **kwargs: object) -> None:
+        raise RuntimeError("simulated revision failure")
+
+    monkeypatch.setattr(lifecycle_module, "create_work_entity_revision", fail_revision)
+    monkeypatch.setattr(
+        lifecycle_module.shutil,
+        "rmtree",
+        lambda *args, **kwargs: None,
+    )
+
+    with pytest.raises(WorkCreationError, match="simulated revision failure"):
+        repository.create_work(
+            work_id="work_atomic",
+            title="Atomic Creation",
+        )
+
+    staging = tmp_path / "works" / ".creating-work_atomic"
+    database = staging / "work.sqlite3"
+    assert database.is_file()
+
+    with repository_read(database) as connection:
+        commit_count = connection.execute(
+            "SELECT COUNT(*) FROM commits"
+        ).fetchone()[0]
+        metadata_count = connection.execute(
+            "SELECT COUNT(*) FROM work_metadata"
+        ).fetchone()[0]
+        revision_count = connection.execute(
+            "SELECT COUNT(*) FROM entity_revisions"
+        ).fetchone()[0]
+
+    assert commit_count == 0
+    assert metadata_count == 0
+    assert revision_count == 0
+
+    with repository_read(repository.paths.master_db) as connection:
+        catalog = connection.execute(
+            "SELECT 1 FROM work_catalog WHERE work_id = 'work_atomic'"
+        ).fetchone()
+    assert catalog is None
 
 
 @pytest.mark.parametrize(
@@ -469,7 +592,9 @@ def test_catalog_registration_failure_preserves_recoverable_orphan_work(
 
     assert first.work_id == "work_fail"
     assert second == first
-    assert repository.open_work("work_fail").title == "Will Fail"
+    opened = repository.open_work("work_fail")
+    assert opened.title == "Will Fail"
+    _assert_initial_work_revision(opened.database_path, opened.work_id)
     assert repository.scan_recovery() == ()
 
 
@@ -739,7 +864,9 @@ def test_recovery_scan_detects_and_finalizes_complete_stale_staging(
     assert catalog.work_id == "work_staged"
     assert not staging.exists()
     assert (tmp_path / "works" / "work_staged").is_dir()
-    assert repository.open_work("work_staged").title == "Staged Work"
+    opened = repository.open_work("work_staged")
+    assert opened.title == "Staged Work"
+    _assert_initial_work_revision(opened.database_path, opened.work_id)
     assert repository.scan_recovery() == ()
 
 
