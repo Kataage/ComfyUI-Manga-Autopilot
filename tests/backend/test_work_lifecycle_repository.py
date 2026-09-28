@@ -27,6 +27,8 @@ from manga_autopilot.storage import (
     Migration,
     UnsafeStoragePathError,
     bootstrap_master_database,
+    create_work_commit,
+    create_work_entity_revision,
     repository_read,
     repository_write,
 )
@@ -71,6 +73,79 @@ def _hold_work_creation_lock_in_child(
         ready.set()
         if not release.wait(20):
             raise RuntimeError("timed out waiting to release child owner")
+
+
+def _damage_work_head(database: Path, *, damage_kind: str) -> None:
+    with repository_write(database) as connection:
+        metadata = connection.execute(
+            "SELECT * FROM work_metadata"
+        ).fetchone()
+        assert metadata is not None
+        work_id = str(metadata["work_id"])
+        current_commit = int(metadata["current_commit_seq"])
+
+        if damage_kind == "extra_metadata":
+            connection.execute(
+                """
+                INSERT INTO work_metadata (
+                    work_id,
+                    universe_source_id,
+                    series_source_id,
+                    source_checkpoint_id,
+                    title,
+                    work_kind,
+                    language,
+                    reading_direction,
+                    status,
+                    current_commit_seq,
+                    current_revision,
+                    created_at,
+                    updated_at,
+                    completed_at
+                )
+                SELECT
+                    ?,
+                    universe_source_id,
+                    series_source_id,
+                    source_checkpoint_id,
+                    title,
+                    work_kind,
+                    language,
+                    reading_direction,
+                    status,
+                    current_commit_seq,
+                    current_revision,
+                    created_at,
+                    updated_at,
+                    completed_at
+                FROM work_metadata
+                WHERE work_id = ?
+                """,
+                (f"{work_id}_extra", work_id),
+            )
+        elif damage_kind == "missing_revision":
+            connection.execute(
+                "UPDATE work_metadata SET current_revision = current_revision + 1"
+            )
+        elif damage_kind == "wrong_commit":
+            commit = create_work_commit(
+                connection,
+                commit_id=f"commit_wrong_head_{work_id}",
+                actor_type="test",
+                operation_type="corrupt_head",
+                parent_commit_seq=current_commit,
+                reason="test-only mismatched Work head",
+            )
+            connection.execute(
+                "UPDATE work_metadata SET current_commit_seq = ?",
+                (commit.commit_seq,),
+            )
+        elif damage_kind == "missing_commit":
+            connection.execute(
+                "UPDATE work_metadata SET current_commit_seq = 999999"
+            )
+        else:
+            raise AssertionError(f"unsupported damage kind: {damage_kind}")
 
 
 def _assert_initial_work_revision(database: Path, work_id: str) -> None:
@@ -1224,6 +1299,43 @@ def test_open_wraps_migration_drift_as_work_upgrade_error(
     assert "drift detected" in str(exc_info.value)
 
 
+@pytest.mark.parametrize(
+    ("damage_kind", "diagnostic_fragment"),
+    [
+        ("extra_metadata", "exactly one row"),
+        ("missing_revision", "current Work revision is missing"),
+        ("wrong_commit", "revision/commit mismatch"),
+        ("missing_commit", "current Work commit is missing"),
+    ],
+)
+def test_open_rejects_invalid_work_revision_head_before_side_effects(
+    tmp_path: Path,
+    damage_kind: str,
+    diagnostic_fragment: str,
+) -> None:
+    repository = WorkLifecycleRepository(tmp_path)
+    created = repository.create_work(
+        work_id=f"work_head_{damage_kind}",
+        title="Head Integrity",
+    )
+    manifest_before = created.manifest_path.read_bytes()
+    catalog_before = repository.list_works()[0]
+
+    _damage_work_head(created.database_path, damage_kind=damage_kind)
+
+    with pytest.raises(
+        WorkIdentityMismatchError,
+        match="Work head integrity failed",
+    ) as exc_info:
+        repository.open_work(created.work_id)
+
+    assert diagnostic_fragment in str(exc_info.value)
+    assert created.manifest_path.read_bytes() == manifest_before
+    catalog_after = repository.list_works()[0]
+    assert catalog_after.last_opened_at == catalog_before.last_opened_at
+    assert catalog_after.manifest_hash == catalog_before.manifest_hash
+
+
 def test_legacy_v1_live_manifest_is_normalized_without_hash_enforcement(
     tmp_path: Path,
 ) -> None:
@@ -1239,13 +1351,39 @@ def test_legacy_v1_live_manifest_is_normalized_without_hash_enforcement(
     )
 
     with repository_write(created.database_path) as connection:
+        metadata = connection.execute(
+            "SELECT * FROM work_metadata WHERE work_id = 'work_001'"
+        ).fetchone()
+        assert metadata is not None
+        previous_revision = int(metadata["current_revision"])
+        commit = create_work_commit(
+            connection,
+            commit_id="commit_legacy_manifest_edit",
+            actor_type="human",
+            operation_type="edit_work",
+            parent_commit_seq=int(metadata["current_commit_seq"]),
+            reason="test legacy manifest normalization after formal edit",
+        )
+        create_work_entity_revision(
+            connection,
+            revision_id="revision_legacy_manifest_edit",
+            entity_type="work",
+            entity_id="work_001",
+            entity_revision=previous_revision + 1,
+            commit_seq=commit.commit_seq,
+            change_kind="update",
+            before_state={"title": str(metadata["title"])},
+            after_state={"title": "Edited After Legacy Hash"},
+        )
         connection.execute(
             """
             UPDATE work_metadata
             SET title = 'Edited After Legacy Hash',
-                current_revision = current_revision + 1
+                current_commit_seq = ?,
+                current_revision = ?
             WHERE work_id = 'work_001'
-            """
+            """,
+            (commit.commit_seq, previous_revision + 1),
         )
 
     opened = repository.open_work("work_001")
@@ -1501,6 +1639,68 @@ def test_recovery_rejects_database_damage_normal_open_would_reject(
         ("orphan", "UNREGISTERED_WORK_INVALID"),
     ],
 )
+@pytest.mark.parametrize(
+    ("recovery_shape", "expected_kind"),
+    [
+        ("staging", "STALE_STAGING_INVALID"),
+        ("orphan", "UNREGISTERED_WORK_INVALID"),
+    ],
+)
+@pytest.mark.parametrize(
+    ("damage_kind", "diagnostic_fragment"),
+    [
+        ("extra_metadata", "exactly one row"),
+        ("missing_revision", "current Work revision is missing"),
+        ("wrong_commit", "revision/commit mismatch"),
+        ("missing_commit", "current Work commit is missing"),
+    ],
+)
+def test_recovery_rejects_invalid_work_revision_head(
+    tmp_path: Path,
+    recovery_shape: str,
+    expected_kind: str,
+    damage_kind: str,
+    diagnostic_fragment: str,
+) -> None:
+    repository = WorkLifecycleRepository(tmp_path)
+    work_id = f"work_head_{recovery_shape}_{damage_kind}"
+    created = repository.create_work(work_id=work_id, title="Head Recovery")
+    _damage_work_head(created.database_path, damage_kind=damage_kind)
+
+    with repository_write(repository.paths.master_db) as connection:
+        connection.execute(
+            "DELETE FROM work_catalog WHERE work_id = ?",
+            (work_id,),
+        )
+
+    if recovery_shape == "staging":
+        recovery_root = tmp_path / "works" / f".creating-{work_id}"
+        os.replace(created.root, recovery_root)
+    else:
+        recovery_root = created.root
+
+    recovery_tree_before_scan = _recovery_tree_snapshot(recovery_root)
+    findings = repository.scan_recovery()
+
+    assert _recovery_tree_snapshot(recovery_root) == recovery_tree_before_scan
+    assert len(findings) == 1
+    finding = findings[0]
+    assert finding.kind == expected_kind
+    assert finding.work_id == work_id
+    assert finding.valid is False
+    assert "WorkHeadIntegrityError" in " ".join(finding.diagnostics)
+    assert diagnostic_fragment in " ".join(finding.diagnostics)
+
+    if recovery_shape == "staging":
+        assert finding.recommended_action == "quarantine"
+        with pytest.raises(WorkRecoveryError, match="cannot finalize invalid staging"):
+            repository.finalize_staging_work(work_id)
+    else:
+        assert finding.recommended_action is None
+        with pytest.raises(WorkRecoveryError, match="cannot register invalid orphan"):
+            repository.reconcile_orphan_work(work_id)
+
+
 def test_recovery_rejects_unsnapshotted_master_lineage(
     tmp_path: Path,
     recovery_shape: str,
