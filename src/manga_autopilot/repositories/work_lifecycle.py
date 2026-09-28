@@ -36,6 +36,7 @@ from manga_autopilot.storage import (
     storage_paths,
     validate_work_database,
     validate_work_id,
+    verify_work_database_for_open,
     work_paths,
     write_connection,
 )
@@ -748,11 +749,18 @@ class WorkLifecycleRepository:
         manifest = _read_manifest(inspection.manifest_path)
 
         try:
-            migration = migrate_work_database(
-                inspection.database_path,
-                migrations=self.work_migrations,
-                app_version=self.app_version,
-            )
+            if inspection.upgrade_required:
+                migration = migrate_work_database(
+                    inspection.database_path,
+                    migrations=self.work_migrations,
+                    app_version=self.app_version,
+                )
+            else:
+                migration = verify_work_database_for_open(
+                    inspection.database_path,
+                    migrations=self.work_migrations,
+                    work_id=work_id,
+                )
         except MigrationError as exc:
             raise WorkUpgradeError(
                 f"failed to upgrade Work {work_id!r} before open: {exc}"
