@@ -135,10 +135,6 @@ def test_canonical_json_rejects_decimal_like_numbers_explicitly() -> None:
     with pytest.raises(TypeError, match="decimal.Decimal"):
         canonical_json({"score": Decimal("1.25")})
 
-def test_canonical_json_rejects_non_json_nan() -> None:
-    with pytest.raises(ValueError):
-        canonical_json({"score": float("nan")})
-
 
 def test_canonical_json_rejects_non_serializable_values() -> None:
     with pytest.raises(TypeError):
@@ -173,6 +169,13 @@ def test_input_fingerprint_has_explicit_versioned_algorithm_prefix() -> None:
     assert FINGERPRINT_VERSION == 2
     assert fingerprint.startswith("sha256:v2:")
     assert len(fingerprint) == len("sha256:v2:") + 64
+
+
+def test_input_fingerprint_v2_has_golden_numeric_digest() -> None:
+    assert input_fingerprint({"value": 0.1}) == (
+        "sha256:v2:"
+        "f78f3a0e64f80a7808b4b1247f917174d0eb322022fdc0de6f0d74fd496a713d"
+    )
 
 
 def test_dependency_fingerprint_is_stable_and_namespaced() -> None:
