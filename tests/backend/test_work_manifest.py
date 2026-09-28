@@ -116,6 +116,82 @@ def test_legacy_v1_manifest_is_accepted_only_as_compatibility_shape() -> None:
     assert is_canonical_live_manifest(manifest) is False
 
 
+@pytest.mark.parametrize(
+    "format_version",
+    [True, False, 1.0, 2.0],
+)
+def test_manifest_format_version_requires_builtin_integer(
+    format_version: object,
+) -> None:
+    manifest = build_live_work_manifest(
+        work_id="work_001",
+        database_name="work.sqlite3",
+        work_schema_version=1,
+        created_at="2026-09-21T00:00:00+00:00",
+        app_version="test",
+    )
+    manifest["format_version"] = format_version
+
+    with pytest.raises(
+        WorkManifestContractError,
+        match="format_version must be an integer",
+    ):
+        validate_manifest_common(manifest, expected_work_id="work_001")
+
+    assert is_canonical_live_manifest(manifest) is False
+
+
+@pytest.mark.parametrize(
+    "schema_version",
+    [True, False, 1.0, 2.0],
+)
+def test_manifest_schema_version_requires_builtin_positive_integer(
+    schema_version: object,
+) -> None:
+    manifest = build_live_work_manifest(
+        work_id="work_001",
+        database_name="work.sqlite3",
+        work_schema_version=1,
+        created_at="2026-09-21T00:00:00+00:00",
+        app_version="test",
+    )
+    manifest["work_schema_version"] = schema_version
+
+    with pytest.raises(
+        WorkManifestContractError,
+        match="work_schema_version must be a positive integer",
+    ):
+        validate_manifest_common(manifest, expected_work_id="work_001")
+
+    assert is_canonical_live_manifest(manifest) is False
+
+
+@pytest.mark.parametrize("schema_version", [True, False, 1.0, 2.0])
+def test_manifest_builders_reject_non_builtin_integer_schema_versions(
+    tmp_path: Path,
+    schema_version: object,
+) -> None:
+    with pytest.raises(ValueError, match="positive integer"):
+        build_live_work_manifest(
+            work_id="work_001",
+            database_name="work.sqlite3",
+            work_schema_version=schema_version,  # type: ignore[arg-type]
+            created_at="2026-09-21T00:00:00+00:00",
+            app_version="test",
+        )
+
+    database = tmp_path / "work.sqlite3"
+    database.write_bytes(b"package")
+    with pytest.raises(ValueError, match="positive integer"):
+        build_package_work_manifest(
+            work_id="work_001",
+            database_path=database,
+            work_schema_version=schema_version,  # type: ignore[arg-type]
+            created_at="2026-09-21T00:00:00+00:00",
+            app_version="test",
+        )
+
+
 def test_future_manifest_format_is_rejected() -> None:
     manifest = build_live_work_manifest(
         work_id="work_001",
