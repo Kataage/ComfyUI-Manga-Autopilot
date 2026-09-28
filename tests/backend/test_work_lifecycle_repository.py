@@ -723,6 +723,120 @@ def test_failed_work_upgrade_does_not_expose_partially_upgraded_work(
     assert backup.is_file()
 
 
+def test_current_schema_open_uses_fast_verification_without_migration(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repository = WorkLifecycleRepository(tmp_path)
+    created = repository.create_work(work_id="work_fast", title="Fast Open")
+
+    original_verify = lifecycle_module.verify_work_database_for_open
+    calls: list[str] = []
+
+    def verify(*args: object, **kwargs: object):
+        calls.append("fast")
+        return original_verify(*args, **kwargs)
+
+    def unexpected_migration(*args: object, **kwargs: object):
+        raise AssertionError("current-schema open must not enter migration path")
+
+    monkeypatch.setattr(
+        lifecycle_module,
+        "verify_work_database_for_open",
+        verify,
+    )
+    monkeypatch.setattr(
+        lifecycle_module,
+        "migrate_work_database",
+        unexpected_migration,
+    )
+
+    opened = repository.open_work(created.work_id)
+
+    assert opened.work_id == created.work_id
+    assert opened.migration_backup_path is None
+    assert calls == ["fast"]
+
+
+def test_current_schema_open_rejects_foreign_key_violation(
+    tmp_path: Path,
+) -> None:
+    repository = WorkLifecycleRepository(tmp_path)
+    created = repository.create_work(work_id="work_fk", title="Broken FK")
+
+    raw = sqlite3.connect(created.database_path)
+    try:
+        raw.execute("PRAGMA foreign_keys = OFF")
+        raw.execute(
+            """
+            INSERT INTO entity_revisions (
+                id,
+                entity_type,
+                entity_id,
+                entity_revision,
+                commit_seq,
+                change_kind,
+                created_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "revision_invalid_fk",
+                "test",
+                "entity_invalid_fk",
+                1,
+                999999,
+                "corrupt",
+                "2026-09-20T00:00:00+00:00",
+            ),
+        )
+        raw.commit()
+    finally:
+        raw.close()
+
+    with pytest.raises(WorkUpgradeError, match="failed to upgrade Work") as exc_info:
+        repository.open_work(created.work_id)
+
+    assert "foreign_key_check failed" in str(exc_info.value)
+
+
+def test_pending_schema_open_uses_migration_not_fast_verification(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    base_repository = WorkLifecycleRepository(tmp_path)
+    base_repository.create_work(work_id="work_upgrade_path", title="Upgrade Path")
+    future_migrations = _future_work_migration()
+    repository = WorkLifecycleRepository(
+        tmp_path,
+        work_migrations=future_migrations,
+    )
+
+    original_migrate = lifecycle_module.migrate_work_database
+    calls: list[str] = []
+
+    def migrate(*args: object, **kwargs: object):
+        calls.append("migrate")
+        return original_migrate(*args, **kwargs)
+
+    def unexpected_fast_verify(*args: object, **kwargs: object):
+        raise AssertionError("pending migration must not use fast-open verification")
+
+    monkeypatch.setattr(lifecycle_module, "migrate_work_database", migrate)
+    monkeypatch.setattr(
+        lifecycle_module,
+        "verify_work_database_for_open",
+        unexpected_fast_verify,
+    )
+
+    opened = repository.open_work("work_upgrade_path")
+
+    assert opened.schema_version == future_migrations[-1].version
+    assert opened.migration_backup_path is not None
+    assert opened.migration_backup_path.is_file()
+    assert calls == ["migrate"]
+
+
 def test_open_wraps_migration_drift_as_work_upgrade_error(
     tmp_path: Path,
 ) -> None:
