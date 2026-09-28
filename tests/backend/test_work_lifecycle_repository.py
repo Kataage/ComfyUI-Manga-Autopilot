@@ -1661,6 +1661,51 @@ def test_quarantine_move_failure_is_discoverable_and_retryable(
     assert inspected[0].kind == "QUARANTINE_COMPLETE"
 
 
+def test_quarantine_parent_fsync_failure_after_move_is_retryable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repository = WorkLifecycleRepository(tmp_path)
+    staging = tmp_path / "works" / ".creating-work_fsync_fail"
+    staging.mkdir()
+    (staging / "partial.txt").write_text("keep", encoding="utf-8")
+    original_fsync = lifecycle_module._fsync_directory
+    calls = 0
+
+    def fail_after_move(path: Path) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 3:
+            raise OSError("simulated source parent fsync failure")
+        original_fsync(path)
+
+    monkeypatch.setattr(lifecycle_module, "_fsync_directory", fail_after_move)
+
+    with pytest.raises(OSError, match="source parent fsync failure"):
+        repository.quarantine_staging_work(
+            "work_fsync_fail",
+            reason="directory sync failed",
+        )
+
+    assert not staging.exists()
+    findings = repository.inspect_quarantine()
+    assert len(findings) == 1
+    assert findings[0].kind == "QUARANTINE_INCOMPLETE"
+    receipt = findings[0].path
+    payload = json.loads(receipt.read_text(encoding="utf-8"))
+    destination = receipt.with_name(payload["destination"])
+    assert destination.is_dir()
+
+    monkeypatch.setattr(lifecycle_module, "_fsync_directory", original_fsync)
+    retried = repository.quarantine_staging_work("work_fsync_fail")
+
+    assert retried == destination
+    completed = json.loads(receipt.read_text(encoding="utf-8"))
+    assert completed["state"] == "complete"
+    assert completed["quarantined_at"]
+    assert repository.scan_recovery() == ()
+
+
 def test_quarantine_receipt_completion_failure_retries_same_destination(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
