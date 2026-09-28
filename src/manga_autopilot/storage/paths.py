@@ -48,13 +48,25 @@ WORK_RESERVED_ID_PREFIXES: tuple[str, ...] = (".",)
 ASSET_SUBDIRS: tuple[str, ...] = ("characters", "panels", "pages", "temp")
 EXPORT_SUBDIRS: tuple[str, ...] = ("pages", "webtoon", "pdf")
 
+_WINDOWS_RESERVED_DEVICE_NAMES = frozenset(
+    {
+        "CON",
+        "PRN",
+        "AUX",
+        "NUL",
+        *(f"COM{index}" for index in range(1, 10)),
+        *(f"LPT{index}" for index in range(1, 10)),
+    }
+)
+_WINDOWS_INVALID_FILENAME_CHARS = frozenset('<>:"|?*')
+
 
 class UnsafeStoragePathError(ValueError):
     """Raised when a managed storage path can escape via symlink/reparse state."""
 
 
 def _safe_path_component(value: str, *, field_name: str) -> str:
-    """Validate a user-controlled ID before using it as one path component."""
+    """Validate a portable user-controlled ID as one path component."""
     if not value:
         raise ValueError(f"{field_name} must be non-empty")
     if value in {".", ".."}:
@@ -65,6 +77,27 @@ def _safe_path_component(value: str, *, field_name: str) -> str:
         raise ValueError(f"{field_name} must not contain NUL")
     if Path(value).is_absolute():
         raise ValueError(f"{field_name} must not be absolute")
+
+    # Managed IDs must remain valid if a Work or project is moved to Windows.
+    # Windows strips trailing dots/spaces and reserves device names even when
+    # an extension is present (for example CON.txt).
+    if value.endswith((" ", ".")):
+        raise ValueError(
+            f"{field_name} must not end with a Windows-trimmed dot or space"
+        )
+    if any(character in _WINDOWS_INVALID_FILENAME_CHARS for character in value):
+        raise ValueError(
+            f"{field_name} contains a Windows-invalid filename character"
+        )
+    if any(ord(character) < 32 for character in value):
+        raise ValueError(
+            f"{field_name} contains a Windows-invalid control character"
+        )
+    device_stem = value.split(".", 1)[0].upper()
+    if device_stem in _WINDOWS_RESERVED_DEVICE_NAMES:
+        raise ValueError(
+            f"{field_name} uses a Windows-reserved device name: {value!r}"
+        )
     return value
 
 
