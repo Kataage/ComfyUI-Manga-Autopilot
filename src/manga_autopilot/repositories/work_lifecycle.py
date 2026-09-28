@@ -153,6 +153,97 @@ def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+_WORK_CREATION_LOCK_PREFIX = ".work-creation-lock-"
+
+
+class _WorkCreationLockActiveError(RuntimeError):
+    """Raised when another process owns one Work creation/recovery lock."""
+
+
+def _work_creation_lock_path(works_root: Path, work_id: str) -> Path:
+    validate_work_id(work_id)
+    return works_root / f"{_WORK_CREATION_LOCK_PREFIX}{work_id}.lock"
+
+
+def _try_lock_handle(handle: Any) -> bool:
+    """Acquire one cross-process advisory lock without blocking."""
+    handle.seek(0)
+    if os.name == "nt":
+        import msvcrt
+
+        try:
+            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+        except OSError as exc:
+            busy_errnos = {
+                errno.EACCES,
+                errno.EAGAIN,
+                getattr(errno, "EDEADLK", errno.EACCES),
+            }
+            if exc.errno in busy_errnos:
+                return False
+            raise
+        return True
+
+    import fcntl
+
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        return False
+    return True
+
+
+def _unlock_handle(handle: Any) -> None:
+    handle.seek(0)
+    if os.name == "nt":
+        import msvcrt
+
+        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+        return
+
+    import fcntl
+
+    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+@contextmanager
+def _work_creation_lock(works_root: Path, work_id: str) -> Iterator[None]:
+    """Own one Work lifecycle mutation across processes.
+
+    Lock files are intentionally persistent. Deleting a lock filename after
+    unlock can split ownership between a process holding the old inode and a
+    process that creates/locks a replacement inode.
+    """
+    lock_path = _work_creation_lock_path(works_root, work_id)
+    assert_managed_regular_file(
+        lock_path,
+        containment_root=works_root,
+        field_name="Work creation lock",
+        allow_missing=True,
+    )
+    with lock_path.open("a+b") as handle:
+        handle.seek(0, os.SEEK_END)
+        if handle.tell() == 0:
+            handle.write(b"0")
+            handle.flush()
+        if not _try_lock_handle(handle):
+            raise _WorkCreationLockActiveError(
+                f"Work creation is active for {work_id!r}"
+            )
+        try:
+            yield
+        finally:
+            _unlock_handle(handle)
+
+
+def _work_creation_is_active(works_root: Path, work_id: str) -> bool:
+    try:
+        with _work_creation_lock(works_root, work_id):
+            return False
+    except _WorkCreationLockActiveError:
+        return True
+
+
 _UNSUPPORTED_DIRECTORY_FSYNC_ERRNOS = frozenset(
     code
     for code in (
@@ -581,174 +672,186 @@ class WorkLifecycleRepository:
         final_paths = work_paths(self.storage_root, resolved_work_id)
         relative_work_path = final_paths.root.relative_to(self.storage_root).as_posix()
         staging_root = self.paths.works / f"{WORK_STAGING_PREFIX}{resolved_work_id}"
-
-        if final_paths.root.exists():
-            raise WorkCreationError(f"Work directory already exists: {final_paths.root}")
-        if staging_root.exists():
-            raise WorkCreationError(
-                f"staging directory already exists for Work {resolved_work_id!r}: "
-                f"{staging_root}"
-            )
-
-        with repository_read(self.paths.master_db) as connection:
-            existing = connection.execute(
-                "SELECT 1 FROM work_catalog WHERE work_id = ?",
-                (resolved_work_id,),
-            ).fetchone()
-        if existing is not None:
-            raise WorkCreationError(
-                f"Work already exists in Master catalog: {resolved_work_id}"
-            )
-
         staging_paths = WorkPaths(work_id=resolved_work_id, root=staging_root)
         created_at = _utc_now_iso()
 
         try:
-            assert_managed_path(
-                staging_paths.root,
-                containment_root=self.paths.works,
-                field_name="Work staging directory",
-            )
-            staging_paths.root.mkdir(parents=True, exist_ok=False)
-            staging_paths.assets.mkdir()
-            staging_paths.cache.mkdir()
-            staging_paths.exports.mkdir()
+            with _work_creation_lock(self.paths.works, resolved_work_id):
+                staging_created = False
+                try:
+                    if final_paths.root.exists():
+                        raise WorkCreationError(
+                            f"Work directory already exists: {final_paths.root}"
+                        )
+                    if staging_root.exists() or staging_root.is_symlink():
+                        raise WorkCreationError(
+                            "staging directory already exists for Work "
+                            f"{resolved_work_id!r}: {staging_root}"
+                        )
 
-            bootstrap_work_database(
-                staging_paths.work_db,
-                work_id=resolved_work_id,
-                app_version=self.app_version,
-                migrations=self.work_migrations,
-            )
+                    with repository_read(self.paths.master_db) as connection:
+                        existing = connection.execute(
+                            "SELECT 1 FROM work_catalog WHERE work_id = ?",
+                            (resolved_work_id,),
+                        ).fetchone()
+                    if existing is not None:
+                        raise WorkCreationError(
+                            "Work already exists in Master catalog: "
+                            f"{resolved_work_id}"
+                        )
 
-            with repository_write(staging_paths.work_db) as connection:
-                commit = create_work_commit(
-                    connection,
-                    commit_id=new_id("commit"),
-                    actor_type="system",
-                    operation_type="create_work",
-                    reason="create Work",
-                    created_at=created_at,
-                )
-                connection.execute(
-                    """
-                    INSERT INTO work_metadata (
-                        work_id,
-                        universe_source_id,
-                        series_source_id,
-                        title,
-                        work_kind,
-                        language,
-                        reading_direction,
-                        status,
-                        current_commit_seq,
-                        current_revision,
-                        created_at,
-                        updated_at
+                    assert_managed_path(
+                        staging_paths.root,
+                        containment_root=self.paths.works,
+                        field_name="Work staging directory",
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        resolved_work_id,
-                        universe_id,
-                        series_id,
-                        title,
-                        work_kind,
-                        language,
-                        reading_direction,
-                        status,
-                        commit.commit_seq,
-                        1,
-                        created_at,
-                        created_at,
-                    ),
-                )
-                create_work_entity_revision(
-                    connection,
-                    revision_id=new_id("revision"),
-                    entity_type="work",
-                    entity_id=resolved_work_id,
-                    entity_revision=1,
-                    commit_seq=commit.commit_seq,
-                    change_kind="create",
-                    after_state=_work_revision_state(
+                    staging_paths.root.mkdir(parents=True, exist_ok=False)
+                    staging_created = True
+                    staging_paths.assets.mkdir()
+                    staging_paths.cache.mkdir()
+                    staging_paths.exports.mkdir()
+
+                    bootstrap_work_database(
+                        staging_paths.work_db,
                         work_id=resolved_work_id,
-                        universe_source_id=universe_id,
-                        series_source_id=series_id,
-                        source_checkpoint_id=None,
-                        title=title,
-                        work_kind=work_kind,
-                        language=language,
-                        reading_direction=reading_direction,
-                        status=status,
-                        current_revision=1,
-                        created_at=created_at,
-                        updated_at=created_at,
-                        completed_at=None,
-                    ),
-                    created_at=created_at,
-                )
-
-            with write_connection(staging_paths.work_db) as connection:
-                connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-
-            manifest = _live_manifest(
-                work_id=resolved_work_id,
-                database_name=staging_paths.work_db.name,
-                work_schema_version=_target_schema_version(self.work_migrations),
-                created_at=created_at,
-                app_version=self.app_version,
-            )
-            _write_json_atomic(staging_paths.manifest_json, manifest)
-            manifest_hash = sha256_file(staging_paths.manifest_json)
-
-            # Durability ordering is intentional:
-            # 1. Work DB/manifest content is flushed,
-            # 2. staging directory entries are fsynced where supported,
-            # 3. staging is atomically renamed to its final path,
-            # 4. the Works parent directory is fsynced,
-            # 5. only then may Master durably reference the final Work.
-            #
-            # A crash before step 5 can leave an orphan Work, which recovery
-            # can reconcile. The inverse (durable catalog row with a rename
-            # that was never made durable) is avoided on platforms that expose
-            # directory fsync.
-            _durable_replace_directory(staging_paths.root, final_paths.root)
-
-            with repository_write(self.paths.master_db) as connection:
-                connection.execute(
-                    """
-                    INSERT INTO work_catalog (
-                        work_id,
-                        universe_id,
-                        series_id,
-                        title,
-                        work_kind,
-                        relative_work_path,
-                        status,
-                        manifest_hash,
-                        created_at,
-                        updated_at
+                        app_version=self.app_version,
+                        migrations=self.work_migrations,
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        resolved_work_id,
-                        universe_id,
-                        series_id,
-                        title,
-                        work_kind,
-                        relative_work_path,
-                        status,
-                        manifest_hash,
-                        created_at,
-                        created_at,
-                    ),
-                )
 
+                    with repository_write(staging_paths.work_db) as connection:
+                        commit = create_work_commit(
+                            connection,
+                            commit_id=new_id("commit"),
+                            actor_type="system",
+                            operation_type="create_work",
+                            reason="create Work",
+                            created_at=created_at,
+                        )
+                        connection.execute(
+                            """
+                            INSERT INTO work_metadata (
+                                work_id,
+                                universe_source_id,
+                                series_source_id,
+                                title,
+                                work_kind,
+                                language,
+                                reading_direction,
+                                status,
+                                current_commit_seq,
+                                current_revision,
+                                created_at,
+                                updated_at
+                            )
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            """,
+                            (
+                                resolved_work_id,
+                                universe_id,
+                                series_id,
+                                title,
+                                work_kind,
+                                language,
+                                reading_direction,
+                                status,
+                                commit.commit_seq,
+                                1,
+                                created_at,
+                                created_at,
+                            ),
+                        )
+                        create_work_entity_revision(
+                            connection,
+                            revision_id=new_id("revision"),
+                            entity_type="work",
+                            entity_id=resolved_work_id,
+                            entity_revision=1,
+                            commit_seq=commit.commit_seq,
+                            change_kind="create",
+                            after_state=_work_revision_state(
+                                work_id=resolved_work_id,
+                                universe_source_id=universe_id,
+                                series_source_id=series_id,
+                                source_checkpoint_id=None,
+                                title=title,
+                                work_kind=work_kind,
+                                language=language,
+                                reading_direction=reading_direction,
+                                status=status,
+                                current_revision=1,
+                                created_at=created_at,
+                                updated_at=created_at,
+                                completed_at=None,
+                            ),
+                            created_at=created_at,
+                        )
+
+                    with write_connection(staging_paths.work_db) as connection:
+                        connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+
+                    manifest = _live_manifest(
+                        work_id=resolved_work_id,
+                        database_name=staging_paths.work_db.name,
+                        work_schema_version=_target_schema_version(
+                            self.work_migrations
+                        ),
+                        created_at=created_at,
+                        app_version=self.app_version,
+                    )
+                    _write_json_atomic(staging_paths.manifest_json, manifest)
+                    manifest_hash = sha256_file(staging_paths.manifest_json)
+
+                    # Durability ordering is intentional:
+                    # 1. Work DB/manifest content is flushed,
+                    # 2. staging directory entries are fsynced where supported,
+                    # 3. staging is atomically renamed to its final path,
+                    # 4. the Works parent directory is fsynced,
+                    # 5. only then may Master durably reference the final Work.
+                    _durable_replace_directory(
+                        staging_paths.root,
+                        final_paths.root,
+                    )
+                    staging_created = False
+
+                    with repository_write(self.paths.master_db) as connection:
+                        connection.execute(
+                            """
+                            INSERT INTO work_catalog (
+                                work_id,
+                                universe_id,
+                                series_id,
+                                title,
+                                work_kind,
+                                relative_work_path,
+                                status,
+                                manifest_hash,
+                                created_at,
+                                updated_at
+                            )
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            """,
+                            (
+                                resolved_work_id,
+                                universe_id,
+                                series_id,
+                                title,
+                                work_kind,
+                                relative_work_path,
+                                status,
+                                manifest_hash,
+                                created_at,
+                                created_at,
+                            ),
+                        )
+                except Exception:
+                    if staging_created and staging_root.exists():
+                        shutil.rmtree(staging_root, ignore_errors=True)
+                    raise
+        except _WorkCreationLockActiveError as exc:
+            raise WorkCreationError(
+                f"Work creation is already active for {resolved_work_id!r}"
+            ) from exc
         except Exception as exc:
-            if staging_root.exists():
-                shutil.rmtree(staging_root, ignore_errors=True)
             if isinstance(exc, WorkLifecycleError):
                 raise
             raise WorkCreationError(
