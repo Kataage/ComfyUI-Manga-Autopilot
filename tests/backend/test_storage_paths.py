@@ -91,6 +91,14 @@ def test_work_paths_rejects_path_traversal(tmp_path: Path, unsafe_id: str) -> No
         ".internal-future",
     ],
 )
+def test_work_paths_rejects_reserved_internal_namespace(
+    tmp_path: Path,
+    reserved_id: str,
+) -> None:
+    with pytest.raises(ValueError, match="reserved"):
+        work_paths(tmp_path, reserved_id)
+
+
 @pytest.mark.parametrize(
     "unsafe_id",
     [
@@ -113,13 +121,6 @@ def test_work_paths_rejects_windows_nonportable_names(
 ) -> None:
     with pytest.raises(ValueError):
         work_paths(tmp_path, unsafe_id)
-
-def test_work_paths_rejects_reserved_internal_namespace(
-    tmp_path: Path,
-    reserved_id: str,
-) -> None:
-    with pytest.raises(ValueError, match="reserved"):
-        work_paths(tmp_path, reserved_id)
 
 
 def test_legacy_project_paths_has_expected_layout(tmp_path: Path) -> None:
