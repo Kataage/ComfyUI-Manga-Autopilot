@@ -885,6 +885,76 @@ async def test_cancelling_offloaded_http_worker_cleans_temp_and_releases_slot(
     assert artifacts.verify_registered_file(result["artifact_id"])["status"] == "READY"
 
 
+
+async def test_repeated_http_cancellation_drains_renderer_before_task_exits(
+    api, monkeypatch,
+):
+    """Double-cancel must not detach Pillow's still-running IO worker (#362)."""
+    _, _, root, handle, _, _, _, artifacts = api
+    import manga_autopilot.services.work_page_export as module
+    from manga_autopilot.routes.work_page_export_routes import _run_page_export
+
+    real_renderer = module.render_page_to_png
+    started = threading.Event()
+    release = threading.Event()
+    worker_finished = threading.Event()
+
+    def blocked_renderer(*args, **kwargs):
+        started.set()
+        try:
+            assert release.wait(timeout=20), "test renderer release timed out"
+            return real_renderer(*args, **kwargs)
+        finally:
+            worker_finished.set()
+
+    monkeypatch.setattr(module, "render_page_to_png", blocked_renderer)
+    service = module.WorkPageExportService(root)
+    task = asyncio.create_task(
+        _run_page_export(service, "work_export_1", "page_main", {})
+    )
+    try:
+        assert await asyncio.to_thread(started.wait, 10)
+
+        task.cancel()
+        # Give the first CancelledError a chance to set cancel_event and
+        # enter the shielded worker drain, while the worker remains blocked.
+        await asyncio.sleep(0.05)
+        assert not task.done()
+        task.cancel()
+        await asyncio.sleep(0.05)
+        assert not task.done(), (
+            "second cancellation detached the HTTP task before the "
+            "renderer and its TemporaryDirectory could finish"
+        )
+        assert not worker_finished.is_set()
+        with pytest.raises(module.PageExportBusyError):
+            await asyncio.to_thread(
+                service.export_png, "work_export_1", "page_main",
+            )
+    finally:
+        release.set()
+        # On assertion failures also prevent the blocked worker from leaking
+        # into later tests, regardless of whether the HTTP task is detached.
+        try:
+            await asyncio.wait_for(task, timeout=20)
+        except asyncio.CancelledError:
+            pass
+
+    assert worker_finished.is_set()
+    assert artifacts.list_for_scope("page", "page_main") == []
+    assert not list((handle.root / "assets" / "temp").glob("page-export-*"))
+    export_dir = handle.root / "exports" / "pages"
+    assert not export_dir.exists() or not list(export_dir.glob("*.png"))
+
+    # A new request can acquire the same slot after the canceled worker is
+    # *fully* drained, and still produces a provenance-verified immutable PNG.
+    result = await asyncio.to_thread(
+        module.WorkPageExportService(root).export_png,
+        "work_export_1", "page_main",
+    )
+    assert artifacts.verify_registered_file(result["artifact_id"])["status"] == "READY"
+
+
 async def test_offloaded_http_renderer_error_releases_busy_slot(api, monkeypatch):
     client, base, _, _, _, _, _, artifacts = api
     import manga_autopilot.services.work_page_export as module
