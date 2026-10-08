@@ -9,6 +9,7 @@ result is a failed step, never an untracked completion.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import secrets
 from collections.abc import Mapping
@@ -32,7 +33,6 @@ from manga_autopilot.services.autopilot import (
     AutopilotStateMachine,
     Orchestrator,
     OrchestratorHooks,
-    _invoke_hook,
 )
 
 
@@ -53,6 +53,22 @@ def _json_value(value: Any) -> Any:
     if isinstance(value, BaseModel):
         value = value.model_dump(mode="json")
     return json.loads(canonical_json(value))
+
+
+async def _invoke_durable_hook(hook: Any, run: AutopilotRun) -> Any:
+    """Run synchronous rendering/generation hooks off the event loop.
+
+    Lease renewal must continue even while synchronous Pillow or filesystem
+    hooks execute. Awaitable hook results are awaited on the calling loop.
+    """
+    if hook is None:
+        return None
+    if inspect.iscoroutinefunction(hook):
+        return await hook(run)
+    result = await asyncio.to_thread(hook, run)
+    if inspect.isawaitable(result):
+        return await result
+    return result
 
 
 @dataclass
@@ -226,7 +242,7 @@ class DurableAutopilotOrchestrator:
                 memory_step = run.record_step(hook_name, target_state)
                 run.log_event("step_started", {"step": hook_name})
                 try:
-                    result = await _invoke_hook(
+                    result = await _invoke_durable_hook(
                         getattr(self.hooks, hook_name, None), run,
                     )
                     replayable = _json_value(result)
