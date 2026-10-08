@@ -607,3 +607,150 @@ async def test_process_local_render_backpressure_does_not_start_second_canvas(ap
     done = await asyncio.wait_for(first, timeout=25)
     assert done["images_composited"] == 1
     assert len(artifacts.list_for_scope("page", "page_main")) == 1
+
+
+async def test_archived_panel_is_not_rendered_and_historical_png_remains(
+    api,
+):
+    client, base, _, handle, _, layouts, panels, artifacts = api
+    # Two distinct Panel candidates render at separate saved Slots.
+    layouts.create_slot(
+        slot_id="slot_live", layout_id="layout_main", slot_key="right",
+        reading_order=2, geometry={"x": 150, "y": 15, "width": 100, "height": 90},
+    )
+    panels.create_panel(
+        panel_id="panel_live", page_id="page_main", order_index=2,
+        panel_purpose="Still active", layout_slot_id="slot_live",
+    )
+    artifacts.register_local_bytes(
+        artifact_id="candidate_live", data=_png((20, 40, 230)),
+        relative_path="assets/panels/candidate_live.png",
+        artifact_type="panel_candidate", scope_type="panel",
+        scope_id="panel_live", mime_type="image/png",
+        dependency_fingerprint="live-v1",
+    )
+    current = panels.get_panel("panel_live")
+    panels.update_panel(
+        "panel_live", expected_revision=current["revision"],
+        selected_candidate_id="candidate_live",
+    )
+    first_response, first = await _export(client, base)
+    assert first_response.status == 201, first
+    assert first["images_composited"] == 2
+    old_file = handle.root / first["relative_path"]
+    old_bytes = old_file.read_bytes()
+    old_record = artifacts.get(first["artifact_id"])
+
+    # An archived Panel must not cause a new output to read its Candidate.
+    archived = panels.get_panel("panel_main")
+    panels.update_panel(
+        "panel_main", expected_revision=archived["revision"],
+        archived_at="2026-10-08T12:00:00Z",
+    )
+    (handle.root / "assets/panels/candidate_main.png").unlink()
+    second_response, second = await _export(client, base)
+    assert second_response.status == 201, second
+    assert second["panels_drawn"] == 1
+    assert second["images_composited"] == 1
+    with Image.open(handle.root / second["relative_path"]) as rendered:
+        assert rendered.getpixel((50, 50)) == (255, 255, 255)
+        assert rendered.getpixel((190, 50))[2] > 180
+    assert old_file.read_bytes() == old_bytes
+    assert artifacts.get(first["artifact_id"]) == old_record
+    all_exports = await client.get(
+        "/manga_autopilot/api/v2/works/work_export_1/exports"
+    )
+    entries = (await all_exports.json())["exports"]
+    assert [row["freshness"] for row in entries[:2]] == ["CURRENT", "STALE"]
+    # The archived Panel and its immutable candidate rows are still present.
+    assert panels.get_panel("panel_main")["archived_at"] is not None
+    assert artifacts.get("candidate_main")["id"] == "candidate_main"
+
+    panels.update_panel(
+        "panel_main", expected_revision=archived["revision"] + 1,
+        archived_at=None,
+    )
+    # Unarchiving is reversible; restore input file for the next output.
+    (handle.root / "assets/panels/candidate_main.png").write_bytes(_png((235, 15, 25)))
+    third_response, third = await _export(client, base)
+    assert third_response.status == 201, third
+    assert third["images_composited"] == 2
+
+
+async def test_archived_page_and_all_panels_archived_refuse_active_export(api):
+    client, base, _, handle, pages, _, panels, artifacts = api
+    existing_response, existing = await _export(client, base)
+    assert existing_response.status == 201
+    preserved = (handle.root / existing["relative_path"]).read_bytes()
+    page = pages.get_page("page_main")
+    pages.update_page(
+        "page_main", expected_revision=page["revision"],
+        archived_at="2026-10-08T12:10:00Z",
+    )
+    blocked_response, blocked = await _export(client, base)
+    assert blocked_response.status == 422
+    assert blocked["error"] == "export_precondition_failed"
+    assert "archived" in blocked["message"]
+    assert len(artifacts.list_for_scope("page", "page_main")) == 1
+    listed = await client.get("/manga_autopilot/api/v2/works/work_export_1/pages")
+    assert [p["id"] for p in (await listed.json())["pages"]] == ["page_other"]
+    recovery = await client.get(
+        "/manga_autopilot/api/v2/works/work_export_1/pages/page_main"
+        "?include_archived=1"
+    )
+    assert recovery.status == 200
+    historical = await client.get(
+        "/manga_autopilot/api/v2/works/work_export_1/exports/"
+        + existing["artifact_id"] + "/png"
+    )
+    assert historical.status == 200
+    assert await historical.read() == preserved
+
+    pages.update_page(
+        "page_main", expected_revision=page["revision"] + 1,
+        archived_at=None,
+    )
+    panel = panels.get_panel("panel_main")
+    panels.update_panel(
+        "panel_main", expected_revision=panel["revision"],
+        archived_at="2026-10-08T12:11:00Z",
+    )
+    no_panel_response, no_panel = await _export(client, base)
+    assert no_panel_response.status == 422
+    assert "no active Panels" in no_panel["message"]
+    assert len(artifacts.list_for_scope("page", "page_main")) == 1
+    panels.update_panel(
+        "panel_main", expected_revision=panel["revision"] + 1,
+        archived_at=None,
+    )
+    accepted, output = await _export(client, base)
+    assert accepted.status == 201, output
+    assert output["images_composited"] == 1
+
+
+async def test_page_archive_after_file_publication_cannot_register_ready_png(
+    api, monkeypatch,
+):
+    client, base, _, handle, pages, _, _, artifacts = api
+    import manga_autopilot.repositories.artifacts as artifact_module
+
+    original = artifact_module._publish_exclusive
+    archived = []
+
+    def publish_then_archive(temp, destination):
+        original(temp, destination)
+        if "exports" in destination.parts:
+            current = pages.get_page("page_main")
+            pages.update_page(
+                "page_main", expected_revision=current["revision"],
+                archived_at="2026-10-08T12:20:00Z",
+            )
+            archived.append(True)
+
+    monkeypatch.setattr(artifact_module, "_publish_exclusive", publish_then_archive)
+    response, body = await _export(client, base)
+    assert response.status == 409, body
+    assert body["error"] == "page_changed"
+    assert archived == [True]
+    assert artifacts.list_for_scope("page", "page_main") == []
+    assert len(list((handle.root / "exports/pages").glob("*.png"))) == 1
