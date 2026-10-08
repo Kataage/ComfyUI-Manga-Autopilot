@@ -61,4 +61,5 @@ jobs:
           tests/backend/test_repository_transactions.py
           tests/backend/test_work_lifecycle_repository.py
           tests/backend/test_artifact_repository.py
+          tests/backend/test_work_page_png_export.py
           -q
