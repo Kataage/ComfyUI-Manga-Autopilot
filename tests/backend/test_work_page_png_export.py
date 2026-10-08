@@ -755,3 +755,151 @@ async def test_page_archive_after_file_publication_cannot_register_ready_png(
     assert archived == [True]
     assert artifacts.list_for_scope("page", "page_main") == []
     assert len(list((handle.root / "exports/pages").glob("*.png"))) == 1
+
+
+async def test_http_page_render_does_not_block_other_requests_or_busy_reply(
+    api, monkeypatch,
+):
+    client, base, _, handle, _, _, _, artifacts = api
+    import manga_autopilot.services.work_page_export as module
+
+    real_renderer = module.render_page_to_png
+    started = threading.Event()
+    release = threading.Event()
+    calls = []
+
+    def suspended_renderer(*args, **kwargs):
+        calls.append(threading.get_ident())
+        started.set()
+        assert release.wait(timeout=20), "test renderer release timed out"
+        return real_renderer(*args, **kwargs)
+
+    monkeypatch.setattr(module, "render_page_to_png", suspended_renderer)
+    first = asyncio.create_task(_export(client, base))
+    try:
+        assert await asyncio.to_thread(started.wait, 10), (
+            "the first real aiohttp POST never entered Pillow"
+        )
+
+        async def page_snapshot():
+            response = await client.get(base)
+            return response.status, await response.json()
+
+        async def exports_snapshot():
+            response = await client.get(
+                "/manga_autopilot/api/v2/works/work_export_1/exports"
+            )
+            return response.status, await response.json()
+
+        # These actual HTTP requests MUST complete while the first PNG POST
+        # still owns the render slot. The old synchronous route blocks the
+        # event loop and cannot make this gather finish before release.
+        (page_status, page_body), (list_status, listed), (busy_response, busy) = (
+            await asyncio.wait_for(
+                asyncio.gather(
+                    page_snapshot(), exports_snapshot(), _export(client, base),
+                ),
+                timeout=6,
+            )
+        )
+        assert page_status == 200
+        assert page_body["page"]["id"] == "page_main"
+        assert list_status == 200
+        assert listed["exports"] == []
+        assert busy_response.status == 429
+        assert busy_response.headers["Retry-After"] == "2"
+        assert busy["error"] == "export_busy"
+        assert len(calls) == 1, "the busy request started another Pillow canvas"
+        assert not first.done(), "render completed before release"
+    finally:
+        release.set()
+
+    first_response, first_png = await asyncio.wait_for(first, timeout=20)
+    assert first_response.status == 201, first_png
+    assert first_png["images_composited"] == 1
+    assert len(calls) == 1
+    row = artifacts.get(first_png["artifact_id"])
+    assert row["status"] == "READY"
+    assert artifacts.verify_registered_file(row["id"]) == row
+    assert (handle.root / row["relative_path"]).is_file()
+
+    # Subsequent clients can render again; only the in-progress work was busy.
+    next_response, next_png = await _export(client, base)
+    assert next_response.status == 201, next_png
+    assert next_png["artifact_id"] != first_png["artifact_id"]
+    assert len(calls) == 2
+
+    gated = await client.get(
+        "/manga_autopilot/api/v2/works/work_export_1/exports/"
+        + first_png["artifact_id"] + "/png?require_current=1"
+    )
+    assert gated.status == 200
+    assert gated.headers["X-Work-Export-Freshness"] == "CURRENT"
+    assert await gated.read() == (handle.root / row["relative_path"]).read_bytes()
+
+
+async def test_cancelling_offloaded_http_worker_cleans_temp_and_releases_slot(
+    api, monkeypatch,
+):
+    _, _, root, handle, _, _, _, artifacts = api
+    import manga_autopilot.services.work_page_export as module
+    from manga_autopilot.routes.work_page_export_routes import _run_page_export
+
+    original_renderer = module.render_page_to_png
+    started = threading.Event()
+    release = threading.Event()
+
+    def suspended_renderer(*args, **kwargs):
+        started.set()
+        assert release.wait(timeout=20), "test renderer release timed out"
+        return original_renderer(*args, **kwargs)
+
+    monkeypatch.setattr(module, "render_page_to_png", suspended_renderer)
+    service = module.WorkPageExportService(root)
+    cancelled_http_task = asyncio.create_task(
+        _run_page_export(service, "work_export_1", "page_main", {})
+    )
+    try:
+        assert await asyncio.to_thread(started.wait, 10)
+        cancelled_http_task.cancel()
+        # Allow the route helper to signal cancellation to its worker before
+        # releasing Pillow. A detached to_thread() call would leave a READY
+        # Artifact behind even though its HTTP request was abandoned.
+        await asyncio.sleep(0)
+    finally:
+        release.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(cancelled_http_task, timeout=20)
+    assert artifacts.list_for_scope("page", "page_main") == []
+    assert not list((handle.root / "assets" / "temp").glob("page-export-*"))
+    export_dir = handle.root / "exports" / "pages"
+    assert not export_dir.exists() or not list(export_dir.glob("*.png"))
+
+    # The render semaphore is released by the finished worker, not by the
+    # cancelled asyncio waiter. A clean later POST can publish normally.
+    result = await asyncio.to_thread(
+        module.WorkPageExportService(root).export_png,
+        "work_export_1", "page_main",
+    )
+    assert artifacts.verify_registered_file(result["artifact_id"])["status"] == "READY"
+
+
+async def test_offloaded_http_renderer_error_releases_busy_slot(api, monkeypatch):
+    client, base, _, _, _, _, _, artifacts = api
+    import manga_autopilot.services.work_page_export as module
+
+    original = module.render_page_to_png
+
+    def broken_renderer(*args, **kwargs):
+        raise RuntimeError("intentional Pillow error")
+
+    monkeypatch.setattr(module, "render_page_to_png", broken_renderer)
+    response = await client.post(base + "/export/png", json={})
+    assert response.status == 500
+    await response.read()
+    assert artifacts.list_for_scope("page", "page_main") == []
+
+    monkeypatch.setattr(module, "render_page_to_png", original)
+    response, result = await _export(client, base)
+    assert response.status == 201, result

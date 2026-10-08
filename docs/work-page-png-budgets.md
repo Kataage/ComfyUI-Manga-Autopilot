@@ -24,6 +24,28 @@ Exceeding a profile's limits results in HTTP 422
 `export_precondition_failed`, with Work/Page context and an actionable
 suggestion. Concurrent Work PNG renders within a Python worker are limited to
 one, returning HTTP 429 `export_busy` with `Retry-After: 2` to other requests.
+The HTTP handler offloads this synchronous CPU/file-intensive service to a
+worker via `asyncio.to_thread()`. Thus a long Pillow render does **not**
+block aiohttp's event loop: Page Editor and Export Center reads are still
+served and a second concurrent HTTP POST can promptly return `429 export_busy`.
+The rendering semaphore remains owned and released only by the service worker.
+
+**Request cancellation (#349):** cancellation signals a `threading.Event`
+to the active worker, then the HTTP coroutine waits for its cleanup before
+propagating cancellation. Pillow itself is not forcibly interrupted; once the
+current render/encode step exits, the export checks cancellation and refuses
+publication. Another cancellation check runs inside the final
+`BEGIN IMMEDIATE` commit-time source guard, before a READY Artifact row or
+Work commit is created. The disposable render directory is removed and the
+worker, not the cancelled waiter, releases the semaphore. A cancellation
+arriving after the final accepted commit cannot undo that committed Artifact;
+the durable Work record is authoritative. If cancellation occurs after
+exclusive file publication but before the Work commit, the already-published
+orphan file may remain for normal recovery, but no unverified READY row is
+committed. Client TCP disconnection is not universally equivalent to aiohttp
+task cancellation; the lifecycle check applies when the server cancels the
+handler task.
+
 **Multiple independent server processes must be provisioned with a separate
 deployment-wide capacity limit**: the per-process semaphore cannot bound an
 arbitrary number of external workers or hosts.
