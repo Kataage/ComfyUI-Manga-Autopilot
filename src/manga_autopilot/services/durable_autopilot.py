@@ -25,12 +25,12 @@ from manga_autopilot.repositories.durable_runs import (
     WorkLeaseConflictError,
 )
 from manga_autopilot.services.autopilot import (
+    _STEP_NAMES,
     AutopilotRun,
     AutopilotState,
     AutopilotStateMachine,
     Orchestrator,
     OrchestratorHooks,
-    _STEP_NAMES,
     _invoke_hook,
 )
 
