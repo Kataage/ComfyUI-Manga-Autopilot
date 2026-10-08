@@ -8,7 +8,10 @@ from pathlib import Path
 import pytest
 
 from manga_autopilot.storage import (
+    WORK_MIGRATIONS,
     bootstrap_work_database,
+    migrate_work_database,
+    read_work_identity,
     create_work_commit,
     repository_write,
     write_connection,
@@ -576,3 +579,81 @@ def test_page_and_panel_story_beat_linkage_enforces_ownership_rows(
                 VALUES ('panel_001', 'missing_beat')
                 """
             )
+
+def test_upgrade_existing_w0002_work_to_page_schema_preserves_history(
+    tmp_path: Path,
+) -> None:
+    """A real pre-Page Work must upgrade without replacing its identity/history."""
+    database = tmp_path / "work.sqlite3"
+    original = bootstrap_work_database(
+        database,
+        work_id="work_001",
+        database_id="workdb_stable",
+        migrations=WORK_MIGRATIONS[:2],
+    )
+    assert original.migration.current_version == 2
+    with repository_write(database) as connection:
+        create_work_commit(
+            connection,
+            commit_id="commit_before_pages",
+            actor_type="system",
+            operation_type="before_upgrade",
+            created_at="2026-09-20T00:00:00+00:00",
+        )
+
+    result = migrate_work_database(
+        database,
+        work_id="work_001",
+        migrations=WORK_MIGRATIONS,
+    )
+
+    assert result.current_version == 3
+    assert result.applied_versions == (3,)
+    assert result.backup_path is not None
+    assert result.backup_path.is_file()
+    assert read_work_identity(database).database_id == "workdb_stable"
+
+    with write_connection(database) as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM commits WHERE commit_id = 'commit_before_pages'"
+        ).fetchone()[0] == 1
+        assert connection.execute(
+            "SELECT name FROM sqlite_master WHERE name = 'panels'"
+        ).fetchone() is not None
+        assert [r[0] for r in connection.execute(
+            "SELECT version FROM schema_migrations ORDER BY version"
+        )] == [1, 2, 3]
+
+    second = migrate_work_database(database, work_id="work_001")
+    assert second.applied_versions == ()
+    assert second.backup_path is None
+
+
+def test_w0003_preserves_v2_history_and_foreign_key_targets(
+    tmp_path: Path,
+) -> None:
+    """The new Work-local tables must not weaken baseline FK integrity."""
+    database = tmp_path / "work.sqlite3"
+    bootstrap_work_database(database, work_id="work_001")
+    with write_connection(database) as connection:
+        tables = {
+            str(row[0])
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
+        }
+        for table in (
+            "pages",
+            "page_story_beats",
+            "layout_instances",
+            "layout_slots",
+            "panels",
+            "panel_story_beats",
+        ):
+            targets = {
+                str(row["table"])
+                for row in connection.execute(f"PRAGMA foreign_key_list({table})")
+            }
+            assert targets <= tables
+            assert "commits" in targets or table == "panel_story_beats"
+        assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
