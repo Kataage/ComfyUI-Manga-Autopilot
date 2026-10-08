@@ -234,9 +234,7 @@ def test_changed_stage_input_after_reopen_reexecutes_only_downstream(
     before = {s["step_key"]: s for s in repo.list_steps(run_id)}
     assert before["generate_panels"]["status"] == "COMPLETED"
     assert before["render_pages"]["status"] == "FAILED_RETRYABLE"
-    assert before["export_pages"]["status"] == "COMPLETED" if (
-        "export_pages" in before
-    ) else True
+    assert "export" not in before
     assert repo.inspect_lease("work_247") is None
 
     # A second separate interpreter sees a different generation fingerprint.
