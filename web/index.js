@@ -177,6 +177,11 @@ function createWorkspaceView() {
     const mounts = resolveMounts();
 
     const showTab = (id) => {
+        // Always release the previous editor's event listeners and in-flight
+        // handlers, even when the destination requires a legacy Project ID.
+        const prev = disposers.get(activeTab);
+        if (typeof prev === "function") prev();
+        disposers.delete(activeTab);
         // Projects and the v2 Work-backed Page Editor must be accessible
         // before an unrelated legacy project ID has been selected.
         if (!activeProjectId && id !== "projects" && id !== "editor") {
@@ -184,10 +189,9 @@ function createWorkspaceView() {
             const msg = document.createElement("p");
             msg.textContent = "Set an active project id in the Projects tab to continue.";
             content.appendChild(msg);
+            activeTab = id;
             return;
         }
-        const prev = disposers.get(activeTab);
-        if (typeof prev === "function") prev();
         content.replaceChildren();
 
         const mountInto = (mountFn, key) => {
