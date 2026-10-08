@@ -12,6 +12,7 @@ from manga_autopilot.repositories.page_domain import (
     LayoutRepository,
     PageDomainNotFoundError,
     PageDomainOwnershipError,
+    PageDomainPanelArchivedError,
     PageRepository,
     PanelRepository,
 )
@@ -359,3 +360,75 @@ def test_layout_slot_and_panel_order_constraints_preserved(repositories):
     assert [s["id"] for s in layouts.list_slots("layout_001")] == [
         "slot_001", "slot_002",
     ]
+
+
+@pytest.mark.parametrize("same_slot", [True, False])
+def test_archived_panel_binding_rejected_by_domain_repo_before_any_write(
+    repositories, same_slot,
+):
+    pages, layouts, panels = repositories
+    _setup(repositories)
+    layouts.create_slot(
+        slot_id="slot_002", layout_id="layout_001", slot_key="bottom",
+        reading_order=2, geometry={"x": 5, "y": 600},
+    )
+    panels.create_panel(
+        panel_id="panel_live", page_id="page_001", order_index=2,
+        layout_slot_id="slot_002", panel_purpose="Visible",
+    )
+    archived = panels.update_panel(
+        "panel_001", expected_revision=1, archived_at="2026-10-08T13:00:00Z",
+    )
+    live = panels.get_panel("panel_live")
+    slot = layouts.get_slot("slot_001")
+    original_layout = layouts.get_layout("layout_001")
+    with repository_read(pages.database_path) as conn:
+        history_before = tuple(
+            conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+            for table in ("commits", "entity_revisions", "invalidations")
+        )
+    with pytest.raises(PageDomainPanelArchivedError, match="unarchive"):
+        layouts.update_layout(
+            "layout_001", expected_revision=original_layout["revision"],
+            geometry_json={"width": 880},
+            slot_updates=[{
+                "id": "slot_001", "expected_revision": slot["revision"],
+                "geometry_json": {"x": 70},
+            }],
+            panel_bindings=[
+                {
+                    "id": "panel_live", "expected_revision": live["revision"],
+                    "layout_slot_id": "slot_001",
+                },
+                {
+                    "id": "panel_001",
+                    "expected_revision": archived["revision"],
+                    "layout_slot_id": (
+                        "slot_001" if same_slot else "slot_002"
+                    ),
+                },
+            ],
+        )
+    assert layouts.get_layout("layout_001") == original_layout
+    assert layouts.get_slot("slot_001") == slot
+    assert panels.get_panel("panel_001") == archived
+    assert panels.get_panel("panel_live") == live
+    with repository_read(pages.database_path) as conn:
+        assert tuple(
+            conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+            for table in ("commits", "entity_revisions", "invalidations")
+        ) == history_before
+    revived = panels.update_panel(
+        "panel_001", expected_revision=archived["revision"], archived_at=None,
+    )
+    changed = layouts.update_layout(
+        "layout_001", expected_revision=original_layout["revision"],
+        panel_bindings=[{
+            "id": "panel_001",
+            "expected_revision": revived["revision"],
+            "layout_slot_id": "slot_002",
+        }],
+    )
+    assert changed["revision"] == original_layout["revision"]
+    assert panels.get_panel("panel_001")["layout_slot_id"] == "slot_002"
+    assert panels.get_panel("panel_001")["revision"] == revived["revision"] + 1
