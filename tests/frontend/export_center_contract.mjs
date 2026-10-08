@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { test } from "node:test";
 
 const source = await readFile(join(process.cwd(), "web", "export_center.js"), "utf8");
-const editor = await import("data:text/javascript;base64:"
+const editor = await import("data:text/javascript;base64,"
   + Buffer.from(source).toString("base64"));
 
 function response(status, data) {
