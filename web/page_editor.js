@@ -182,6 +182,7 @@ export function mountPageEditor(container, opts = {}) {
   let slotEdits = new Map();
   let bindingEdits = new Map();
   let currentPageId = "";
+  let currentWorkId = "";
   const documentListeners = [];
   container.replaceChildren();
 
@@ -254,6 +255,9 @@ export function mountPageEditor(container, opts = {}) {
   function updateControls() {
     loadBtn.disabled = busy;
     pageSelect.disabled = busy || !pageSelect.options.length;
+    for (const selector of bindings.querySelectorAll("select")) {
+      selector.disabled = busy || stale;
+    }
     saveBtn.disabled = busy || !snapshot?.layout || !dirty || stale;
     reloadBtn.disabled = busy || !currentPageId;
     widthInput.disabled = busy || !snapshot?.layout || stale;
@@ -399,6 +403,7 @@ export function mountPageEditor(container, opts = {}) {
   function applySnapshot(data) {
     snapshot = data;
     currentPageId = data.page.id;
+    currentWorkId = data.work_id;
     storePreference(STORAGE_PAGE, currentPageId);
     resetEdits();
     draw();
@@ -416,7 +421,7 @@ export function mountPageEditor(container, opts = {}) {
     updateControls();
     setStatus("Loading persisted Page...");
     try {
-      const data = await loadPersistedPage(workInput.value.trim(), pageId);
+      const data = await loadPersistedPage(currentWorkId, pageId);
       if (disposed || token !== requestToken) return;
       applySnapshot(data);
     } catch (err) {
@@ -443,6 +448,7 @@ export function mountPageEditor(container, opts = {}) {
     busy = true;
     snapshot = null;
     currentPageId = "";
+    currentWorkId = "";
     pageSelect.replaceChildren();
     updateControls();
     draw();
@@ -508,7 +514,7 @@ export function mountPageEditor(container, opts = {}) {
     setStatus("Saving layout...");
     try {
       const data = await savePersistedLayout(
-        workInput.value.trim(), currentPageId, snapshot,
+        currentWorkId, currentPageId, snapshot,
         { geometry: layoutGeometry, slots: slotEdits, bindings: bindingEdits }
       );
       if (disposed || token !== requestToken) return;
