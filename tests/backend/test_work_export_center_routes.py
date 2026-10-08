@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import io
+import json
 import threading
 from pathlib import Path
 
@@ -466,10 +467,19 @@ async def test_generic_sha_looking_page_render_never_acquires_current_attestatio
             (rendered["artifact_id"],),
         ).fetchone()
     assert row["operation_type"] == "register_verified_page_render_v1"
-    assert row["reason"] == (
-        "page_export_attestation_v1:"
-        f"{rendered['artifact_id']}:page_a:{rendered['dependency_fingerprint']}"
+    attestation = json.loads(row["reason"])
+    assert attestation["attestation_version"] == 1
+    assert attestation["artifact_id"] == rendered["artifact_id"]
+    assert attestation["page_id"] == "page_a"
+    assert attestation["dependency_fingerprint"] == (
+        rendered["dependency_fingerprint"]
     )
+    source = attestation["source_fingerprint_payload"]
+    assert source["page_id"] == "page_a"
+    assert source["panel_artifacts"][0]["artifact_id"] == "candidate_a"
+    assert source["background"] == "#ffffff"
+    assert source["outer_border"] is True
+    assert source["export_profile"] == "screen"
     authorized = await client.get(
         "/manga_autopilot/api/v2/works/work_fresh/exports/"
         + rendered["artifact_id"] + "/png?require_current=1"
