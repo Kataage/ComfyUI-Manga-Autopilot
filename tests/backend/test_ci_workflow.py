@@ -60,3 +60,4 @@ def test_ci_workflow_has_windows_persistence_job() -> None:
     assert "test_migrations.py" in flat
     assert "test_legacy_inventory.py" in flat
     assert "test_work_lifecycle_repository.py" in flat
+    assert "test_artifact_repository.py" in flat
