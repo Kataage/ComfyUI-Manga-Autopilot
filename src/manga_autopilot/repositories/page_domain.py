@@ -8,10 +8,8 @@ Downstream invalidations and entity-revision snapshots belong to issue #236.
 
 from __future__ import annotations
 
-import json
 import sqlite3
 from collections.abc import Mapping, Sequence
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -60,10 +58,6 @@ _JSON_FIELDS = frozenset({
     "continuity_requirements_json", "generation_spec_json",
 })
 _TABLES = frozenset({"pages", "layout_instances", "layout_slots", "panels"})
-
-
-def _timestamp() -> str:
-    return datetime.now(timezone.utc).isoformat()
 
 
 def _id(value: str, name: str) -> str:
