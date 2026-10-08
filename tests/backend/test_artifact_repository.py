@@ -163,6 +163,26 @@ def test_short_commit_sees_complete_published_file_not_temporary(work, monkeypat
     assert called == [handle.root / "exports" / "pages" / "final.png"]
 
 
+def test_commit_guard_rejects_ready_artifact_atomically_after_file_publish(work):
+    repo, handle = work
+    baseline = _counts(handle.database_path)
+    checked = []
+
+    def fail_under_write_lock(conn):
+        assert conn.in_transaction
+        # No formal Artifact commit, row, or history exists yet.
+        assert _counts(handle.database_path) == baseline
+        checked.append(True)
+        raise RuntimeError("source revision changed")
+
+    with pytest.raises(RuntimeError, match="source revision changed"):
+        _register(repo, commit_guard=fail_under_write_lock)
+    assert checked == [True]
+    assert _counts(handle.database_path) == baseline
+    # The hard-linked final file remains orphaned for crash-safe recovery.
+    assert (handle.root / "assets/panels/reveal.png").is_file()
+
+
 def test_streaming_file_registration_preserves_source_and_payload(work, tmp_path):
     repo, handle = work
     source = tmp_path / "already-rendered.bin"
