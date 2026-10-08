@@ -77,8 +77,6 @@ def read_page_state_in_transaction(
     }
 
 
-
-
 class PageApplicationService:
     """A Work-scoped query/command facade suitable for HTTP or a UI adapter."""
 
