@@ -11,6 +11,7 @@ from __future__ import annotations
 import hashlib
 import math
 import tempfile
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -23,6 +24,10 @@ from manga_autopilot.repositories import (
     WorkLifecycleRepository,
 )
 from manga_autopilot.services.page_application import PageApplicationService
+from manga_autopilot.services.page_png_budget import (
+    DEFAULT_PROFILE,
+    resolve_page_png_budget,
+)
 from manga_autopilot.services.page_renderer import render_page_to_png
 from manga_autopilot.storage import assert_managed_path
 
@@ -33,6 +38,16 @@ class PageExportValidationError(ValueError):
 
 class PageExportConflictError(PageExportValidationError):
     """Persisted state changed during rendering; reject the stale export."""
+
+
+class PageExportBusyError(PageExportValidationError):
+    """This worker is already rendering another large Work Page PNG."""
+
+
+# Process-local backpressure: concurrent requests through multiple service
+# instances in one worker must not allocate multiple giant Pillow canvases.
+# Multi-worker deployments must provision/enforce a separate global capacity.
+_RENDER_SLOT = threading.BoundedSemaphore(value=1)
 
 
 def _number(data: dict[str, Any], field: str, label: str) -> float:
@@ -130,7 +145,34 @@ class WorkPageExportService:
         *,
         background: str = "#ffffff",
         outer_border: bool = True,
+        export_profile: str = DEFAULT_PROFILE,
     ) -> dict[str, Any]:
+        if not _RENDER_SLOT.acquire(blocking=False):
+            raise PageExportBusyError(
+                f"Work {work_id}, Page {page_id}: another PNG render is in progress "
+                "in this worker. Retry after it completes."
+            )
+        try:
+            return self._export_png(
+                work_id, page_id, background=background,
+                outer_border=outer_border, export_profile=export_profile,
+            )
+        finally:
+            _RENDER_SLOT.release()
+
+    def _export_png(
+        self,
+        work_id: str,
+        page_id: str,
+        *,
+        background: str,
+        outer_border: bool,
+        export_profile: str,
+    ) -> dict[str, Any]:
+        try:
+            budget = resolve_page_png_budget(export_profile)
+        except ValueError as exc:
+            raise PageExportValidationError(str(exc)) from exc
         if (not isinstance(background, str) or len(background) != 7
             or background[0] != "#" or any(
                 ch not in "0123456789abcdefABCDEF" for ch in background[1:]
@@ -152,6 +194,15 @@ class WorkPageExportService:
             raise PageExportValidationError("persisted Layout geometry is not an object")
         width = _size(page_geometry, "width", f"Page {page_id}")
         height = _size(page_geometry, "height", f"Page {page_id}")
+        area = width * height
+        if area > budget.max_pixels:
+            raise PageExportValidationError(
+                f"Work {work_id}, Page {page_id}: {width} x {height} "
+                f"({area:,} pixels) exceeds {budget.name!r} export_profile "
+                f"limit of {budget.max_pixels:,} pixels. Reduce saved Page "
+                "dimensions in Page Editor or explicitly select the 'print' "
+                "profile for a larger permitted output."
+            )
 
         slots = {slot["id"]: slot for slot in state["slots"]}
         if not state["panels"]:
@@ -162,6 +213,7 @@ class WorkPageExportService:
         work = WorkLifecycleRepository(self.storage_root).open_work(work_id)
         layouts: list[PanelLayout] = []
         dependencies: list[dict[str, Any]] = []
+        total_input_pixels = 0
         for panel in state["panels"]:
             panel_id = panel["id"]
             slot_id = panel["layout_slot_id"]
@@ -185,6 +237,22 @@ class WorkPageExportService:
                     f"LayoutSlot {slot_id}: width and height must be positive"
                 )
             artifact = _selected_artifact(artifact_repo, panel)
+            iw, ih = artifact["width"], artifact["height"]
+            if type(iw) is not int or type(ih) is not int or iw < 1 or ih < 1:
+                raise PageExportValidationError(
+                    f"Panel {panel_id}: selected Artifact has no valid stored image dimensions"
+                )
+            input_area = iw * ih
+            total_input_pixels += input_area
+            if input_area > budget.max_input_pixels or (
+                total_input_pixels > budget.max_total_input_pixels
+            ):
+                raise PageExportValidationError(
+                    f"Work {work_id}, Page {page_id}, Panel {panel_id}: "
+                    "registered candidate image input pixel budget exceeded "
+                    f"for export_profile {budget.name!r}. Use smaller images "
+                    "or the explicit 'print' profile."
+                )
             image_path = assert_managed_path(
                 work.root.joinpath(*artifact["relative_path"].split("/")),
                 containment_root=work.root,
@@ -212,6 +280,7 @@ class WorkPageExportService:
             "panel_artifacts": dependencies,
             "background": background,
             "outer_border": outer_border,
+            "export_profile": budget.name,
             "renderer": "legacy_page_renderer_v1",
         }
         fingerprint = hashlib.sha256(
@@ -237,6 +306,15 @@ class WorkPageExportService:
                 background=background,
                 outer_border=outer_border,
             )
+            # Fail before final Artifact publication, including pathological
+            # incompressible PNGs that exceed the profile's disk/network budget.
+            output_bytes = result.output_path.stat().st_size
+            if output_bytes > budget.max_png_bytes:
+                raise PageExportValidationError(
+                    f"Work {work_id}, Page {page_id}: rendered PNG is "
+                    f"{output_bytes:,} bytes, exceeding export_profile "
+                    f"{budget.name!r} limit of {budget.max_png_bytes:,} bytes."
+                )
             if result.images_composited != len(layouts):
                 raise PageExportValidationError(
                     f"Page {page_id}: only {result.images_composited}/"
@@ -280,6 +358,7 @@ class WorkPageExportService:
 
 
 __all__ = [
+    "PageExportBusyError",
     "PageExportConflictError",
     "PageExportValidationError",
     "WorkPageExportService",

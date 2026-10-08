@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import io
+import threading
 from pathlib import Path
 
 import pytest
@@ -319,3 +321,152 @@ async def test_concurrent_page_edit_during_render_blocks_stale_registration(api,
     assert artifacts.list_for_scope("page", "page_main") == []
     export_dir = handle.root / "exports" / "pages"
     assert not export_dir.exists() or not list(export_dir.iterdir())
+
+
+async def test_oversized_output_area_rejected_before_renderer_or_artifact(api, monkeypatch):
+    client, base, _, handle, _, layouts, _, artifacts = api
+    import manga_autopilot.services.work_page_export as module
+
+    invoked = []
+    monkeypatch.setattr(module, "render_page_to_png", lambda *a, **kw: invoked.append(kw))
+    current = layouts.get_layout("layout_main")
+    layouts.update_layout(
+        "layout_main", expected_revision=current["revision"],
+        geometry_json={"width": 5000, "height": 5000},
+    )
+    response, data = await _export(client, base)
+    assert response.status == 422
+    assert data["error"] == "export_precondition_failed"
+    assert "25,000,000 pixels" in data["message"]
+    assert "12,000,000" in data["message"]
+    assert "Page page_main" in data["message"]
+    assert "print" in data["message"]
+    assert invoked == []
+    assert artifacts.list_for_scope("page", "page_main") == []
+    # Artifact fixture setup already creates assets/temp; reject renders must
+    # not create or leave any transient page-export render directory.
+    assert not list((handle.root / "assets" / "temp").glob("page-export-*"))
+
+
+async def test_print_profile_allowed_to_reach_renderer_but_hard_caps_enforced(api, monkeypatch):
+    client, base, _, _, _, layouts, _, artifacts = api
+    import manga_autopilot.services.work_page_export as module
+
+    current = layouts.get_layout("layout_main")
+    layouts.update_layout(
+        "layout_main", expected_revision=current["revision"],
+        geometry_json={"width": 5000, "height": 4000},
+    )
+    called = []
+
+    def stop_renderer(*args, **kwargs):
+        called.append((kwargs["page_width"], kwargs["page_height"]))
+        raise RuntimeError("renderer reached within named print profile")
+
+    monkeypatch.setattr(module, "render_page_to_png", stop_renderer)
+    response, data = await _export(client, base)
+    assert response.status == 422
+    assert "12,000,000" in data["message"]
+    with pytest.raises(RuntimeError, match="renderer reached"):
+        module.WorkPageExportService(base_storage(api)).export_png(
+            "work_export_1", "page_main", export_profile="print"
+        )
+    assert called == [(5000, 4000)]
+    assert artifacts.list_for_scope("page", "page_main") == []
+
+    updated = layouts.get_layout("layout_main")
+    layouts.update_layout(
+        "layout_main", expected_revision=updated["revision"],
+        geometry_json={"width": 6000, "height": 5000},
+    )
+    response, data = await _export(client, base, {"export_profile": "print"})
+    assert response.status == 422
+    assert "24,000,000 pixels" in data["message"]
+    assert called == [(5000, 4000)]
+
+
+def base_storage(api):
+    return api[2]
+
+
+@pytest.mark.parametrize("profile", ["ultra", "", None, 500, {}, []])
+async def test_unknown_export_profile_is_rejected(api, profile):
+    client, base, _, _, _, _, _, artifacts = api
+    response, data = await _export(client, base, {"export_profile": profile})
+    assert response.status == 422
+    assert data["error"] == "export_precondition_failed"
+    assert "export_profile" in data["message"]
+    assert artifacts.list_for_scope("page", "page_main") == []
+
+
+async def test_candidate_pixel_metadata_budget_rejected_before_decode(api, monkeypatch):
+    client, base, _, _, _, _, _, artifacts = api
+    import manga_autopilot.services.work_page_export as module
+    from manga_autopilot.storage import repository_write
+
+    with repository_write(artifacts._open().database_path) as db:
+        db.execute(
+            "UPDATE artifacts SET width = ?, height = ? WHERE id = ?",
+            (5000, 5000, "candidate_main"),
+        )
+    invoked = []
+    monkeypatch.setattr(module, "render_page_to_png", lambda *a, **kw: invoked.append(kw))
+    response, data = await _export(client, base)
+    assert response.status == 422
+    assert "input pixel budget exceeded" in data["message"]
+    assert invoked == []
+
+
+async def test_generated_png_file_size_budget_before_artifact_registration(api, monkeypatch):
+    client, base, _, handle, _, _, _, artifacts = api
+    import manga_autopilot.services.work_page_export as module
+    from manga_autopilot.services.page_png_budget import PROFILES
+    from manga_autopilot.services.page_renderer import PageRenderResult
+
+    def sparse_oversized_render(page_id, layouts, *, output_dir, **kwargs):
+        path = Path(output_dir) / "page_0001.png"
+        with path.open("wb") as output:
+            output.truncate(PROFILES["screen"].max_png_bytes + 1)
+        return PageRenderResult(
+            page_id=page_id, output_path=path, width=300, height=200,
+            panels_drawn=1, images_composited=1,
+        )
+
+    monkeypatch.setattr(module, "render_page_to_png", sparse_oversized_render)
+    response, data = await _export(client, base)
+    assert response.status == 422
+    assert "rendered PNG" in data["message"]
+    assert "bytes" in data["message"]
+    assert artifacts.list_for_scope("page", "page_main") == []
+    assert not (handle.root / "exports" / "pages").exists()
+
+
+async def test_process_local_render_backpressure_does_not_start_second_canvas(api, monkeypatch):
+    _, _, storage, _, _, _, _, artifacts = api
+    import manga_autopilot.services.work_page_export as module
+
+    original = module.render_page_to_png
+    entered = threading.Event()
+    release = threading.Event()
+
+    def suspended_renderer(*args, **kwargs):
+        entered.set()
+        assert release.wait(timeout=20)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(module, "render_page_to_png", suspended_renderer)
+    service = module.WorkPageExportService(storage)
+    first = asyncio.create_task(
+        asyncio.to_thread(service.export_png, "work_export_1", "page_main")
+    )
+    try:
+        assert await asyncio.to_thread(entered.wait, 12)
+        with pytest.raises(module.PageExportBusyError, match="another PNG render"):
+            module.WorkPageExportService(storage).export_png(
+                "work_export_1", "page_main"
+            )
+    finally:
+        release.set()
+    done = await asyncio.wait_for(first, timeout=25)
+    assert done["images_composited"] == 1
+    assert len(artifacts.list_for_scope("page", "page_main")) == 1

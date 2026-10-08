@@ -15,6 +15,7 @@ from manga_autopilot.repositories import (
     WorkNotFoundError,
 )
 from manga_autopilot.services.work_page_export import (
+    PageExportBusyError,
     PageExportConflictError,
     PageExportValidationError,
     WorkPageExportService,
@@ -22,7 +23,7 @@ from manga_autopilot.services.work_page_export import (
 from manga_autopilot.storage.paths import UnsafeStoragePathError
 
 ROUTE_PREFIX = "/manga_autopilot/api/v2/works/{work_id}/pages/{page_id}/export/png"
-_ALLOWED_SETTINGS = frozenset({"background", "outer_border"})
+_ALLOWED_SETTINGS = frozenset({"background", "outer_border", "export_profile"})
 
 
 async def export_work_page_png(request: web.Request) -> web.Response:
@@ -57,6 +58,11 @@ async def export_work_page_png(request: web.Request) -> web.Response:
     except (PageDomainNotFoundError, WorkNotFoundError) as exc:
         return web.json_response(
             {"error": "not_found", "message": str(exc)}, status=404
+        )
+    except PageExportBusyError as exc:
+        return web.json_response(
+            {"error": "export_busy", "message": str(exc)}, status=429,
+            headers={"Retry-After": "2"},
         )
     except PageExportConflictError as exc:
         return web.json_response(
