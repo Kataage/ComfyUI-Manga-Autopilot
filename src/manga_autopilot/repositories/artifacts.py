@@ -11,7 +11,9 @@ from __future__ import annotations
 import hashlib
 import io
 import os
+import sqlite3
 import tempfile
+from collections.abc import Callable
 from pathlib import Path, PurePosixPath
 from typing import Any, BinaryIO
 
@@ -235,6 +237,7 @@ class ArtifactRepository:
         mime_type: str = "application/octet-stream",
         run_id: str | None = None,
         generation_attempt_id: str | None = None,
+        commit_guard: Callable[[sqlite3.Connection], None] | None = None,
     ) -> dict[str, Any]:
         source = Path(source_path)
         if source.is_symlink() or not source.is_file():
@@ -251,6 +254,7 @@ class ArtifactRepository:
                 mime_type=mime_type,
                 run_id=run_id,
                 generation_attempt_id=generation_attempt_id,
+                commit_guard=commit_guard,
             )
 
     def _register_stream(
@@ -266,6 +270,7 @@ class ArtifactRepository:
         mime_type: str,
         run_id: str | None,
         generation_attempt_id: str | None,
+        commit_guard: Callable[[sqlite3.Connection], None] | None = None,
     ) -> dict[str, Any]:
         relative = _valid_relative_path(relative_path)
         kind = _nonempty(artifact_type, "artifact_type")
@@ -329,6 +334,12 @@ class ArtifactRepository:
         with repository_write(work.database_path) as conn:
             if not target.is_file():
                 raise ArtifactIntegrityError("published artifact disappeared before registration")
+            # The caller's DB-only guard checks all source revisions under
+            # this SAME BEGIN IMMEDIATE Work transaction. A mismatch aborts
+            # before any commit/revision/READY Artifact row is written.
+            # The already-published immutable file remains a recoverable orphan.
+            if commit_guard is not None:
+                commit_guard(conn)
             commit = create_work_commit(
                 conn,
                 commit_id=new_id("commit"),
