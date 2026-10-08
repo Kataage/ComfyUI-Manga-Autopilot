@@ -12,9 +12,8 @@ import hashlib
 import io
 import os
 import tempfile
-from collections.abc import BinaryIO, Iterable
 from pathlib import Path, PurePosixPath
-from typing import Any
+from typing import Any, BinaryIO
 
 from PIL import Image, UnidentifiedImageError
 
