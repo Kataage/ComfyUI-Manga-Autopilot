@@ -422,6 +422,44 @@ async def test_panel_switch_after_file_publication_rejects_stale_png(api, monkey
     assert len(list((handle.root / "exports" / "pages").glob("*.png"))) == 2
 
 
+async def test_new_candidate_after_file_publication_invalidates_implicit_choice(
+    api, monkeypatch,
+):
+    client, base, _, _, _, _, panels, artifacts = api
+    import manga_autopilot.repositories.artifacts as artifacts_module
+
+    current = panels.get_panel("panel_main")
+    panels.update_panel(
+        "panel_main", expected_revision=current["revision"],
+        selected_candidate_id=None,
+    )
+    original_publish = artifacts_module._publish_exclusive
+    added = []
+
+    def publish_then_add_candidate(temp, destination):
+        original_publish(temp, destination)
+        if "exports" in destination.parts:
+            artifacts.register_local_bytes(
+                artifact_id="candidate_late",
+                data=_png((0, 220, 0)), artifact_type="panel_candidate",
+                scope_type="panel", scope_id="panel_main",
+                mime_type="image/png",
+                relative_path="assets/panels/candidate_late.png",
+                dependency_fingerprint="late_v1",
+            )
+            added.append(True)
+
+    monkeypatch.setattr(
+        artifacts_module, "_publish_exclusive", publish_then_add_candidate
+    )
+    response, body = await _export(client, base)
+    assert response.status == 409, body
+    assert body["error"] == "page_changed"
+    assert added == [True]
+    assert artifacts.list_for_scope("page", "page_main") == []
+    assert artifacts.get("candidate_late")["status"] == "READY"
+
+
 async def test_oversized_output_area_rejected_before_renderer_or_artifact(api, monkeypatch):
     client, base, _, handle, _, layouts, _, artifacts = api
     import manga_autopilot.services.work_page_export as module
