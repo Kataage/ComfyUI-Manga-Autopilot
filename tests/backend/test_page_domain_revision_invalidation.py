@@ -247,11 +247,12 @@ def test_selected_candidate_change_does_not_invalidate_panel_generation(domain):
             """INSERT INTO artifacts (
                 id, artifact_type, scope_type, scope_id, relative_path,
                 mime_type, sha256, file_size, revision, dependency_fingerprint,
-                status
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                status, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             ("candidate_001", "panel_candidate", "panel", "panel_a",
              "assets/panels/candidate_001.png", "image/png",
-             "0" * 64, 16, 1, "fixture-input", "READY"),
+             "0" * 64, 16, 1, "fixture-input", "READY",
+             "2026-10-08T00:00:00Z"),
         )
     before = _counts(pages)
     changed = panels.update_panel(
