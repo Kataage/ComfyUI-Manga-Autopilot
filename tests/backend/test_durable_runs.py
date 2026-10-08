@@ -323,3 +323,82 @@ def test_lease_requires_existing_work_and_run(tmp_path: Path) -> None:
                            lease_kind="MUTATION", ttl_seconds=1,
                            run_id=run_id)
     assert repo.inspect_lease("work_test") is None
+
+
+
+def test_step_heartbeat_fences_stale_owner_after_explicit_reclaim(
+    tmp_path: Path,
+) -> None:
+    """An old worker cannot impersonate the active step's new attempt."""
+    db = tmp_path / "work.sqlite3"
+    _work(db)
+    clock = Clock()
+    original = DurableRunRepository(db, clock=clock)
+    fresh = DurableRunRepository(db, clock=clock)
+    run_id = _run(original)
+    original.acquire_lease(
+        work_id="work_test", lease_owner="first",
+        lease_kind="AUTOPILOT_MUTATION", ttl_seconds=6, run_id=run_id,
+    )
+    original.transition_run(
+        run_id, expected_status="PENDING", new_status="RUNNING",
+        lease_owner="first",
+    )
+    step = original.create_step(
+        run_id=run_id, step_key="generate_panels",
+        input_fingerprint="v1", lease_owner="first",
+    )
+    step_id = step["id"]
+    original.start_step(
+        step_id, input_fingerprint="v1", lease_owner="first",
+    )
+    initial = fresh.get_step(step_id)["heartbeat_at"]
+    clock.advance(1)
+    original.heartbeat_step(step_id, lease_owner="first")
+    assert fresh.get_step(step_id)["heartbeat_at"] > initial
+
+    clock.advance(7)
+    assert fresh.inspect_lease("work_test")["expired"] is True
+    fresh.acquire_lease(
+        work_id="work_test", lease_owner="second",
+        lease_kind="AUTOPILOT_MUTATION", ttl_seconds=12,
+        run_id=run_id, reclaim_expired_owner="first",
+    )
+    fresh.recover_interrupted_run(run_id, lease_owner="second")
+    fresh.transition_run(
+        run_id, expected_status="INTERRUPTED", new_status="RUNNING",
+        lease_owner="second",
+    )
+    fresh.start_step(
+        step_id, input_fingerprint="v1", lease_owner="second",
+    )
+    before = fresh.get_step(step_id)
+    assert before["attempt_count"] == 2
+    receipts = fresh.list_step_attempts(step_id)
+    assert [a["status"] for a in receipts] == ["INTERRUPTED", "RUNNING"]
+    clock.advance(1)
+
+    with pytest.raises(WorkLeaseConflictError):
+        original.heartbeat_step(step_id, lease_owner="first")
+    assert fresh.get_step(step_id)["heartbeat_at"] == before["heartbeat_at"]
+    assert fresh.list_step_attempts(step_id) == receipts
+    # Even callers with a step ID but no owner token cannot write heartbeat.
+    with pytest.raises(TypeError):
+        original.heartbeat_step(step_id)
+
+    fresh.heartbeat_step(step_id, lease_owner="second")
+    assert fresh.get_step(step_id)["heartbeat_at"] > before["heartbeat_at"]
+    assert fresh.list_step_attempts(step_id) == receipts
+
+    fresh.finish_step(
+        step_id, status="COMPLETED", output={"value": True},
+        lease_owner="second",
+    )
+    finished = fresh.get_step(step_id)
+    clock.advance(1)
+    with pytest.raises(DurableRunStateError, match="RUNNING"):
+        fresh.heartbeat_step(step_id, lease_owner="second")
+    assert fresh.get_step(step_id)["heartbeat_at"] == finished["heartbeat_at"]
+    assert [a["status"] for a in fresh.list_step_attempts(step_id)] == [
+        "INTERRUPTED", "COMPLETED",
+    ]
