@@ -6,7 +6,12 @@ Never enumerate arbitrary filesystem paths or accept client-supplied paths.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
+import os
+import stat
+import tempfile
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -19,10 +24,69 @@ from manga_autopilot.repositories import (
     WorkIdentityMismatchError,
     WorkNotFoundError,
 )
+from manga_autopilot.services.page_png_budget import (
+    MAX_SERVABLE_PNG_BYTES,
+    PNG_IO_CHUNK_BYTES,
+    PNG_SPOOL_MEMORY_BYTES,
+)
 from manga_autopilot.storage import assert_managed_path, repository_read
 from manga_autopilot.storage.paths import UnsafeStoragePathError
 
 ROUTE_PREFIX = "/manga_autopilot/api/v2/works/{work_id}/exports"
+# Cap disk-spool concurrency. Each download uses at most 1 MiB Python RAM
+# plus a bounded, checked on-disk temp snapshot, not a full in-memory PNG.
+_DOWNLOAD_SLOTS = threading.BoundedSemaphore(value=2)
+
+
+def _verified_png_snapshot(path: Path, row: dict[str, Any]):
+    """Copy and verify one pinned input file descriptor before serving bytes.
+
+    The returned file-like object is an independently owned, seeked snapshot,
+    not a live path. Replacement or mutation of the Work path after this
+    function cannot alter the emitted response body. Only verified bytes may
+    reach the client; never stream a partial unverified corrupt artifact.
+    """
+    limit = MAX_SERVABLE_PNG_BYTES
+    expected_size = row["file_size"]
+    if type(expected_size) is not int or not 0 < expected_size <= limit:
+        raise ArtifactIntegrityError(
+            f"registered Work PNG {row['id']!r} exceeds the {limit:,} byte "
+            "download budget; use a smaller export"
+        )
+    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0)
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        fd = os.open(path, flags)
+    except OSError as exc:
+        raise ArtifactIntegrityError(
+            f"registered Work PNG {row['id']!r} file is missing or unsafe: {exc}"
+        ) from exc
+    snapshot = tempfile.SpooledTemporaryFile(max_size=PNG_SPOOL_MEMORY_BYTES)
+    try:
+        with os.fdopen(fd, "rb") as source:
+            if not stat.S_ISREG(os.fstat(source.fileno()).st_mode):
+                raise ArtifactIntegrityError("registered Work PNG is not a regular file")
+            digest = hashlib.sha256()
+            length = 0
+            while chunk := source.read(PNG_IO_CHUNK_BYTES):
+                length += len(chunk)
+                if length > limit or length > expected_size:
+                    raise ArtifactIntegrityError(
+                        f"registered Work PNG {row['id']!r} exceeds its size budget"
+                    )
+                digest.update(chunk)
+                snapshot.write(chunk)
+        if length != expected_size or digest.hexdigest() != row["sha256"]:
+            raise ArtifactIntegrityError(
+                f"registered Work PNG {row['id']!r} hash/size mismatch"
+            )
+        snapshot.seek(0)
+        return snapshot
+    except BaseException:
+        snapshot.close()
+        raise
+
 
 
 def _repository(request: web.Request) -> ArtifactRepository:
@@ -107,30 +171,41 @@ async def get_work_export_png(request: web.Request) -> web.Response:
         artifact_id = request.match_info["artifact_id"]
         row = repository.get(artifact_id)
         _ensure_page_png(row, artifact_id)
-        repository.verify_registered_file(artifact_id)
-        handle = repository._open()
-        path = assert_managed_path(
-            handle.root.joinpath(*row["relative_path"].split("/")),
-            containment_root=handle.root,
-            field_name="Work Page PNG export",
-        )
-        if path.is_symlink() or not path.is_file():
-            raise ArtifactIntegrityError(
-                f"registered Work PNG {artifact_id!r} is missing or unsafe"
+        if not _DOWNLOAD_SLOTS.acquire(blocking=False):
+            return web.json_response(
+                {"error": "download_busy", "message":
+                 "Work PNG download budget is busy; retry after other downloads finish"},
+                status=429, headers={"Retry-After": "2"},
             )
-        data = path.read_bytes()
-        if len(data) != row["file_size"] or hashlib.sha256(data).hexdigest() != row["sha256"]:
-            raise ArtifactIntegrityError(
-                f"registered Work PNG {artifact_id!r} changed while reading"
+        try:
+            handle = repository._open()
+            path = assert_managed_path(
+                handle.root.joinpath(*row["relative_path"].split("/")),
+                containment_root=handle.root,
+                field_name="Work Page PNG export",
             )
-        return web.Response(
-            body=data,
-            content_type="image/png",
-            headers={
-                "Cache-Control": "private, no-store",
-                "X-Content-Type-Options": "nosniff",
-            },
-        )
+            # Validate a pinned original file descriptor and copy in bounded
+            # chunks. Stream only from the verified independent temp snapshot.
+            snapshot = await asyncio.to_thread(_verified_png_snapshot, path, row)
+            try:
+                response = web.StreamResponse(
+                    status=200,
+                    headers={
+                        "Content-Type": "image/png",
+                        "Cache-Control": "private, no-store",
+                        "X-Content-Type-Options": "nosniff",
+                    },
+                )
+                response.content_length = row["file_size"]
+                await response.prepare(request)
+                while chunk := await asyncio.to_thread(snapshot.read, PNG_IO_CHUNK_BYTES):
+                    await response.write(chunk)
+                await response.write_eof()
+                return response
+            finally:
+                snapshot.close()
+        finally:
+            _DOWNLOAD_SLOTS.release()
     except Exception as exc:
         return _error(exc)
 
