@@ -425,8 +425,16 @@ class DurableRunRepository:
             )
             return dict(step)
 
-    def heartbeat_step(self, step_id: str) -> None:
+    def heartbeat_step(self, step_id: str, *, lease_owner: str) -> None:
+        """Heartbeat only the active attempt held by the current Work owner.
+
+        Verify the Run/lease under the same write transaction that updates
+        the Step: an old executor cannot touch a newer resumed attempt.
+        """
+        _required(lease_owner, "lease_owner")
         with repository_write(self.database_path) as conn:
+            step = self._get(conn, "run_steps", step_id)
+            self._assert_owner(conn, str(step["run_id"]), lease_owner)
             cursor = conn.execute(
                 """UPDATE run_steps SET heartbeat_at = ?
                    WHERE id = ? AND status = 'RUNNING'""",
