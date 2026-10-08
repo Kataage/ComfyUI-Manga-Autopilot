@@ -371,3 +371,128 @@ async def test_invalid_archive_query_is_rejected(api, query):
     assert list_response.status == 400
     detail_response = await client.get(prefix + "/page_001" + query)
     assert detail_response.status == 400
+
+
+async def test_archived_panel_binding_is_rejected_atomically_and_unarchive_recovers(
+    api, aiohttp_client,
+):
+    client, prefix, root, handle = api
+    panels = PanelRepository(handle.database_path)
+    layouts = LayoutRepository(handle.database_path)
+    existing = panels.get_panel("panel_001")
+    archived = panels.update_panel(
+        "panel_001", expected_revision=existing["revision"],
+        archived_at="2026-10-08T13:00:00Z",
+    )
+
+    active_response, active = await _state(client, prefix)
+    assert active_response.status == 200
+    assert [p["id"] for p in active["panels"]] == ["panel_002"]
+    recovery = await client.get(prefix + "/page_001?include_archived=1")
+    assert recovery.status == 200
+    full = await recovery.json()
+    assert [p["id"] for p in full["panels"]] == ["panel_001", "panel_002"]
+    assert full["panels"][0]["archived_at"] is not None
+    assert full["panels"][0]["layout_slot_id"] == "slot_001"
+
+    def history_counts():
+        with repository_read(handle.database_path) as db:
+            return tuple(
+                db.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+                for table in ("commits", "entity_revisions", "invalidations")
+            )
+
+    before_counts = history_counts()
+    before_layout = layouts.get_layout("layout_001")
+    before_slot = layouts.get_slot("slot_001")
+    before_live = panels.get_panel("panel_002")
+
+    # Even a no-op command against a hidden Panel is not an active edit.
+    noop = await client.patch(prefix + "/page_001/layout", json={
+        "expected_revision": before_layout["revision"],
+        "panel_bindings": [{
+            "id": "panel_001", "expected_revision": archived["revision"],
+            "layout_slot_id": archived["layout_slot_id"],
+        }],
+    })
+    assert noop.status == 409
+    assert (await noop.json())["error"] == "panel_archived"
+    assert history_counts() == before_counts
+
+    # Stage another valid Panel binding, a Slot update, and Layout geometry
+    # before the archived participant: the whole batch must roll back.
+    mixed = await client.patch(prefix + "/page_001/layout", json={
+        "expected_revision": before_layout["revision"],
+        "geometry_json": {"width": 1600, "height": 2200},
+        "slot_updates": [{
+            "id": "slot_001",
+            "expected_revision": before_slot["revision"],
+            "geometry_json": {"x": 22, "y": 35, "width": 500, "height": 400},
+        }],
+        "panel_bindings": [
+            {
+                "id": "panel_002",
+                "expected_revision": before_live["revision"],
+                "layout_slot_id": "slot_001",
+            },
+            {
+                "id": "panel_001",
+                "expected_revision": archived["revision"],
+                "layout_slot_id": "slot_002",
+            },
+        ],
+    })
+    assert mixed.status == 409
+    assert (await mixed.json())["error"] == "panel_archived"
+    assert history_counts() == before_counts
+    assert layouts.get_layout("layout_001") == before_layout
+    assert layouts.get_slot("slot_001") == before_slot
+    assert panels.get_panel("panel_001") == archived
+    assert panels.get_panel("panel_002") == before_live
+    recovery_after = await client.get(prefix + "/page_001?include_archived=1")
+    assert await recovery_after.json() == full
+
+    # The archived state can be explicitly and revision-safely reversed.
+    revived = panels.update_panel(
+        "panel_001", expected_revision=archived["revision"],
+        archived_at=None,
+    )
+    accepted = await client.patch(prefix + "/page_001/layout", json={
+        "expected_revision": before_layout["revision"],
+        "geometry_json": {"width": 1600, "height": 2200},
+        "slot_updates": [{
+            "id": "slot_001",
+            "expected_revision": before_slot["revision"],
+            "geometry_json": {"x": 22, "y": 35, "width": 500, "height": 400},
+        }],
+        "panel_bindings": [
+            {
+                "id": "panel_002",
+                "expected_revision": before_live["revision"],
+                "layout_slot_id": "slot_001",
+            },
+            {
+                "id": "panel_001",
+                "expected_revision": revived["revision"],
+                "layout_slot_id": "slot_002",
+            },
+        ],
+    })
+    assert accepted.status == 200, await accepted.text()
+    saved = await accepted.json()
+    assert saved["layout"]["geometry_json"]["width"] == 1600
+    assert saved["slots"][0]["geometry_json"]["x"] == 22
+    assert {p["id"]: p["layout_slot_id"] for p in saved["panels"]} == {
+        "panel_001": "slot_002", "panel_002": "slot_001",
+    }
+    assert saved["panels"][0]["action_json"] == full["panels"][0]["action_json"]
+    assert saved["panels"][0]["generation_spec_json"] == (
+        full["panels"][0]["generation_spec_json"]
+    )
+
+    reopened_app = web.Application()
+    register_all(reopened_app, storage_root=str(root))
+    restarted = await aiohttp_client(reopened_app)
+    reopened = await restarted.get(prefix + "/page_001")
+    assert reopened.status == 200
+    assert await reopened.json() == saved
