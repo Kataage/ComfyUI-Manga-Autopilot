@@ -175,8 +175,18 @@ def test_commit_guard_rejects_ready_artifact_atomically_after_file_publish(work)
         checked.append(True)
         raise RuntimeError("source revision changed")
 
+    source = handle.root / "source.png"
+    source.write_bytes(_png())
     with pytest.raises(RuntimeError, match="source revision changed"):
-        _register(repo, commit_guard=fail_under_write_lock)
+        repo.register_local_file(
+            source_path=source,
+            relative_path="assets/panels/reveal.png",
+            artifact_type="panel_candidate",
+            scope_type="panel", scope_id="panel_001",
+            mime_type="image/png",
+            dependency_fingerprint="gen-v1:abc123",
+            commit_guard=fail_under_write_lock,
+        )
     assert checked == [True]
     assert _counts(handle.database_path) == baseline
     # The hard-linked final file remains orphaned for crash-safe recovery.
