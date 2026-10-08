@@ -222,10 +222,13 @@ class DurableAutopilotOrchestrator:
             reclaim_expired_owner=reclaim_expired_owner,
         )
         heartbeat_task: asyncio.Task[None] | None = None
+        active_step_id: str | None = None
 
         async def renew_lease() -> None:
             # Running ComfyUI hooks can exceed one lease TTL. Refresh the
-            # Work-exclusive token and durable Run heartbeat cooperatively.
+            # Work-exclusive token, Run and in-flight RunStep in each cycle.
+            # All assignments to active_step_id happen on this event loop,
+            # and each repository call uses its own short transaction.
             period = max(1, min(60, self.lease_ttl_seconds // 3))
             while True:
                 await asyncio.sleep(period)
@@ -235,6 +238,10 @@ class DurableAutopilotOrchestrator:
                         ttl_seconds=self.lease_ttl_seconds,
                     )
                     self.repository.heartbeat_run(run_id, lease_owner=owner)
+                    if active_step_id is not None:
+                        self.repository.heartbeat_step(
+                            active_step_id, lease_owner=owner,
+                        )
                 except Exception as exc:
                     raise DurableHeartbeatLostError(
                         "durable Work lease heartbeat renewal failed"
@@ -332,6 +339,7 @@ class DurableAutopilotOrchestrator:
                     step["id"], input_fingerprint=fingerprint,
                     lease_owner=owner,
                 )
+                active_step_id = str(step["id"])
                 machine.advance(reason=hook_name)
                 memory_step = run.record_step(hook_name, target_state)
                 run.log_event("step_started", {"step": hook_name})
@@ -410,6 +418,12 @@ class DurableAutopilotOrchestrator:
                         "step_failed", {"step": hook_name, "status": state},
                     )
                     return run
+                finally:
+                    # Keep the active Step visible to renew_lease() throughout
+                    # cancellation/guardian-loss worker draining. Clear it
+                    # only after the Step receipt is finished or recovery
+                    # leaves this owner; never heartbeat a terminal Step.
+                    active_step_id = None
 
             _check_heartbeat(heartbeat_task)
             self.repository.transition_run(
