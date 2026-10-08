@@ -279,3 +279,95 @@ async def test_invalid_command_rejected_without_state_changes(api, body):
     assert response.status == 400
     _, after = await _state(client, prefix)
     assert before == after
+
+
+async def test_archived_page_hidden_by_default_but_available_for_explicit_recovery(
+    api, aiohttp_client,
+):
+    client, prefix, tmp_path, handle = api
+    pages = PageRepository(handle.database_path)
+    panels = PanelRepository(handle.database_path)
+    page = pages.get_page("page_001")
+    pages.update_page(
+        "page_001", expected_revision=page["revision"],
+        archived_at="2026-10-08T10:00:00Z",
+    )
+    active = await client.get(prefix)
+    assert active.status == 200
+    assert [p["id"] for p in (await active.json())["pages"]] == ["page_002"]
+    archived_list = await client.get(prefix + "?include_archived=1")
+    assert archived_list.status == 200
+    assert [p["id"] for p in (await archived_list.json())["pages"]] == [
+        "page_001", "page_002",
+    ]
+    blocked = await client.get(prefix + "/page_001")
+    assert blocked.status == 409
+    assert (await blocked.json())["error"] == "page_archived"
+    recovery = await client.get(prefix + "/page_001?include_archived=1")
+    assert recovery.status == 200
+    original = await recovery.json()
+    assert original["page"]["archived_at"] is not None
+    assert len(original["panels"]) == 2
+
+    # Archived Page commands must fail at the domain write lock, even with
+    # correct Layout revisions (not merely fail in the UI preflight).
+    before = pages.get_page("page_001")
+    with repository_read(handle.database_path) as db:
+        old_commits = db.execute("SELECT COUNT(*) FROM commits").fetchone()[0]
+    patch = await client.patch(
+        prefix + "/page_001/layout",
+        json={"expected_revision": 1, "geometry_json": {"width": 800}},
+    )
+    assert patch.status == 409
+    assert (await patch.json())["error"] == "page_archived"
+    assert pages.get_page("page_001") == before
+    with repository_read(handle.database_path) as db:
+        assert db.execute("SELECT COUNT(*) FROM commits").fetchone()[0] == old_commits
+
+    # Archive/unarchive keeps the same IDs, Panel rows and persisted geometry.
+    pages.update_page(
+        "page_001", expected_revision=before["revision"], archived_at=None,
+    )
+    response, active_page = await _state(client, prefix)
+    assert response.status == 200
+    assert active_page["page"]["id"] == "page_001"
+    assert len(active_page["panels"]) == 2
+    assert panels.get_panel("panel_001")["page_id"] == "page_001"
+    restarted = web.Application()
+    register_all(restarted, storage_root=str(tmp_path))
+    reopened = await aiohttp_client(restarted)
+    assert (await (await reopened.get(prefix)).json())["pages"][0]["id"] == "page_001"
+
+
+async def test_archived_panel_excluded_from_default_editor_projection(api):
+    client, prefix, _, handle = api
+    panels = PanelRepository(handle.database_path)
+    original = panels.get_panel("panel_001")
+    panels.update_panel(
+        "panel_001", expected_revision=original["revision"],
+        archived_at="2026-10-08T10:01:00Z",
+    )
+    response, body = await _state(client, prefix)
+    assert response.status == 200
+    assert [p["id"] for p in body["panels"]] == ["panel_002"]
+    recovery = await client.get(prefix + "/page_001?include_archived=1")
+    assert recovery.status == 200
+    assert [p["id"] for p in (await recovery.json())["panels"]] == [
+        "panel_001", "panel_002",
+    ]
+    after = panels.get_panel("panel_001")
+    panels.update_panel(
+        "panel_001", expected_revision=after["revision"], archived_at=None,
+    )
+    assert [p["id"] for p in (await _state(client, prefix))[1]["panels"]] == [
+        "panel_001", "panel_002",
+    ]
+
+
+@pytest.mark.parametrize("query", ["?include_archived=true", "?include_archived=yes"])
+async def test_invalid_archive_query_is_rejected(api, query):
+    client, prefix, _, _ = api
+    list_response = await client.get(prefix + query)
+    assert list_response.status == 400
+    detail_response = await client.get(prefix + "/page_001" + query)
+    assert detail_response.status == 400
