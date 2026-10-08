@@ -177,7 +177,9 @@ function createWorkspaceView() {
     const mounts = resolveMounts();
 
     const showTab = (id) => {
-        if (!activeProjectId) {
+        // Projects and the v2 Work-backed Page Editor must be accessible
+        // before an unrelated legacy project ID has been selected.
+        if (!activeProjectId && id !== "projects" && id !== "editor") {
             content.replaceChildren();
             const msg = document.createElement("p");
             msg.textContent = "Set an active project id in the Projects tab to continue.";
@@ -193,7 +195,8 @@ function createWorkspaceView() {
             content.appendChild(host);
             if (typeof mountFn === "function") {
                 try {
-                    disposers.set(key, mountFn(host, { projectId: activeProjectId }));
+                    disposers.set(key, mountFn(host, key === "editor"
+                        ? {} : { projectId: activeProjectId }));
                 } catch (err) {
                     const errEl = document.createElement("pre");
                     errEl.textContent = `${key} mount failed: ${err.message}`;
