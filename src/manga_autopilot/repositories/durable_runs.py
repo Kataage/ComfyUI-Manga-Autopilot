@@ -216,6 +216,7 @@ class DurableRunRepository:
     def heartbeat_run(self, run_id: str, *, lease_owner: str) -> None:
         _required(lease_owner, "lease_owner")
         with repository_write(self.database_path) as conn:
+            self._assert_owner(conn, run_id, lease_owner)
             cursor = conn.execute(
                 """UPDATE runs SET heartbeat_at = ?
                    WHERE id = ? AND status = 'RUNNING' AND lease_owner = ?""",
