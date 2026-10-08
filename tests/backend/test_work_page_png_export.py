@@ -18,7 +18,6 @@ from manga_autopilot.repositories import (
     WorkLifecycleRepository,
 )
 from manga_autopilot.routes import register_all
-from manga_autopilot.storage import repository_read
 
 
 def _png(color: tuple[int, int, int]) -> bytes:
