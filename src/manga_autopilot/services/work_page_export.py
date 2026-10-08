@@ -21,9 +21,13 @@ from manga_autopilot.repositories import (
     ArtifactIntegrityError,
     ArtifactNotFoundError,
     ArtifactRepository,
+    PageDomainNotFoundError,
     WorkLifecycleRepository,
 )
-from manga_autopilot.services.page_application import PageApplicationService
+from manga_autopilot.services.page_application import (
+    PageApplicationService,
+    read_page_state_in_transaction,
+)
 from manga_autopilot.services.page_png_budget import (
     DEFAULT_PROFILE,
     resolve_page_png_budget,
@@ -330,6 +334,27 @@ class WorkPageExportService:
                 )
             for dependency in dependencies:
                 artifact_repo.verify_registered_file(dependency["artifact_id"])
+            # Recheck the EXACT persisted input projection inside the final
+            # Artifact registration's BEGIN IMMEDIATE transaction. The earlier
+            # post-render read is only a fast-fail optimization: it cannot
+            # protect the window while output bytes are copied and published.
+            def guard_source_revision(conn):
+                try:
+                    current = read_page_state_in_transaction(
+                        conn, work.work_id, page_id
+                    )
+                except PageDomainNotFoundError as exc:
+                    raise PageExportConflictError(
+                        f"Page {page_id} disappeared before PNG commit; retry export."
+                    ) from exc
+                if _snapshot_fingerprint(current) != (
+                    fingerprint_payload["page_state_sha256"]
+                ):
+                    raise PageExportConflictError(
+                        f"Page {page_id} changed before PNG commit; "
+                        "reload and export again."
+                    )
+
             artifact_id = new_id("artifact")
             relative_path = f"exports/pages/{page_id}_{artifact_id}.png"
             artifact = artifact_repo.register_local_file(
@@ -341,6 +366,7 @@ class WorkPageExportService:
                 mime_type="image/png",
                 dependency_fingerprint=fingerprint,
                 artifact_id=artifact_id,
+                commit_guard=guard_source_revision,
             )
         return {
             "work_id": work_id,
