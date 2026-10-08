@@ -348,6 +348,80 @@ async def test_concurrent_page_edit_during_render_blocks_stale_registration(api,
     assert not export_dir.exists() or not list(export_dir.iterdir())
 
 
+async def test_edit_after_post_render_check_cannot_commit_stale_png(api, monkeypatch):
+    client, base, _, handle, _, layouts, _, artifacts = api
+    from manga_autopilot.storage import repository_read
+
+    original = ArtifactRepository.register_local_file
+    mutations = []
+
+    def edit_before_artifact_copy(self, **kwargs):
+        # This is AFTER the exporter's old final self.pages.get_page() check.
+        if kwargs["artifact_type"] == "page_render":
+            current = layouts.get_layout("layout_main")
+            layouts.update_layout(
+                "layout_main", expected_revision=current["revision"],
+                geometry_json={"width": 320, "height": 200},
+            )
+            mutations.append("layout")
+        return original(self, **kwargs)
+
+    monkeypatch.setattr(
+        ArtifactRepository, "register_local_file", edit_before_artifact_copy
+    )
+    response, body = await _export(client, base)
+    assert response.status == 409, body
+    assert body["error"] == "page_changed"
+    assert mutations == ["layout"]
+    assert artifacts.list_for_scope("page", "page_main") == []
+    with repository_read(handle.database_path) as db:
+        assert db.execute(
+            "SELECT COUNT(*) FROM commits WHERE operation_type = 'register_artifact'"
+        ).fetchone()[0] == 2  # Only the two fixture candidate registrations.
+        assert db.execute(
+            "SELECT COUNT(*) FROM entity_revisions WHERE entity_type = 'artifact'"
+        ).fetchone()[0] == 2
+    # The immutable output file is allowed to remain an unregistered orphan,
+    # never a READY record pointing to an outdated Page snapshot.
+    assert len(list((handle.root / "exports" / "pages").glob("*.png"))) == 1
+
+
+async def test_panel_switch_after_file_publication_rejects_stale_png(api, monkeypatch):
+    client, base, _, handle, _, _, panels, artifacts = api
+    import manga_autopilot.repositories.artifacts as artifacts_module
+
+    original_publish = artifacts_module._publish_exclusive
+    edits = []
+
+    def publish_then_switch(temp, destination):
+        original_publish(temp, destination)
+        if "exports" in destination.parts:
+            current = panels.get_panel("panel_main")
+            panels.update_panel(
+                "panel_main", expected_revision=current["revision"],
+                selected_candidate_id=None,
+            )
+            edits.append("panel_selection")
+
+    monkeypatch.setattr(
+        artifacts_module, "_publish_exclusive", publish_then_switch
+    )
+    response, body = await _export(client, base)
+    assert response.status == 409, body
+    assert body["error"] == "page_changed"
+    assert edits == ["panel_selection"]
+    assert artifacts.list_for_scope("page", "page_main") == []
+    assert len(list((handle.root / "exports" / "pages").glob("*.png"))) == 1
+
+    # Retry uses the committed Panel state; orphan publication never claims
+    # to have succeeded and cannot poison the next immutable registration.
+    response, body = await _export(client, base)
+    assert response.status == 201, body
+    assert len(artifacts.list_for_scope("page", "page_main")) == 1
+    assert artifacts.verify_registered_file(body["artifact_id"])
+    assert len(list((handle.root / "exports" / "pages").glob("*.png"))) == 2
+
+
 async def test_oversized_output_area_rejected_before_renderer_or_artifact(api, monkeypatch):
     client, base, _, handle, _, layouts, _, artifacts = api
     import manga_autopilot.services.work_page_export as module
