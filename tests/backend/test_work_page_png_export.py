@@ -187,7 +187,8 @@ async def test_selected_artifact_ownership_is_enforced_not_guessed(api):
     assert body["error"] == "export_precondition_failed"
     assert "owned by this Panel" in body["message"]
     assert artifacts.list_for_scope("page", "page_main") == []
-    assert not list((handle.root / "exports" / "pages").iterdir())
+    export_dir = handle.root / "exports" / "pages"
+    assert not export_dir.exists() or not list(export_dir.iterdir())
 
 
 async def test_missing_selected_image_is_actionable_and_does_not_create_blank_page(api):
@@ -316,4 +317,5 @@ async def test_concurrent_page_edit_during_render_blocks_stale_registration(api,
     assert response.status == 409
     assert body["error"] == "page_changed"
     assert artifacts.list_for_scope("page", "page_main") == []
-    assert not list((handle.root / "exports" / "pages").iterdir())
+    export_dir = handle.root / "exports" / "pages"
+    assert not export_dir.exists() or not list(export_dir.iterdir())
