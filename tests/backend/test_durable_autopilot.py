@@ -445,6 +445,7 @@ async def test_repeated_cancellation_keeps_sync_hook_lease_and_heartbeat_until_e
         )
         assert running["status"] == "RUNNING"
         assert running["attempt_count"] == 1
+        initial_step_heartbeat = running["heartbeat_at"]
         initial_lease = competing_repo.inspect_lease("work_246")
         assert initial_lease is not None
         assert initial_lease["lease_owner"] == "canceling_owner"
@@ -470,6 +471,10 @@ async def test_repeated_cancellation_keeps_sync_hook_lease_and_heartbeat_until_e
             await asyncio.sleep(0.05)
         assert renewed is not None and renewed["expires_at"] > initial_lease["expires_at"]
         assert renewed["expired"] is False
+        draining_step = competing_repo.get_step(running["id"])
+        assert draining_step["status"] == "RUNNING"
+        assert draining_step["heartbeat_at"] > initial_step_heartbeat
+        assert competing_repo.list_step_attempts(running["id"])[0]["status"] == "RUNNING"
         assert not task.done()
         assert competing_repo.get_run(run_id)["status"] == "RUNNING"
 
@@ -831,3 +836,149 @@ async def test_unsafe_lease_heartbeat_period_is_rejected_before_mutation(
         ).execute(run_id, input_payload={}, step_inputs={})
     assert repo.inspect_lease("work_246") is None
     assert repo.get_run(run_id)["status"] == "PENDING"
+
+
+
+@pytest.mark.asyncio
+async def test_async_stage_renews_step_run_and_work_heartbeats_together(
+    tmp_path: Path,
+) -> None:
+    """An independent DB observer sees a live RunStep, not a stale start time."""
+    db = work(tmp_path)
+
+    class Clock:
+        moment = datetime(2026, 10, 9, tzinfo=timezone.utc)
+
+        def __call__(self):
+            return self.moment
+
+    clock = Clock()
+    owning_repo = DurableRunRepository(db, clock=clock)
+    observer = DurableRunRepository(db, clock=clock)
+    run_id = start(owning_repo)
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def blocked_async_hook(_):
+        entered.set()
+        await release.wait()
+        return {"finished": True}
+
+    task = asyncio.create_task(DurableAutopilotOrchestrator(
+        repository=owning_repo, work_id="work_246",
+        hooks=OrchestratorHooks(plan_story=blocked_async_hook),
+        lease_ttl_seconds=3,
+    ).execute(run_id, input_payload={}, step_inputs={}, lease_owner="step_owner"))
+
+    try:
+        await asyncio.wait_for(entered.wait(), timeout=10)
+        step = next(
+            x for x in observer.list_steps(run_id)
+            if x["step_key"] == "plan_story"
+        )
+        assert step["status"] == "RUNNING"
+        assert step["attempt_count"] == 1
+        started_heartbeat = step["heartbeat_at"]
+        run_heartbeat = observer.get_run(run_id)["heartbeat_at"]
+        lease = observer.inspect_lease("work_246")
+        assert lease is not None
+        assert lease["lease_owner"] == "step_owner"
+        before_attempt = observer.list_step_attempts(step["id"])
+        assert [r["status"] for r in before_attempt] == ["RUNNING"]
+
+        clock.moment += timedelta(seconds=1)
+        advanced = None
+        for _ in range(160):
+            advanced = observer.get_step(step["id"])
+            if advanced["heartbeat_at"] > started_heartbeat:
+                break
+            await asyncio.sleep(0.05)
+
+        assert advanced is not None
+        assert advanced["status"] == "RUNNING"
+        assert advanced["heartbeat_at"] > started_heartbeat
+        assert observer.get_run(run_id)["heartbeat_at"] > run_heartbeat
+        renewed = observer.inspect_lease("work_246")
+        assert renewed is not None
+        assert renewed["heartbeat_at"] > lease["heartbeat_at"]
+        assert renewed["expired"] is False
+        assert observer.list_step_attempts(step["id"]) == before_attempt
+        assert not task.done()
+    finally:
+        release.set()
+
+    result = await asyncio.wait_for(task, timeout=20)
+    assert result.machine.state.value == "COMPLETED"
+    finished = observer.get_step(step["id"])
+    assert finished["status"] == "COMPLETED"
+    assert finished["attempt_count"] == 1
+    assert observer.get_run(run_id)["status"] == "COMPLETED"
+    assert observer.inspect_lease("work_246") is None
+    assert [r["status"] for r in observer.list_step_attempts(step["id"])] == [
+        "COMPLETED",
+    ]
+    # There is no finalizer or unowned heartbeat after completion.
+    await asyncio.sleep(0.05)
+    assert observer.get_step(step["id"])["heartbeat_at"] == finished["heartbeat_at"]
+
+
+@pytest.mark.asyncio
+async def test_failed_step_heartbeat_stops_guardian_and_does_not_claim_success(
+    tmp_path: Path,
+) -> None:
+    """Telemetry persistence failure is a lost guardian, not silent success."""
+    db = work(tmp_path)
+    attempted = threading.Event()
+    started = threading.Event()
+    release = threading.Event()
+    completed = threading.Event()
+
+    class FailStepHeartbeatRepository(DurableRunRepository):
+        def heartbeat_step(self, step_id, *, lease_owner):
+            attempted.set()
+            raise OSError("injected RunStep heartbeat storage failure")
+
+    owner = FailStepHeartbeatRepository(db)
+    observer = DurableRunRepository(db)
+    run_id = start(owner)
+
+    def blocked_sync_hook(_):
+        started.set()
+        try:
+            assert release.wait(timeout=20)
+            return {"should_not_commit": True}
+        finally:
+            completed.set()
+
+    task = asyncio.create_task(DurableAutopilotOrchestrator(
+        repository=owner, work_id="work_246",
+        hooks=OrchestratorHooks(generate_panels=blocked_sync_hook),
+        lease_ttl_seconds=3,
+    ).execute(run_id, input_payload={}, step_inputs={},
+              lease_owner="failed_step_heartbeat"))
+    try:
+        assert await asyncio.to_thread(started.wait, 10)
+        assert await asyncio.to_thread(attempted.wait, 10)
+        await asyncio.sleep(0.05)
+        assert not task.done()
+        assert not completed.is_set()
+        running_step = next(
+            x for x in observer.list_steps(run_id)
+            if x["step_key"] == "generate_panels"
+        )
+        assert running_step["status"] == "RUNNING"
+        assert observer.inspect_lease("work_246") is not None
+    finally:
+        release.set()
+
+    with pytest.raises(DurableHeartbeatLostError):
+        await asyncio.wait_for(task, timeout=20)
+    assert completed.is_set()
+    assert observer.inspect_lease("work_246") is None
+    assert observer.get_run(run_id)["status"] == "INTERRUPTED"
+    current = observer.get_step(running_step["id"])
+    assert current["status"] == "INTERRUPTED"
+    assert current["output_json"] == "{}"
+    assert [r["status"] for r in observer.list_step_attempts(current["id"])] == [
+        "INTERRUPTED",
+    ]
