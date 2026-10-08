@@ -14,7 +14,6 @@ import os
 import stat
 import tempfile
 import threading
-from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -447,7 +446,9 @@ class WorkPageExportService:
                     Path(panel_layout.image_path), verified_path, artifact,
                     max_bytes=budget.max_input_bytes, cancel_event=cancel_event,
                 )
-                pinned_layouts.append(replace(panel_layout, image_path=str(verified_path)))
+                pinned_layouts.append(
+                    panel_layout.model_copy(update={"image_path": str(verified_path)})
+                )
             check_not_cancelled()
             result = render_page_to_png(
                 f"page_{state['page']['page_number']}",
