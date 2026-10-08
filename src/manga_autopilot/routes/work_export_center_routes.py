@@ -24,6 +24,7 @@ from manga_autopilot.repositories import (
     WorkIdentityMismatchError,
     WorkNotFoundError,
 )
+from manga_autopilot.services.page_export_freshness import page_png_freshness
 from manga_autopilot.services.page_png_budget import (
     MAX_SERVABLE_PNG_BYTES,
     PNG_IO_CHUNK_BYTES,
@@ -116,8 +117,9 @@ def _error(exc: Exception) -> web.Response:
     raise exc
 
 
-def _present(row: dict[str, Any]) -> dict[str, Any]:
+def _present(row: dict[str, Any], freshness: dict[str, Any]) -> dict[str, Any]:
     return {
+        **freshness,
         field: row[field]
         for field in (
             "id", "artifact_type", "scope_type", "scope_id", "relative_path",
@@ -146,20 +148,28 @@ async def list_work_exports(request: web.Request) -> web.Response:
         repository = _repository(request)
         handle = repository._open()
         with repository_read(handle.database_path) as conn:
-            rows = [
-                dict(row) for row in conn.execute(
-                    """SELECT * FROM artifacts
-                    WHERE artifact_type = 'page_render'
-                      AND scope_type = 'page'
-                      AND mime_type = 'image/png'
-                      AND status = 'READY'
-                      AND archived_at IS NULL
-                    ORDER BY created_commit_seq DESC, id DESC"""
-                )
-            ]
+            # The artifacts and their later invalidations share one snapshot.
+            conn.execute("BEGIN")
+            try:
+                rows = [
+                    dict(row) for row in conn.execute(
+                        """SELECT * FROM artifacts
+                        WHERE artifact_type = 'page_render'
+                          AND scope_type = 'page'
+                          AND mime_type = 'image/png'
+                          AND status = 'READY'
+                          AND archived_at IS NULL
+                        ORDER BY created_commit_seq DESC, id DESC"""
+                    )
+                ]
+                exports = [
+                    _present(row, page_png_freshness(conn, row)) for row in rows
+                ]
+            finally:
+                conn.rollback()
         return web.json_response({
             "work_id": request.match_info["work_id"],
-            "exports": [_present(row) for row in rows],
+            "exports": exports,
         })
     except Exception as exc:
         return _error(exc)
@@ -169,8 +179,37 @@ async def get_work_export_png(request: web.Request) -> web.Response:
     try:
         repository = _repository(request)
         artifact_id = request.match_info["artifact_id"]
-        row = repository.get(artifact_id)
-        _ensure_page_png(row, artifact_id)
+        require_current = request.query.get("require_current", "0")
+        if require_current not in {"0", "1"}:
+            raise ValueError("require_current must be 0 or 1")
+        handle = repository._open()
+        with repository_read(handle.database_path) as conn:
+            conn.execute("BEGIN")
+            try:
+                record = conn.execute(
+                    "SELECT * FROM artifacts WHERE id = ?", (artifact_id,)
+                ).fetchone()
+                if record is None:
+                    raise ArtifactNotFoundError(f"artifact not found: {artifact_id}")
+                row = dict(record)
+                _ensure_page_png(row, artifact_id)
+                freshness = page_png_freshness(conn, row)
+            finally:
+                conn.rollback()
+        # Historical downloads remain available. Consumers explicitly requiring
+        # fresh output fail closed, without converting READY into a stale status.
+        if require_current == "1" and not freshness["is_current"]:
+            return web.json_response(
+                {
+                    "error": "stale_export",
+                    "message": (
+                        f"Page PNG {artifact_id!r} is {freshness['freshness']}; "
+                        "export the current saved Page again."
+                    ),
+                    **freshness,
+                },
+                status=409,
+            )
         if not _DOWNLOAD_SLOTS.acquire(blocking=False):
             return web.json_response(
                 {"error": "download_busy", "message":
@@ -178,7 +217,6 @@ async def get_work_export_png(request: web.Request) -> web.Response:
                 status=429, headers={"Retry-After": "2"},
             )
         try:
-            handle = repository._open()
             path = assert_managed_path(
                 handle.root.joinpath(*row["relative_path"].split("/")),
                 containment_root=handle.root,
@@ -194,6 +232,7 @@ async def get_work_export_png(request: web.Request) -> web.Response:
                         "Content-Type": "image/png",
                         "Cache-Control": "private, no-store",
                         "X-Content-Type-Options": "nosniff",
+                        "X-Work-Export-Freshness": freshness["freshness"],
                     },
                 )
                 response.content_length = row["file_size"]
