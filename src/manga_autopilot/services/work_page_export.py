@@ -23,7 +23,6 @@ from PIL import Image, UnidentifiedImageError
 from manga_autopilot.models.panel import PanelLayout
 from manga_autopilot.primitives import canonical_json, new_id
 from manga_autopilot.repositories import (
-    ArtifactIntegrityError,
     ArtifactNotFoundError,
     ArtifactRepository,
     PageDomainNotFoundError,
@@ -120,13 +119,10 @@ def _selected_artifact(
             f"Panel {panel_id}: Artifact {artifact['id']} is not a current "
             "READY image owned by this Panel."
         )
-    try:
-        repository.verify_registered_file(str(artifact["id"]))
-    except (ArtifactIntegrityError, ValueError, FileNotFoundError) as exc:
-        raise PageExportValidationError(
-            f"Panel {panel_id}: registered Artifact {artifact['id']} file is "
-            f"missing, unsafe, or corrupt: {exc}"
-        ) from exc
+    # The actual on-disk integrity check happens *after* the named byte and
+    # decoded-pixel budgets are checked, when a verified private input copy is
+    # materialized for Pillow. Avoid an unbounded preliminary hash read of a
+    # very large (or currently swapped) registered Candidate pathname.
     return artifact
 
 
@@ -173,15 +169,16 @@ def _copy_verified_candidate_snapshot(
                 total += len(chunk)
                 if total > expected_bytes or total > max_bytes:
                     raise PageExportValidationError(
-                        f"Panel Candidate {artifact['id']}: copied input exceeds "
-                        "recorded length or encoded source budget"
+                        f"Panel Candidate {artifact['id']}: corrupt or modified "
+                        "copied input exceeds recorded length or encoded source budget"
                     )
                 digest.update(chunk)
                 output.write(chunk)
             if total != expected_bytes or digest.hexdigest() != artifact["sha256"]:
                 raise PageExportValidationError(
-                    f"Panel Candidate {artifact['id']}: copied input hash/size "
-                    "differs from the verified Work Artifact; retry export"
+                    f"Panel Candidate {artifact['id']}: corrupt or modified "
+                    "copied input hash/size differs from the verified Work Artifact; "
+                    "retry export"
                 )
     except OSError as exc:
         raise PageExportValidationError(
