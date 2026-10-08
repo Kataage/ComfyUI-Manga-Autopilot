@@ -11,8 +11,8 @@ from __future__ import annotations
 import asyncio
 import json
 import secrets
-from contextlib import suppress
 from collections.abc import Mapping
+from contextlib import suppress
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
