@@ -290,7 +290,7 @@ class DurableAutopilotOrchestrator:
         finally:
             if heartbeat_task is not None:
                 heartbeat_task.cancel()
-                with suppress(asyncio.CancelledError):
+                with suppress(asyncio.CancelledError, WorkLeaseConflictError, DurableRunStateError):
                     await heartbeat_task
             # Old process owners cannot release a newly reclaimed lease.
             try:
