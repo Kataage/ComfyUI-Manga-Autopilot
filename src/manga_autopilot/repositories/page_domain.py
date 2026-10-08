@@ -32,6 +32,10 @@ class PageDomainOwnershipError(PersistenceError):
     """An entity reference crosses Page or Layout ownership boundaries."""
 
 
+class PageDomainCandidateSelectionError(PageDomainOwnershipError):
+    """A Panel's selected candidate is not its own current image Artifact."""
+
+
 _PAGE_FIELDS = frozenset({
     "page_number", "order_key", "page_role", "page_purpose",
     "narrative_goal", "format_kind", "status", "archived_at",
@@ -215,6 +219,44 @@ def _check_slot_page(connection: sqlite3.Connection, slot_id: str, page_id: str)
 
 def _check_page(connection: sqlite3.Connection, page_id: str) -> None:
     _read_row(connection, "pages", page_id)
+
+
+def _validate_selected_candidate(
+    connection: sqlite3.Connection, panel_id: str, candidate_id: Any,
+) -> None:
+    """Check the temporary W0005 Candidate == Artifact identity contract.
+
+    A selected_candidate_id is either NULL or the exact Artifact ID of a
+    current image/png|jpeg|webp panel_candidate *in this same Work database*.
+    The repository_write transaction locks the DB before lookup and until the
+    Panel revision is committed. No filename search or cross-Work fallback.
+    File hash/integrity is separately enforced when the exporter reads bytes.
+    """
+    if candidate_id is None:
+        return
+    if type(candidate_id) is not str or not candidate_id.strip():
+        raise PageDomainCandidateSelectionError(
+            f"Panel {panel_id!r}: selected_candidate_id must be "
+            "a non-empty Artifact ID or null"
+        )
+    row = connection.execute(
+        """SELECT artifact_type, scope_type, scope_id, status, archived_at, mime_type
+           FROM artifacts WHERE id = ?""", (candidate_id,),
+    ).fetchone()
+    if row is None or (
+        row["artifact_type"] != "panel_candidate"
+        or row["scope_type"] != "panel"
+        or row["scope_id"] != panel_id
+        or row["status"] != "READY"
+        or row["archived_at"] is not None
+        or row["mime_type"] not in {"image/png", "image/jpeg", "image/webp"}
+    ):
+        raise PageDomainCandidateSelectionError(
+            f"Panel {panel_id!r}: Candidate {candidate_id!r} must be a "
+            "current READY image panel_candidate Artifact owned by this "
+            "Panel in the same Work (unknown, archived, wrong type, "
+            "wrong Work, or wrong owner is not selectable)"
+        )
 
 
 class PageRepository:
@@ -598,6 +640,18 @@ class PanelRepository:
         attrs = _values(changes, _PANEL_FIELDS)
         with repository_write(self.database_path) as conn:
             existing = _read_row(conn, "panels", _id(panel_id, "panel_id"))
+            # Preserve 409-style optimistic concurrency semantics even when
+            # the caller also supplies an invalid candidate. Both checks and
+            # the actual Panel write share this BEGIN IMMEDIATE transaction.
+            assert_expected_revision(
+                entity_type="panels", entity_id=panel_id,
+                expected_revision=expected_revision,
+                actual_revision=existing["revision"],
+            )
+            if "selected_candidate_id" in attrs:
+                _validate_selected_candidate(
+                    conn, panel_id, attrs["selected_candidate_id"]
+                )
             if attrs.get("layout_slot_id") is not None:
                 _check_slot_page(
                     conn, _id(attrs["layout_slot_id"], "layout_slot_id"),
@@ -612,6 +666,7 @@ class PanelRepository:
 
 __all__ = [
     "LayoutRepository",
+    "PageDomainCandidateSelectionError",
     "PageDomainNotFoundError",
     "PageDomainOwnershipError",
     "PageRepository",
