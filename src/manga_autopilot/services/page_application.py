@@ -8,6 +8,7 @@ repositories and never read or write legacy project/panel JSON files.
 from __future__ import annotations
 
 import json
+import sqlite3
 from pathlib import Path
 from typing import Any
 
@@ -35,6 +36,49 @@ def _decode(row: Any) -> dict[str, Any]:
     return record
 
 
+def read_page_state_in_transaction(
+    db: sqlite3.Connection, work_id: str, page_id: str,
+) -> dict[str, Any]:
+    """Read the authoritative Page projection using the caller's SQLite snapshot.
+
+    In export publication the caller holds BEGIN IMMEDIATE, so the Page and
+    all its Layout/Slot/Panel dependencies cannot change before Artifact commit.
+    Never open another connection or start/commit a transaction here.
+    """
+    page = db.execute(
+        "SELECT * FROM pages WHERE id = ?", (page_id,)
+    ).fetchone()
+    if page is None:
+        raise PageDomainNotFoundError(f"page not found: {page_id}")
+    layout = db.execute(
+        "SELECT * FROM layout_instances WHERE page_id = ?", (page_id,)
+    ).fetchone()
+    slots = (
+        db.execute(
+            """
+            SELECT * FROM layout_slots WHERE layout_instance_id = ?
+            ORDER BY reading_order, id
+            """,
+            (layout["id"],),
+        ).fetchall()
+        if layout is not None
+        else []
+    )
+    panels = db.execute(
+        "SELECT * FROM panels WHERE page_id = ? ORDER BY order_index, id",
+        (page_id,),
+    ).fetchall()
+    return {
+        "work_id": work_id,
+        "page": _decode(page),
+        "layout": _decode(layout) if layout is not None else None,
+        "slots": [_decode(row) for row in slots],
+        "panels": [_decode(row) for row in panels],
+    }
+
+
+
+
 class PageApplicationService:
     """A Work-scoped query/command facade suitable for HTTP or a UI adapter."""
 
@@ -53,43 +97,12 @@ class PageApplicationService:
     def get_page(self, work_id: str, page_id: str) -> dict[str, Any]:
         handle = self.lifecycle.open_work(work_id)
         with repository_read(handle.database_path) as db:
-            # Explicit BEGIN gives all four queries the same snapshot even
-            # while an independent renderer or Editor writes to the Work.
+            # A stable read snapshot shared by all Page projection queries.
             db.execute("BEGIN")
             try:
-                page = db.execute(
-                    "SELECT * FROM pages WHERE id = ?", (page_id,)
-                ).fetchone()
-                if page is None:
-                    raise PageDomainNotFoundError(f"page not found: {page_id}")
-                layout = db.execute(
-                    "SELECT * FROM layout_instances WHERE page_id = ?", (page_id,)
-                ).fetchone()
-                slots = (
-                    db.execute(
-                        """
-                        SELECT * FROM layout_slots WHERE layout_instance_id = ?
-                        ORDER BY reading_order, id
-                        """,
-                        (layout["id"],),
-                    ).fetchall()
-                    if layout is not None
-                    else []
-                )
-                panels = db.execute(
-                    "SELECT * FROM panels WHERE page_id = ? ORDER BY order_index, id",
-                    (page_id,),
-                ).fetchall()
-                result = {
-                    "work_id": handle.work_id,
-                    "page": _decode(page),
-                    "layout": _decode(layout) if layout is not None else None,
-                    "slots": [_decode(row) for row in slots],
-                    "panels": [_decode(row) for row in panels],
-                }
+                return read_page_state_in_transaction(db, handle.work_id, page_id)
             finally:
                 db.rollback()
-        return result
 
     def update_layout(
         self,
@@ -127,4 +140,4 @@ class PageApplicationService:
         return self.get_page(work_id, page_id)
 
 
-__all__ = ["PageApplicationService"]
+__all__ = ["PageApplicationService", "read_page_state_in_transaction"]
