@@ -16,6 +16,7 @@ from manga_autopilot.repositories.page_domain import (
     PageDomainArchivedError,
     PageDomainNotFoundError,
     PageDomainOwnershipError,
+    PageDomainPanelArchivedError,
 )
 from manga_autopilot.repositories.work_lifecycle import (
     WorkIdentityMismatchError,
@@ -56,6 +57,8 @@ def _translate(exc: Exception) -> web.Response:
         )
     if isinstance(exc, PageDomainArchivedError):
         return _problem(409, "page_archived", str(exc))
+    if isinstance(exc, PageDomainPanelArchivedError):
+        return _problem(409, "panel_archived", str(exc))
     if isinstance(exc, (PageDomainNotFoundError, WorkNotFoundError)):
         return _problem(404, "not_found", str(exc))
     if isinstance(exc, (PageDomainOwnershipError, WorkIdentityMismatchError)):

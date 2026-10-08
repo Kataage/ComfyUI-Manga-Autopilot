@@ -27,6 +27,17 @@ loads the active Page. Page/Panel archive and unarchive themselves remain
 the responsibility of their revisioned domain repositories, not a new
 client-side direct SQLite command.
 
+An active Page Editor Layout PATCH with `panel_bindings` cannot update an
+archived Panel, even if its ID and latest revision are known, or the requested
+binding is a no-op. The domain repository checks `panel.archived_at` inside
+the same `BEGIN IMMEDIATE` transaction **before** any Layout/Slot/Panel
+writes or Work history commits and returns HTTP `409 panel_archived`.
+This applies to mixed commands containing otherwise-valid Layout geometry,
+Slot edits and bindings for active Panels: the entire command is rejected
+without partial history or revision changes. After an explicit revision-guarded
+Panel unarchive, that Panel can again participate in active binding updates.
+This is the #344 closure of the read-model / command-model gap in #337.
+
 Both Page Editor and Export Center rely on the same active Page list
 endpoint for selectors, so archived Pages are never silently offered as
 ordinary editable/exportable Pages. Historical exports remain visible
