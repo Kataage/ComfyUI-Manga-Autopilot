@@ -10,6 +10,11 @@ from __future__ import annotations
 import sqlite3
 from typing import Any
 
+from manga_autopilot.repositories.artifacts import (
+    VERIFIED_PAGE_RENDER_OPERATION,
+    verified_page_render_reason,
+)
+
 
 def page_png_freshness(
     connection: sqlite3.Connection, artifact: dict[str, Any],
@@ -34,6 +39,25 @@ def page_png_freshness(
         or not isinstance(fingerprint, str)
         or len(fingerprint) != 64
         or any(ch not in "0123456789abcdef" for ch in fingerprint)
+    ):
+        return unverified
+
+    # A digest-shaped string proves nothing about the source of the PNG.
+    # Only a Work commit minted by the source-guarded exporter after its
+    # BEGIN IMMEDIATE snapshot check can certify this Artifact as CURRENT.
+    # Historic/generic/imported rows remain retrievable but UNVERIFIED.
+    attestation = connection.execute(
+        """SELECT operation_type, actor_type, reason
+           FROM commits WHERE commit_seq = ?""",
+        (published,),
+    ).fetchone()
+    if (
+        attestation is None
+        or attestation["operation_type"] != VERIFIED_PAGE_RENDER_OPERATION
+        or attestation["actor_type"] != "system"
+        or attestation["reason"] != verified_page_render_reason(
+            artifact["id"], page_id, fingerprint,
+        )
     ):
         return unverified
 
