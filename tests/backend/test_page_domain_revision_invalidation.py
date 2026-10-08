@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 from pathlib import Path
 
 import pytest
@@ -304,6 +305,47 @@ def test_ownership_failure_rolls_back_mutations_history_and_invalidations(domain
     assert layouts.get_slot("slot_a") == original_slot
     assert panels.get_panel("panel_a") == original_panel
     assert len(audit.list_entity_revisions("layout_instance", "layout_a")) == 1
+
+
+def test_sql_constraint_failure_rolls_back_first_mutations_and_audit_rows(domain):
+    """A late SQLite failure must undo earlier revisions/invalidations in one batch."""
+    pages, layouts, panels, audit = domain
+    _seed(domain)
+    layouts.create_slot(
+        slot_id="slot_extra",
+        layout_id="layout_a",
+        slot_key="bottom",
+        reading_order=2,
+        geometry={"x": 20},
+    )
+    before = _counts(pages)
+    old_layout = layouts.get_layout("layout_a")
+    old_first = layouts.get_slot("slot_a")
+    old_extra = layouts.get_slot("slot_extra")
+    old_panel = panels.get_panel("panel_a")
+    initial_history = len(audit.list_entity_revisions("layout_slot", "slot_a"))
+    with pytest.raises(sqlite3.IntegrityError):
+        layouts.update_layout(
+            "layout_a",
+            expected_revision=1,
+            geometry_json={"width": 600},
+            slot_updates=[
+                {
+                    "id": "slot_a", "expected_revision": 1,
+                    "geometry_json": {"x": 55},
+                },
+                {
+                    "id": "slot_extra", "expected_revision": 1,
+                    "reading_order": 1,
+                },
+            ],
+        )
+    assert _counts(pages) == before
+    assert layouts.get_layout("layout_a") == old_layout
+    assert layouts.get_slot("slot_a") == old_first
+    assert layouts.get_slot("slot_extra") == old_extra
+    assert panels.get_panel("panel_a") == old_panel
+    assert len(audit.list_entity_revisions("layout_slot", "slot_a")) == initial_history
 
 
 def test_stale_revision_does_not_write_history_or_invalidations(domain):
