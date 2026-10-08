@@ -12,7 +12,7 @@ from typing import Any
 
 from manga_autopilot.repositories.artifacts import (
     VERIFIED_PAGE_RENDER_OPERATION,
-    verified_page_render_reason,
+    verify_page_render_attestation,
 )
 
 
@@ -55,9 +55,7 @@ def page_png_freshness(
         attestation is None
         or attestation["operation_type"] != VERIFIED_PAGE_RENDER_OPERATION
         or attestation["actor_type"] != "system"
-        or attestation["reason"] != verified_page_render_reason(
-            artifact["id"], page_id, fingerprint,
-        )
+        or not verify_page_render_attestation(attestation["reason"], artifact)
     ):
         return unverified
 
