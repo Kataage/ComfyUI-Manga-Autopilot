@@ -873,9 +873,8 @@ async def test_cancelling_offloaded_http_worker_cleans_temp_and_releases_slot(
         await asyncio.wait_for(cancelled_http_task, timeout=20)
     assert artifacts.list_for_scope("page", "page_main") == []
     assert not list((handle.root / "assets" / "temp").glob("page-export-*"))
-    assert not list((handle.root / "exports" / "pages").glob("*.png")) if (
-        handle.root / "exports" / "pages"
-    ).exists() else True
+    export_dir = handle.root / "exports" / "pages"
+    assert not export_dir.exists() or not list(export_dir.glob("*.png"))
 
     # The render semaphore is released by the finished worker, not by the
     # cancelled asyncio waiter. A clean later POST can publish normally.
@@ -896,8 +895,9 @@ async def test_offloaded_http_renderer_error_releases_busy_slot(api, monkeypatch
         raise RuntimeError("intentional Pillow error")
 
     monkeypatch.setattr(module, "render_page_to_png", broken_renderer)
-    response, _ = await _export(client, base)
+    response = await client.post(base + "/export/png", json={})
     assert response.status == 500
+    await response.read()
     assert artifacts.list_for_scope("page", "page_main") == []
 
     monkeypatch.setattr(module, "render_page_to_png", original)
