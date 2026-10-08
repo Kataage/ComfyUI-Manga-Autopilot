@@ -642,3 +642,210 @@ async def test_archived_panel_candidate_publication_does_not_stale_current_page_
     assert fresh_only.status == 409
     assert artifacts.get(original["artifact_id"]) == original_record
     assert (handle.root / original["relative_path"]).read_bytes() == original_bytes
+
+
+
+async def test_canceled_http_download_keeps_spool_slot_until_copy_worker_exits(
+    browser_api, aiohttp_client, monkeypatch,
+):
+    _, handle, _ = browser_api
+    import manga_autopilot.routes.work_export_center_routes as routes
+
+    url = "/manga_autopilot/api/v2/works/work_center/exports/page_artifact_1/png"
+    handlers = []
+
+    @web.middleware
+    async def track_handler(request, handler):
+        if request.method == "GET" and request.path == url:
+            handlers.append(asyncio.current_task())
+        return await handler(request)
+
+    app = web.Application(middlewares=[track_handler])
+    register_all(app, storage_root=str(handle.root.parent.parent))
+    client = await aiohttp_client(app)
+
+    original = routes._verified_png_snapshot
+    copy_release = threading.Event()
+    entered = 0
+    closed = []
+    guard = threading.Lock()
+
+    class TrackedSnapshot:
+        def __init__(self, source, number):
+            self.source = source
+            self.number = number
+
+        def read(self, size):
+            return self.source.read(size)
+
+        def close(self):
+            with guard:
+                closed.append(self.number)
+            self.source.close()
+
+    def suspended_copy(path, row):
+        nonlocal entered
+        with guard:
+            entered += 1
+            number = entered
+        assert copy_release.wait(timeout=20), "download worker never released"
+        return TrackedSnapshot(original(path, row), number)
+
+    monkeypatch.setattr(routes, "_verified_png_snapshot", suspended_copy)
+    first = asyncio.create_task(client.get(url))
+    second = asyncio.create_task(client.get(url))
+    try:
+        for _ in range(700):
+            with guard:
+                if entered == 2:
+                    break
+            await asyncio.sleep(0.01)
+        assert entered == 2, "two separate HTTP copies must own the two slots"
+        assert len(handlers) >= 2
+
+        full = await asyncio.wait_for(client.get(url), timeout=4)
+        assert full.status == 429
+        assert (await full.json())["error"] == "download_busy"
+        assert full.headers["Retry-After"] == "2"
+
+        handlers[0].cancel()
+        await asyncio.sleep(0.03)
+        # Even a second cancellation must not detach a running to_thread job.
+        handlers[0].cancel()
+        await asyncio.sleep(0.03)
+        assert not handlers[0].done(), "cancelled handler abandoned its copy worker"
+
+        still_full = await asyncio.wait_for(client.get(url), timeout=4)
+        assert still_full.status == 429
+        assert (await still_full.json())["error"] == "download_busy"
+        with guard:
+            assert entered == 2, "cancellation let a third download copy start"
+            assert closed == [], "snapshots were not yet created by worker threads"
+    finally:
+        copy_release.set()
+
+    completed = await asyncio.wait_for(
+        asyncio.gather(first, second, return_exceptions=True), timeout=20,
+    )
+    successful = [
+        item for item in completed if hasattr(item, "status") and item.status == 200
+    ]
+    assert len(successful) == 1, completed
+    assert await successful[0].read() == _png()
+    # Wait for both server handler finalizers; explicitly closed snapshots are
+    # observable even for the cancelled waiter, not left to GC.
+    for _ in range(300):
+        with guard:
+            if len(closed) == 2:
+                break
+        await asyncio.sleep(0.01)
+    with guard:
+        assert sorted(closed) == [1, 2]
+
+    after = await asyncio.wait_for(client.get(url), timeout=10)
+    assert after.status == 200
+    assert await after.read() == _png()
+
+
+async def test_canceled_http_stream_read_finishes_before_closing_spool_and_slot(
+    browser_api, aiohttp_client, monkeypatch,
+):
+    _, handle, _ = browser_api
+    import manga_autopilot.routes.work_export_center_routes as routes
+
+    url = "/manga_autopilot/api/v2/works/work_center/exports/page_artifact_1/png"
+    handlers = []
+
+    @web.middleware
+    async def track_handler(request, handler):
+        if request.method == "GET" and request.path == url:
+            handlers.append(asyncio.current_task())
+        return await handler(request)
+
+    app = web.Application(middlewares=[track_handler])
+    register_all(app, storage_root=str(handle.root.parent.parent))
+    client = await aiohttp_client(app)
+
+    original = routes._verified_png_snapshot
+    reading = threading.Event()
+    release = threading.Event()
+    snapshot_started = threading.Event()
+    closed_while_reading = []
+    closed = []
+    guard = threading.Lock()
+    number = 0
+
+    class TrackedSnapshot:
+        def __init__(self, source, is_first):
+            self.source = source
+            self.is_first = is_first
+            self.in_read = False
+
+        def read(self, size):
+            if self.is_first:
+                with guard:
+                    self.in_read = True
+                reading.set()
+                try:
+                    assert release.wait(timeout=20), "stream read never released"
+                    return self.source.read(size)
+                finally:
+                    with guard:
+                        self.in_read = False
+            return self.source.read(size)
+
+        def close(self):
+            with guard:
+                closed.append(self.is_first)
+                if self.in_read:
+                    closed_while_reading.append(True)
+            self.source.close()
+
+    def suspended_copy(path, row):
+        nonlocal number
+        with guard:
+            number += 1
+            index = number
+        if index == 2:
+            snapshot_started.set()
+            assert release.wait(timeout=20), "second copy never released"
+        return TrackedSnapshot(original(path, row), index == 1)
+
+    monkeypatch.setattr(routes, "_verified_png_snapshot", suspended_copy)
+    first_response = await asyncio.wait_for(client.get(url), timeout=10)
+    assert first_response.status == 200
+    assert await asyncio.to_thread(reading.wait, 10), (
+        "first HTTP handler never entered worker snapshot.read()"
+    )
+
+    second = asyncio.create_task(client.get(url))
+    try:
+        assert await asyncio.to_thread(snapshot_started.wait, 10)
+        assert len(handlers) >= 2
+        handlers[0].cancel()
+        await asyncio.sleep(0.05)
+        assert not handlers[0].done(), "read worker was abandoned on cancellation"
+        assert closed_while_reading == []
+
+        full = await asyncio.wait_for(client.get(url), timeout=4)
+        assert full.status == 429
+        assert (await full.json())["error"] == "download_busy"
+        assert number == 2, "a third copy ran while the streaming read was alive"
+    finally:
+        release.set()
+
+    second_response = await asyncio.wait_for(second, timeout=20)
+    assert second_response.status == 200
+    assert await second_response.read() == _png()
+    first_response.close()
+    for _ in range(300):
+        with guard:
+            if len(closed) == 2:
+                break
+        await asyncio.sleep(0.01)
+    with guard:
+        assert sorted(closed) == [False, True]
+        assert closed_while_reading == []
+    after = await asyncio.wait_for(client.get(url), timeout=10)
+    assert after.status == 200
+    assert await after.read() == _png()
