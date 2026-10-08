@@ -41,7 +41,9 @@ def _build_application(args: argparse.Namespace) -> web.Application:
     """Construct a genuinely new application instance over a persisted DB."""
     app = web.Application()
     app_id = secrets.token_hex(12)
-    clock = lambda: _FIXED_NOW + timedelta(seconds=args.clock_offset)
+    def clock() -> datetime:
+        return _FIXED_NOW + timedelta(seconds=args.clock_offset)
+
     repository = DurableRunRepository(args.database, clock=clock)
 
     async def validate_input(run: Any) -> dict[str, str]:
