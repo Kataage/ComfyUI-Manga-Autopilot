@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -24,6 +26,36 @@ from manga_autopilot.storage.paths import UnsafeStoragePathError
 
 ROUTE_PREFIX = "/manga_autopilot/api/v2/works/{work_id}/pages/{page_id}/export/png"
 _ALLOWED_SETTINGS = frozenset({"background", "outer_border", "export_profile"})
+
+
+async def _run_page_export(
+    service: WorkPageExportService,
+    work_id: str,
+    page_id: str,
+    settings: dict[str, Any],
+) -> dict[str, Any]:
+    """Keep Pillow/file IO off the HTTP event loop and own worker cancellation.
+
+    Cancelling an asyncio.to_thread waiter does not stop its thread. We signal
+    cancellation to the Work export's pre-publication and commit-time guards,
+    then drain the worker before propagating cancellation. The service's render
+    semaphore belongs to the worker and is never released early.
+    """
+    cancelled = threading.Event()
+    worker = asyncio.create_task(asyncio.to_thread(
+        service.export_png, work_id, page_id, cancel_event=cancelled, **settings,
+    ))
+    try:
+        return await asyncio.shield(worker)
+    except asyncio.CancelledError:
+        cancelled.set()
+        # Do not abandon an unowned thread still holding the render slot or
+        # writing Work files. Let it complete cleanup before this task exits.
+        try:
+            await asyncio.shield(worker)
+        except Exception:
+            pass
+        raise
 
 
 async def export_work_page_png(request: web.Request) -> web.Response:
@@ -52,8 +84,9 @@ async def export_work_page_png(request: web.Request) -> web.Response:
     if storage_root is None:
         raise web.HTTPInternalServerError(text="manga_storage_root is not configured")
     try:
-        result = WorkPageExportService(Path(storage_root)).export_png(
-            request.match_info["work_id"], request.match_info["page_id"], **body
+        result = await _run_page_export(
+            WorkPageExportService(Path(storage_root)),
+            request.match_info["work_id"], request.match_info["page_id"], body,
         )
     except (PageDomainNotFoundError, WorkNotFoundError) as exc:
         return web.json_response(
