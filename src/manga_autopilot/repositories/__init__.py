@@ -7,7 +7,6 @@ from manga_autopilot.repositories.page_domain import (
     PageRepository,
     PanelRepository,
 )
-
 from manga_autopilot.repositories.work_lifecycle import (
     PortableWorkInspection,
     WorkCatalogEntry,
