@@ -36,6 +36,10 @@ class PageDomainArchivedError(PageDomainOwnershipError):
     """Archived Page cannot be edited through active Page Editor commands."""
 
 
+class PageDomainPanelArchivedError(PageDomainOwnershipError):
+    """Archived Panel cannot be rebound through an active Page Layout command."""
+
+
 class PageDomainCandidateSelectionError(PageDomainOwnershipError):
     """A Panel's selected candidate is not its own current image Artifact."""
 
@@ -533,6 +537,15 @@ class LayoutRepository:
                     raise PageDomainOwnershipError(
                         f"panel {panel_id!r} does not belong to layout Page"
                     )
+                # The default Page Editor projection hides archived Panels.
+                # Reject even no-op or mixed-batch bindings under this same
+                # BEGIN IMMEDIATE lock: an archived Panel's persisted binding
+                # must only become editable after an explicit unarchive.
+                if panel["archived_at"] is not None:
+                    raise PageDomainPanelArchivedError(
+                        f"Panel {panel_id} is archived; unarchive before changing "
+                        "its LayoutSlot binding."
+                    )
                 if slot_binding is not None:
                     _check_slot_page(
                         conn, _id(slot_binding, "layout_slot_id"), layout["page_id"]
@@ -679,6 +692,7 @@ __all__ = [
     "PageDomainCandidateSelectionError",
     "PageDomainNotFoundError",
     "PageDomainOwnershipError",
+    "PageDomainPanelArchivedError",
     "PageRepository",
     "PanelRepository",
 ]
