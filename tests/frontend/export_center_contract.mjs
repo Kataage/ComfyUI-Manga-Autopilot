@@ -369,3 +369,42 @@ test("explicit Print profile is sent as bounded settings, never geometry", async
     env.restore();
   }
 });
+
+
+test("Export Center labels source freshness without hiding historical PNGs", async () => {
+  const env = browser();
+  globalThis.fetch = async (url) => {
+    if (url.endsWith("/pages")) {
+      return response(200, { pages: [{ id: "page_1", page_number: 1 }] });
+    }
+    if (url.endsWith("/exports")) {
+      return response(200, { work_id: "work_history", exports: [
+        { id: "new_png", scope_id: "page_1",
+          relative_path: "exports/pages/new.png", freshness: "CURRENT",
+          is_current: true },
+        { id: "old_png", scope_id: "page_1",
+          relative_path: "exports/pages/old.png", freshness: "STALE",
+          is_current: false, freshness_reason: "page_inputs_changed" },
+        { id: "legacy_png", scope_id: "page_1",
+          relative_path: "exports/pages/legacy.png", freshness: "UNVERIFIED",
+          is_current: false, freshness_reason: "source_provenance_unavailable" },
+      ] });
+    }
+    throw new Error("Unexpected request " + url);
+  };
+  try {
+    const root = env.root();
+    const dispose = editor.mountExportCenter(root, { workId: "work_history" });
+    await flush();
+    assert.match(root.textContent, /Current · Page page_1/);
+    assert.match(root.textContent, /Stale \(historical\)/);
+    assert.match(root.textContent, /Saved Page changed/);
+    assert.match(root.textContent, /Unverified \(historical\)/);
+    assert.equal(root.querySelectorAll("a").length, 3,
+      "all immutable historical exports should remain available");
+    assert.equal(root.querySelectorAll("li").length, 3);
+    dispose();
+  } finally {
+    env.restore();
+  }
+});

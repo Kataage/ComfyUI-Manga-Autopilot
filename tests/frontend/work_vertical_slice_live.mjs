@@ -206,6 +206,15 @@ assert.equal(mostRecent.artifact_type, "page_render");
 assert.equal(mostRecent.width, desiredWidth);
 assert.equal(mostRecent.height, 200);
 assert.equal(mostRecent.status, "READY");
+assert.equal(mostRecent.freshness, "CURRENT");
+assert.equal(mostRecent.is_current, true);
+assert.match(exportRoot.textContent, /Current · Page/);
+if (phase === "reopen") {
+  assert.equal(currentExports[1].freshness, "STALE");
+  assert.equal(currentExports[1].is_current, false);
+  assert.equal(currentExports[1].freshness_reason, "page_inputs_changed");
+  assert.ok(exportRoot.textContent.includes("Stale (historical)"));
+}
 const exportLink = exportRoot.querySelectorAll("a").find((node) =>
   node.href === exportCenter.exportPngFileUrl(WORK, mostRecent.id));
 assert.ok(exportLink, "Export Center must link registered Work Artifact ID");
