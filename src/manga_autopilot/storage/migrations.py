@@ -481,6 +481,53 @@ Migration(
             """,
         ),
     ),
+Migration(
+        version=5,
+        name="W0005_work_artifacts",
+        statements=(
+            """
+            CREATE TABLE artifacts (
+                id TEXT PRIMARY KEY,
+                artifact_type TEXT NOT NULL,
+                scope_type TEXT,
+                scope_id TEXT,
+                relative_path TEXT NOT NULL UNIQUE,
+                mime_type TEXT,
+                sha256 TEXT NOT NULL,
+                file_size INTEGER,
+                width INTEGER,
+                height INTEGER,
+                run_id TEXT,
+                generation_attempt_id TEXT,
+                revision INTEGER NOT NULL CHECK (revision > 0),
+                dependency_fingerprint TEXT NOT NULL,
+                status TEXT NOT NULL,
+                created_commit_seq INTEGER REFERENCES commits(commit_seq),
+                created_at TEXT NOT NULL,
+                archived_at TEXT,
+                CHECK (file_size IS NULL OR file_size >= 0),
+                CHECK (width IS NULL OR width > 0),
+                CHECK (height IS NULL OR height > 0)
+            )
+            """,
+            """
+            CREATE INDEX idx_artifacts_scope_type
+            ON artifacts(scope_type, scope_id, artifact_type)
+            """,
+            """
+            CREATE INDEX idx_artifacts_sha256
+            ON artifacts(sha256)
+            """,
+            """
+            CREATE INDEX idx_artifacts_run_id
+            ON artifacts(run_id)
+            """,
+            """
+            CREATE INDEX idx_artifacts_status
+            ON artifacts(status)
+            """,
+        ),
+    ),
 )
 
 

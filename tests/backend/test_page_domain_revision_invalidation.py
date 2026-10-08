@@ -405,7 +405,7 @@ def test_upgrade_existing_w0003_work_preserves_data_and_historical_revisions(
     upgraded = migrate_work_database(
         db_path,
         work_id="work_before_w4",
-        migrations=WORK_MIGRATIONS,
+        migrations=WORK_MIGRATIONS[:4],
     )
     assert upgraded.applied_versions == (4,)
     assert upgraded.backup_path is not None
@@ -432,6 +432,8 @@ def test_upgrade_existing_w0003_work_preserves_data_and_historical_revisions(
     )
     assert len(history) == 1
     assert history[0]["entity_revision"] == 1
-    again = migrate_work_database(db_path, work_id="work_before_w4")
+    again = migrate_work_database(
+        db_path, work_id="work_before_w4", migrations=WORK_MIGRATIONS[:4]
+    )
     assert again.applied_versions == ()
     assert again.backup_path is None
