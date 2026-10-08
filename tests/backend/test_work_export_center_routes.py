@@ -11,8 +11,12 @@ import pytest
 from aiohttp import web
 from PIL import Image
 
-from manga_autopilot.repositories import ArtifactRepository, WorkLifecycleRepository
+from manga_autopilot.repositories import (
+    ArtifactRepository, LayoutRepository, PageRepository, PanelRepository,
+    WorkLifecycleRepository,
+)
 from manga_autopilot.routes import register_all
+from manga_autopilot.storage import repository_read
 
 
 def _png(color: str = "#19b13d") -> bytes:
@@ -71,6 +75,8 @@ async def test_work_list_returns_only_registered_page_png_metadata(browser_api):
     assert row["height"] == 9
     assert row["mime_type"] == "image/png"
     assert row["status"] == "READY"
+    assert row["freshness"] == "UNVERIFIED"
+    assert row["is_current"] is False
     assert "created_at" in row
     assert "absolute_path" not in row
     assert "artifact_path" not in row
