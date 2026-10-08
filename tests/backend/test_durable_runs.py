@@ -215,6 +215,11 @@ def test_lease_conflict_expiry_and_explicit_owner_recovery(tmp_path: Path) -> No
     assert extended["expires_at"] > lease["expires_at"]
     clock.advance(21)
     assert repo.inspect_lease("work_test")["expired"] is True
+    with pytest.raises(WorkLeaseConflictError, match="rotate"):
+        repo.acquire_lease(
+            work_id="work_test", lease_owner="owner_a", lease_kind="MUTATION",
+            ttl_seconds=10, reclaim_expired_owner="owner_a",
+        )
     with pytest.raises(WorkLeaseConflictError, match="explicit"):
         repo.acquire_lease(
             work_id="work_test", lease_owner="owner_b", lease_kind="MUTATION",
@@ -271,4 +276,12 @@ def test_lease_requires_existing_work_and_run(tmp_path: Path) -> None:
         repo.acquire_lease(work_id="work_test", lease_owner="owner",
                            lease_kind="MUTATION", ttl_seconds=1,
                            run_id="run_missing")
+    run_id = repo.create_run(
+        run_kind="AUTOPILOT", scope_type="WORK", scope_id="other_work",
+        requested_by="user", input_fingerprint="v1",
+    )["id"]
+    with pytest.raises(WorkLeaseConflictError, match="different Work"):
+        repo.acquire_lease(work_id="work_test", lease_owner="owner",
+                           lease_kind="MUTATION", ttl_seconds=1,
+                           run_id=run_id)
     assert repo.inspect_lease("work_test") is None
