@@ -329,3 +329,43 @@ test("disposed Export Center ignores delayed server results", async () => {
     env.restore();
   }
 });
+
+
+test("explicit Print profile is sent as bounded settings, never geometry", async () => {
+  const env = browser();
+  const exports = [];
+  const requests = [];
+  globalThis.fetch = async (url, options = {}) => {
+    requests.push({ url, options });
+    if (url.endsWith("/pages")) {
+      return response(200, { pages: [{ id: "page_print", page_number: 3 }] });
+    }
+    if (url.endsWith("/exports")) {
+      return response(200, { work_id: "work_print", exports });
+    }
+    if (url.endsWith("/export/png")) {
+      const body = JSON.parse(options.body);
+      assert.deepEqual(body, { export_profile: "print" });
+      return response(201, {
+        work_id: "work_print", page_id: "page_print",
+        artifact_id: "artifact_print",
+        relative_path: "exports/pages/page_print_artifact_print.png",
+      });
+    }
+    throw new Error("unexpected URL " + url);
+  };
+  try {
+    const root = env.root();
+    const dispose = editor.mountExportCenter(root, { workId: "work_print" });
+    await flush();
+    const selects = root.querySelectorAll("select");
+    assert.equal(selects.length, 2, "saved Page and explicit PNG profile selectors");
+    selects[1].value = "print";
+    await find(root, "button", "Export PNG").fire("click");
+    assert.match(root.textContent, /PNG exported and registered/);
+    assert.equal(requests.filter((r) => r.options.method === "POST").length, 1);
+    dispose();
+  } finally {
+    env.restore();
+  }
+});
