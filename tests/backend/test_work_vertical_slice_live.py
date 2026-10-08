@@ -25,12 +25,13 @@ from PIL import Image
 from manga_autopilot.repositories import (
     ArtifactRepository,
     LayoutRepository,
+    PageDomainCandidateSelectionError,
     PageRepository,
     PanelRepository,
     WorkLifecycleRepository,
 )
 from manga_autopilot.routes import register_all
-from manga_autopilot.storage import repository_read
+from manga_autopilot.storage import repository_read, repository_write
 
 ROOT = Path(__file__).resolve().parents[2]
 BROWSER = ROOT / "tests" / "frontend" / "work_vertical_slice_live.mjs"
@@ -210,10 +211,21 @@ async def test_actual_editor_ui_save_export_reopen_edit_export_again(
         assert wrong_work.status == 404
         wrong_work.release()
         wrong_owner = panels.get_panel("panel_red")
-        panels.update_panel(
-            "panel_red", expected_revision=wrong_owner["revision"],
-            selected_candidate_id="artifact_blue",
-        )
+        with pytest.raises(
+            PageDomainCandidateSelectionError, match="owned by this Panel"
+        ):
+            panels.update_panel(
+                "panel_red", expected_revision=wrong_owner["revision"],
+                selected_candidate_id="artifact_blue",
+            )
+        assert panels.get_panel("panel_red") == wrong_owner
+        # Legacy persisted Work corruption must *also* be rejected by the
+        # exporter. Public repository selection cannot create this state.
+        with repository_write(handle.database_path) as db:
+            db.execute(
+                "UPDATE panels SET selected_candidate_id = ? WHERE id = ?",
+                ("artifact_blue", "panel_red"),
+            )
         failed = await session.post(
             first_origin + f"/manga_autopilot/api/v2/works/{WORK_ID}"
             + f"/pages/{PAGE_ID}/export/png",
@@ -235,8 +247,9 @@ async def test_actual_editor_ui_save_export_reopen_edit_export_again(
         )
     assert not (handle.root / "forbidden.png").exists()
 
-    # Restore valid selection by persisted repository revision, not a mock
-    # browser attribute. Then really close the aiohttp server and open Work
+    # Repair the historic invalid selection using the guarded public
+    # repository revision, not a mock browser attribute. Then close HTTP
+    # server and reopen Work
     # in a newly constructed lifecycle/application instance.
     changed = panels.get_panel("panel_red")
     panels.update_panel(

@@ -22,6 +22,7 @@ from manga_autopilot.storage import (
     migrate_work_database,
     read_work_identity,
     repository_read,
+    repository_write,
 )
 
 
@@ -239,6 +240,20 @@ def test_panel_narrative_change_invalidates_only_relevant_downstream_work(domain
 def test_selected_candidate_change_does_not_invalidate_panel_generation(domain):
     pages, _, panels, audit = domain
     _seed(domain)
+    # W0005 stores Candidate selection as the ID of a registered Work-local
+    # panel_candidate Artifact; the real file is consumed only on export.
+    with repository_write(pages.database_path) as db:
+        db.execute(
+            """INSERT INTO artifacts (
+                id, artifact_type, scope_type, scope_id, relative_path,
+                mime_type, sha256, file_size, revision, dependency_fingerprint,
+                status, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            ("candidate_001", "panel_candidate", "panel", "panel_a",
+             "assets/panels/candidate_001.png", "image/png",
+             "0" * 64, 16, 1, "fixture-input", "READY",
+             "2026-10-08T00:00:00Z"),
+        )
     before = _counts(pages)
     changed = panels.update_panel(
         "panel_a",

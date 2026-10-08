@@ -179,11 +179,24 @@ async def test_repeated_exports_have_distinct_immutable_registered_artifacts(api
 
 async def test_selected_artifact_ownership_is_enforced_not_guessed(api):
     client, base, _, handle, _, _, panels, artifacts = api
+    from manga_autopilot.repositories import PageDomainCandidateSelectionError
+    from manga_autopilot.storage import repository_write
+
     current = panels.get_panel("panel_main")
-    panels.update_panel(
-        "panel_main", expected_revision=current["revision"],
-        selected_candidate_id="candidate_other",
-    )
+    with pytest.raises(PageDomainCandidateSelectionError, match="owned by this Panel"):
+        panels.update_panel(
+            "panel_main", expected_revision=current["revision"],
+            selected_candidate_id="candidate_other",
+        )
+    assert panels.get_panel("panel_main") == current
+
+    # Defensive export test for a Work written by an older unguarded version.
+    # Only test setup bypasses the public repository selection transaction.
+    with repository_write(handle.database_path) as db:
+        db.execute(
+            "UPDATE panels SET selected_candidate_id = ? WHERE id = ?",
+            ("candidate_other", "panel_main"),
+        )
     response, body = await _export(client, base)
     assert response.status == 422
     assert body["error"] == "export_precondition_failed"
@@ -194,12 +207,24 @@ async def test_selected_artifact_ownership_is_enforced_not_guessed(api):
 
 
 async def test_missing_selected_image_is_actionable_and_does_not_create_blank_page(api):
-    client, base, _, _, _, _, panels, artifacts = api
+    client, base, _, handle, _, _, panels, artifacts = api
+    from manga_autopilot.repositories import PageDomainCandidateSelectionError
+    from manga_autopilot.storage import repository_write
+
     current = panels.get_panel("panel_main")
-    panels.update_panel(
-        "panel_main", expected_revision=current["revision"],
-        selected_candidate_id="candidate_missing",
-    )
+    with pytest.raises(PageDomainCandidateSelectionError, match="Candidate"):
+        panels.update_panel(
+            "panel_main", expected_revision=current["revision"],
+            selected_candidate_id="candidate_missing",
+        )
+    assert panels.get_panel("panel_main") == current
+
+    # Read-time guard remains essential for historical invalid Work data.
+    with repository_write(handle.database_path) as db:
+        db.execute(
+            "UPDATE panels SET selected_candidate_id = ? WHERE id = ?",
+            ("candidate_missing", "panel_main"),
+        )
     response, body = await _export(client, base)
     assert response.status == 422
     assert "candidate_missing" in body["message"]
