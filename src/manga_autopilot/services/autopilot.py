@@ -814,6 +814,10 @@ class Orchestrator:
         step_state: AutopilotState,
         exc: BaseException,
     ) -> None:
+        if run.machine.state == AutopilotState.CANCELLED or _is_cancelled(run):
+            # A slow hook may fail after the user cancelled its Run. Never
+            # resurrect a terminal cancellation as an unrelated failure.
+            return
         failure_map = {
             AutopilotState.STORY_PLANNED: AutopilotState.FAILED_STORY_PLANNING,
             AutopilotState.CHARACTERS_DEFINED: AutopilotState.FAILED_CHARACTER_SHEET,
@@ -895,8 +899,14 @@ class Orchestrator:
             return self._finalize(run)
         except Exception as exc:  # noqa: BLE001
             log.exception("autopilot pipeline failed: %s", exc)
-            if not run.machine.state.value.startswith("FAILED"):
-                run.machine.fail(AutopilotState.FAILED_PANEL_GENERATION, reason=str(exc))
+            if (
+                run.machine.state != AutopilotState.CANCELLED
+                and not _is_cancelled(run)
+                and not run.machine.state.value.startswith("FAILED")
+            ):
+                run.machine.fail(
+                    AutopilotState.FAILED_PANEL_GENERATION, reason=str(exc),
+                )
             return self._finalize(run)
 
     def _finalize(self, run: AutopilotRun) -> AutopilotRun:
