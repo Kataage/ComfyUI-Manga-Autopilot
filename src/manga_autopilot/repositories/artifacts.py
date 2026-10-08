@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import io
+import json
 import os
 import sqlite3
 import tempfile
@@ -19,7 +20,7 @@ from typing import Any, BinaryIO
 
 from PIL import Image, UnidentifiedImageError
 
-from manga_autopilot.primitives import new_id
+from manga_autopilot.primitives import canonical_json, new_id
 from manga_autopilot.repositories.work_lifecycle import WorkLifecycleRepository
 from manga_autopilot.storage import (
     assert_managed_path,
@@ -148,9 +149,50 @@ VERIFIED_PAGE_RENDER_OPERATION = "register_verified_page_render_v1"
 
 def verified_page_render_reason(
     artifact_id: str, page_id: str, fingerprint: str,
+    source_payload: dict[str, Any],
 ) -> str:
-    """Bind a Page export's artifact identity, owner and input digest."""
-    return f"page_export_attestation_v1:{artifact_id}:{page_id}:{fingerprint}"
+    """Canonical source and render-options attestation in the Artifact commit."""
+    return canonical_json({
+        "attestation_version": 1,
+        "artifact_id": artifact_id,
+        "page_id": page_id,
+        "dependency_fingerprint": fingerprint,
+        "source_fingerprint_payload": source_payload,
+    })
+
+
+def verify_page_render_attestation(
+    reason: str | None, artifact: dict[str, Any],
+) -> bool:
+    """Validate source digest and immutable Artifact/Work commit binding."""
+    if not isinstance(reason, str):
+        return False
+    try:
+        envelope = json.loads(reason)
+        payload = envelope["source_fingerprint_payload"]
+        if type(envelope["attestation_version"]) is not int:
+            return False
+        if envelope["attestation_version"] != 1 or not isinstance(payload, dict):
+            return False
+        if envelope["artifact_id"] != artifact["id"]:
+            return False
+        if envelope["page_id"] != artifact["scope_id"]:
+            return False
+        if payload["page_id"] != artifact["scope_id"]:
+            return False
+        if envelope["dependency_fingerprint"] != artifact["dependency_fingerprint"]:
+            return False
+        if payload["renderer"] != "legacy_page_renderer_v1":
+            return False
+        if not isinstance(payload["panel_artifacts"], list):
+            return False
+        return (
+            canonical_json(envelope) == reason
+            and hashlib.sha256(canonical_json(payload).encode("utf-8")).hexdigest()
+            == artifact["dependency_fingerprint"]
+        )
+    except (ValueError, TypeError, KeyError, AttributeError):
+        return False
 
 
 class ArtifactRepository:
@@ -279,21 +321,90 @@ class ArtifactRepository:
         dependency_fingerprint: str,
         artifact_id: str,
         commit_guard: Callable[[sqlite3.Connection], None],
+        source_fingerprint_payload: dict[str, Any],
     ) -> dict[str, Any]:
-        """Internal exporter-only registration of a source-guarded Page PNG.
+        """Export-only registration with an independently verified source proof.
 
-        Call exclusively after WorkPageExportService prepared its persisted
-        source snapshot and final BEGIN IMMEDIATE revision/candidate guard.
-        The generic public register_local_file/bytes APIs NEVER create a
-        trusted provenance commit, even when their caller supplies a guard.
+        Generic register_local_file/bytes, including those with user-supplied
+        commit guards, cannot issue this attestation. The Work commit, source
+        attestation, READY Artifact and history record are atomic.
         """
         if not callable(commit_guard):
-            raise ValueError("verified Page render requires a commit guard")
-        if (
-            len(dependency_fingerprint) != 64
-            or any(ch not in "0123456789abcdef" for ch in dependency_fingerprint)
+            raise ValueError("verified Page render requires a source commit guard")
+        reason = verified_page_render_reason(
+            artifact_id, page_id, dependency_fingerprint, source_fingerprint_payload,
+        )
+        if not verify_page_render_attestation(
+            reason,
+            {"id": artifact_id, "scope_id": page_id,
+             "dependency_fingerprint": dependency_fingerprint},
         ):
-            raise ValueError("verified Page render requires canonical SHA256 fingerprint")
+            raise ValueError("verified Page render requires matching source digest")
+
+        def attested_guard(conn: sqlite3.Connection) -> None:
+            from manga_autopilot.services.page_application import (
+                read_page_state_in_transaction,
+            )
+            from manga_autopilot.services.work_page_export import (
+                PageExportConflictError,
+            )
+
+            current = read_page_state_in_transaction(conn, self.work_id, page_id)
+            source_hash = hashlib.sha256(canonical_json({
+                "page": current["page"], "layout": current["layout"],
+                "slots": current["slots"], "panels": current["panels"],
+            }).encode("utf-8")).hexdigest()
+            active = [
+                panel for panel in current["panels"]
+                if panel["archived_at"] is None
+            ]
+            deps = source_fingerprint_payload["panel_artifacts"]
+            if (
+                current["page"]["archived_at"] is not None
+                or not active
+                or source_hash != source_fingerprint_payload["page_state_sha256"]
+                or len(active) != len(deps)
+                or {p["id"] for p in active} != {d["panel_id"] for d in deps}
+            ):
+                raise PageExportConflictError(
+                    f"Page {page_id} changed before provenance attestation."
+                )
+            slots = {slot["id"]: slot for slot in current["slots"]}
+            for dep in deps:
+                panel = next(p for p in active if p["id"] == dep["panel_id"])
+                slot = slots.get(dep["slot_id"])
+                row = conn.execute(
+                    """SELECT artifact_type, scope_type, scope_id, status,
+                              archived_at, mime_type, sha256 FROM artifacts
+                       WHERE id = ?""",
+                    (dep["artifact_id"],),
+                ).fetchone()
+                if (
+                    slot is None
+                    or panel["revision"] != dep["panel_revision"]
+                    or panel["layout_slot_id"] != dep["slot_id"]
+                    or slot["revision"] != dep["slot_revision"]
+                    or row is None
+                    or row["artifact_type"] != "panel_candidate"
+                    or row["scope_type"] != "panel"
+                    or row["scope_id"] != panel["id"]
+                    or row["status"] != "READY"
+                    or row["archived_at"] is not None
+                    or row["mime_type"] not in {
+                        "image/png", "image/jpeg", "image/webp"
+                    }
+                    or row["sha256"] != dep["sha256"]
+                    or (
+                        panel["selected_candidate_id"] is not None
+                        and panel["selected_candidate_id"] != dep["artifact_id"]
+                    )
+                ):
+                    raise PageExportConflictError(
+                        f"Page {page_id} candidate source failed attestation."
+                    )
+            # Keep #335's exact candidate uniqueness and commit ordering guard.
+            commit_guard(conn)
+
         source = Path(source_path)
         if source.is_symlink() or not source.is_file():
             raise ValueError("source_path must be an existing regular non-symlink file")
@@ -309,8 +420,9 @@ class ArtifactRepository:
                 mime_type="image/png",
                 run_id=None,
                 generation_attempt_id=None,
-                commit_guard=commit_guard,
+                commit_guard=attested_guard,
                 _verified_page_render=True,
+                _verified_page_source_payload=source_fingerprint_payload,
             )
 
     def _register_stream(
@@ -328,6 +440,7 @@ class ArtifactRepository:
         generation_attempt_id: str | None,
         commit_guard: Callable[[sqlite3.Connection], None] | None = None,
         _verified_page_render: bool = False,
+        _verified_page_source_payload: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         relative = _valid_relative_path(relative_path)
         kind = _nonempty(artifact_type, "artifact_type")
@@ -411,6 +524,7 @@ class ArtifactRepository:
                 reason=(
                     verified_page_render_reason(
                         artifact_key, scope_id, fingerprint,
+                        _verified_page_source_payload,
                     )
                     if _verified_page_render else f"publish {kind}"
                 ),
