@@ -150,6 +150,7 @@ class WorkPageExportService:
         background: str = "#ffffff",
         outer_border: bool = True,
         export_profile: str = DEFAULT_PROFILE,
+        cancel_event: threading.Event | None = None,
     ) -> dict[str, Any]:
         if not _RENDER_SLOT.acquire(blocking=False):
             raise PageExportBusyError(
@@ -160,6 +161,7 @@ class WorkPageExportService:
             return self._export_png(
                 work_id, page_id, background=background,
                 outer_border=outer_border, export_profile=export_profile,
+                cancel_event=cancel_event,
             )
         finally:
             _RENDER_SLOT.release()
@@ -172,7 +174,19 @@ class WorkPageExportService:
         background: str,
         outer_border: bool,
         export_profile: str,
+        cancel_event: threading.Event | None,
     ) -> dict[str, Any]:
+        # An aiohttp request can be cancelled while its to_thread() worker
+        # continues. Abort before durable publication, rather than silently
+        # creating a READY export for an abandoned request. Once a database
+        # commit has succeeded it cannot be undone and remains auditable.
+        def check_not_cancelled() -> None:
+            if cancel_event is not None and cancel_event.is_set():
+                raise PageExportConflictError(
+                    f"Work {work_id}, Page {page_id}: PNG export request was cancelled."
+                )
+
+        check_not_cancelled()
         try:
             budget = resolve_page_png_budget(export_profile)
         except ValueError as exc:
@@ -328,6 +342,9 @@ class WorkPageExportService:
                 background=background,
                 outer_border=outer_border,
             )
+            # Cancellation may arrive while Pillow is busy. Its disposable
+            # TemporaryDirectory is always cleaned before any Artifact write.
+            check_not_cancelled()
             # Fail before final Artifact publication, including pathological
             # incompressible PNGs that exceed the profile's disk/network budget.
             output_bytes = result.output_path.stat().st_size
@@ -351,12 +368,18 @@ class WorkPageExportService:
                     f"Page {page_id} changed while rendering; reload and export again."
                 )
             for dependency in dependencies:
+                check_not_cancelled()
                 artifact_repo.verify_registered_file(dependency["artifact_id"])
+            check_not_cancelled()
             # Recheck the EXACT persisted input projection inside the final
             # Artifact registration's BEGIN IMMEDIATE transaction. The earlier
             # post-render read is only a fast-fail optimization: it cannot
             # protect the window while output bytes are copied and published.
             def guard_source_revision(conn):
+                # Final cancellation gate shares the BEGIN IMMEDIATE Work lock
+                # with provenance/commit validation; an interrupted export
+                # cannot create a READY row after this guard sees cancellation.
+                check_not_cancelled()
                 try:
                     current = read_page_state_in_transaction(
                         conn, work.work_id, page_id
