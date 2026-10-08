@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import threading
-import time
 from collections import Counter
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
