@@ -248,6 +248,40 @@ def test_lease_conflict_expiry_and_explicit_owner_recovery(tmp_path: Path) -> No
     assert repo.inspect_lease("work_test") is None
 
 
+def test_expired_owner_cannot_erase_explicit_recovery_token(tmp_path: Path) -> None:
+    db = tmp_path / "work.sqlite3"
+    _work(db)
+    clock = Clock()
+    original = DurableRunRepository(db, clock=clock)
+    another = DurableRunRepository(db, clock=clock)
+    run_id = _run(original)
+    original.acquire_lease(
+        work_id="work_test", lease_owner="stale",
+        lease_kind="AUTOPILOT_MUTATION", ttl_seconds=3, run_id=run_id,
+    )
+    clock.advance(4)
+    with pytest.raises(WorkLeaseConflictError, match="expired"):
+        original.release_lease(work_id="work_test", lease_owner="stale")
+    lease = another.inspect_lease("work_test")
+    assert lease is not None and lease["expired"]
+    assert lease["lease_owner"] == "stale"
+    with pytest.raises(WorkLeaseConflictError, match="explicit"):
+        another.acquire_lease(
+            work_id="work_test", lease_owner="fresh",
+            lease_kind="AUTOPILOT_MUTATION", ttl_seconds=10, run_id=run_id,
+        )
+    restored = another.acquire_lease(
+        work_id="work_test", lease_owner="fresh",
+        lease_kind="AUTOPILOT_MUTATION", ttl_seconds=10, run_id=run_id,
+        reclaim_expired_owner="stale",
+    )
+    assert restored["lease_owner"] == "fresh"
+    with pytest.raises(WorkLeaseConflictError):
+        original.release_lease(work_id="work_test", lease_owner="stale")
+    another.release_lease(work_id="work_test", lease_owner="fresh")
+    assert another.inspect_lease("work_test") is None
+
+
 def test_two_connections_can_never_acquire_same_work_lease(tmp_path: Path) -> None:
     db = tmp_path / "work.sqlite3"
     _work(db)
