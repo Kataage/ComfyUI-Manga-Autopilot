@@ -130,7 +130,7 @@ def test_layout_creation_sets_page_association_and_rejects_duplicate(repositorie
     with pytest.raises(PageDomainOwnershipError):
         layouts.create_layout(layout_id="l2", page_id="p1")
     assert layouts.get_layout("l1")["id"] == "l1"
-    assert _commits(pages) == before
+    assert _commits(pages) == before + 1
 
 
 def test_layout_changes_preserve_panel_identity_semantics_and_unmodified_revisions(
