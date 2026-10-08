@@ -49,6 +49,7 @@ _RUN_TRANSITIONS = {
 }
 _STEP_STARTABLE = frozenset({
     "PENDING", "INTERRUPTED", "FAILED_RETRYABLE", "STALE",
+    "NEEDS_ATTENTION",
 })
 _STEP_TERMINAL = frozenset({
     "COMPLETED", "FAILED_RETRYABLE", "FAILED_TERMINAL",
@@ -176,6 +177,21 @@ class DurableRunRepository:
                 _required(lease_owner, "lease_owner")
                 if old["lease_owner"] not in (None, lease_owner):
                     raise DurableRunStateError("Run lease owner mismatch")
+                if expected_status == "RUNNING":
+                    self._assert_owner(conn, run_id, lease_owner)
+                elif new_status == "RUNNING":
+                    lease = conn.execute(
+                        """SELECT expires_at FROM work_leases
+                           WHERE run_id = ? AND lease_owner = ?""",
+                        (run_id, lease_owner),
+                    ).fetchone()
+                    if (
+                        lease is None
+                        or _utc(datetime.fromisoformat(
+                            lease["expires_at"]
+                        )) <= self._now()
+                    ):
+                        raise WorkLeaseConflictError("no current lease to start Run")
             conn.execute(
                 """
                 UPDATE runs SET status = ?,
@@ -200,6 +216,7 @@ class DurableRunRepository:
     def heartbeat_run(self, run_id: str, *, lease_owner: str) -> None:
         _required(lease_owner, "lease_owner")
         with repository_write(self.database_path) as conn:
+            self._assert_owner(conn, run_id, lease_owner)
             cursor = conn.execute(
                 """UPDATE runs SET heartbeat_at = ?
                    WHERE id = ? AND status = 'RUNNING' AND lease_owner = ?""",
@@ -207,6 +224,89 @@ class DurableRunRepository:
             )
             if cursor.rowcount != 1:
                 raise DurableRunStateError("Run heartbeat owner/state mismatch")
+
+    def _assert_owner(
+        self, conn: sqlite3.Connection, run_id: str, owner: str | None,
+    ) -> None:
+        """Fence stale orchestration owners within the write transaction."""
+        if owner is None:
+            return  # Trusted low-level repository APIs remain compatible.
+        _required(owner, "lease_owner")
+        run = self._get(conn, "runs", run_id)
+        lease = conn.execute(
+            "SELECT * FROM work_leases WHERE run_id = ? AND lease_owner = ?",
+            (run_id, owner),
+        ).fetchone()
+        if (
+            run["status"] != "RUNNING" or run["lease_owner"] != owner
+            or lease is None
+            or _utc(datetime.fromisoformat(lease["expires_at"])) <= self._now()
+        ):
+            raise WorkLeaseConflictError("stale or expired durable Run owner")
+
+    def list_step_attempts(self, step_id: str) -> list[dict[str, Any]]:
+        with repository_read(self.database_path) as conn:
+            self._get(conn, "run_steps", step_id)
+            return [
+                dict(row) for row in conn.execute(
+                    """SELECT * FROM run_step_attempts
+                       WHERE run_step_id = ? ORDER BY attempt_no""",
+                    (step_id,),
+                ).fetchall()
+            ]
+
+    def recover_interrupted_run(self, run_id: str, *, lease_owner: str) -> None:
+        """Fence a crashed process after explicit expired-lease recovery."""
+        with repository_write(self.database_path) as conn:
+            run = self._get(conn, "runs", run_id)
+            if run["status"] != "RUNNING":
+                raise DurableRunStateError("only RUNNING Run can be recovered")
+            lease = conn.execute(
+                "SELECT * FROM work_leases WHERE run_id = ? AND lease_owner = ?",
+                (run_id, lease_owner),
+            ).fetchone()
+            if (
+                lease is None
+                or _utc(datetime.fromisoformat(lease["expires_at"])) <= self._now()
+                or run["lease_owner"] == lease_owner
+            ):
+                raise WorkLeaseConflictError("recovery requires a new active lease")
+            timestamp = self._now().isoformat()
+            conn.execute(
+                """UPDATE run_step_attempts SET status = 'INTERRUPTED',
+                    error_json = '{"reason":"process_interrupted"}',
+                    finished_at = ?
+                    WHERE status = 'RUNNING' AND run_step_id IN (
+                        SELECT id FROM run_steps WHERE run_id = ?
+                    )""",
+                (timestamp, run_id),
+            )
+            conn.execute(
+                """UPDATE run_steps SET status = 'INTERRUPTED',
+                    error_json = '{"reason":"process_interrupted"}',
+                    finished_at = ?
+                    WHERE run_id = ? AND status = 'RUNNING'""",
+                (timestamp, run_id),
+            )
+            conn.execute(
+                """UPDATE runs SET status = 'INTERRUPTED',
+                    lease_owner = NULL WHERE id = ?""", (run_id,),
+            )
+
+    def set_pending_fingerprint(
+        self, step_id: str, *, input_fingerprint: str,
+        lease_owner: str | None = None,
+    ) -> None:
+        _required(input_fingerprint, "input_fingerprint")
+        with repository_write(self.database_path) as conn:
+            step = self._get(conn, "run_steps", step_id)
+            self._assert_owner(conn, str(step["run_id"]), lease_owner)
+            if step["status"] != "PENDING":
+                raise DurableRunStateError("only pending step can update its input")
+            conn.execute(
+                "UPDATE run_steps SET input_fingerprint = ? WHERE id = ?",
+                (input_fingerprint, step_id),
+            )
 
     def create_step(
         self,
@@ -217,6 +317,7 @@ class DurableRunRepository:
         scope_type: str | None = None,
         scope_id: str | None = None,
         step_id: str | None = None,
+        lease_owner: str | None = None,
     ) -> dict[str, Any]:
         _required(step_key, "step_key")
         _required(input_fingerprint, "input_fingerprint")
@@ -228,6 +329,7 @@ class DurableRunRepository:
         identifier = _required(step_id or new_id("step"), "step_id")
         with repository_write(self.database_path) as conn:
             self._get(conn, "runs", run_id)
+            self._assert_owner(conn, run_id, lease_owner)
             conn.execute(
                 """
                 INSERT INTO run_steps (
@@ -256,10 +358,14 @@ class DurableRunRepository:
                 ).fetchall()
             ]
 
-    def mark_step_stale(self, step_id: str, *, new_fingerprint: str) -> None:
+    def mark_step_stale(
+        self, step_id: str, *, new_fingerprint: str,
+        lease_owner: str | None = None,
+    ) -> None:
         _required(new_fingerprint, "new_fingerprint")
         with repository_write(self.database_path) as conn:
             old = self._get(conn, "run_steps", step_id)
+            self._assert_owner(conn, str(old["run_id"]), lease_owner)
             if old["status"] != "COMPLETED":
                 raise DurableRunStateError("only a completed step can become STALE")
             if old["input_fingerprint"] == new_fingerprint:
@@ -274,11 +380,13 @@ class DurableRunRepository:
         step_id: str,
         *,
         input_fingerprint: str,
+        lease_owner: str | None = None,
     ) -> dict[str, Any]:
         _required(input_fingerprint, "input_fingerprint")
         timestamp = self._now().isoformat()
         with repository_write(self.database_path) as conn:
             old = self._get(conn, "run_steps", step_id)
+            self._assert_owner(conn, str(old["run_id"]), lease_owner)
             run = self._get(conn, "runs", str(old["run_id"]))
             if run["status"] != "RUNNING":
                 raise DurableRunStateError("cannot start step unless Run is RUNNING")
@@ -288,9 +396,10 @@ class DurableRunRepository:
                 )
             if old["status"] == "COMPLETED":
                 raise DurableRunStateError("completed step cannot restart")
-            if old["status"] != "STALE" and (
-                old["input_fingerprint"] != input_fingerprint
-            ):
+            if old["status"] not in {
+                "STALE", "FAILED_RETRYABLE", "INTERRUPTED",
+                "NEEDS_ATTENTION",
+            } and old["input_fingerprint"] != input_fingerprint:
                 raise DurableRunStateError(
                     "new fingerprint requires explicit invalidation"
                 )
@@ -305,7 +414,16 @@ class DurableRunRepository:
                 """,
                 (input_fingerprint, timestamp, timestamp, step_id),
             )
-            return dict(self._get(conn, "run_steps", step_id))
+            step = self._get(conn, "run_steps", step_id)
+            conn.execute(
+                """INSERT INTO run_step_attempts (
+                    id, run_step_id, attempt_no, input_fingerprint,
+                    status, output_json, error_json, started_at, finished_at
+                ) VALUES (?, ?, ?, ?, 'RUNNING', '{}', '{}', ?, NULL)""",
+                (new_id("attempt"), step_id, int(step["attempt_count"]),
+                 input_fingerprint, timestamp),
+            )
+            return dict(step)
 
     def heartbeat_step(self, step_id: str) -> None:
         with repository_write(self.database_path) as conn:
@@ -324,6 +442,7 @@ class DurableRunRepository:
         status: str,
         output: Mapping[str, Any] | None = None,
         error: Mapping[str, Any] | None = None,
+        lease_owner: str | None = None,
     ) -> dict[str, Any]:
         if status not in _STEP_TERMINAL:
             raise DurableRunStateError(f"invalid step completion status {status}")
@@ -331,13 +450,25 @@ class DurableRunRepository:
         error_json = canonical_json(dict(error or {}))
         with repository_write(self.database_path) as conn:
             old = self._get(conn, "run_steps", step_id)
+            self._assert_owner(conn, str(old["run_id"]), lease_owner)
             if old["status"] != "RUNNING":
                 raise DurableRunStateError("only a RUNNING step may finish")
+            finished = self._now().isoformat()
             conn.execute(
                 """UPDATE run_steps SET status = ?, output_json = ?,
                     error_json = ?, finished_at = ? WHERE id = ?""",
-                (status, output_json, error_json, self._now().isoformat(), step_id),
+                (status, output_json, error_json, finished, step_id),
             )
+            cursor = conn.execute(
+                """UPDATE run_step_attempts SET status = ?, output_json = ?,
+                    error_json = ?, finished_at = ?
+                    WHERE run_step_id = ? AND attempt_no = ?
+                      AND status = 'RUNNING'""",
+                (status, output_json, error_json, finished, step_id,
+                 int(old["attempt_count"])),
+            )
+            if cursor.rowcount != 1:
+                raise DurableRunStateError("current step attempt record is missing")
             return dict(self._get(conn, "run_steps", step_id))
 
     def _assert_work(self, conn: sqlite3.Connection, work_id: str) -> None:

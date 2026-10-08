@@ -517,3 +517,36 @@ async def test_orchestrator_step_blocks_across_multiple_steps() -> None:
     assert result_p == "p"
     assert call_log == ["v", "p"]
 
+
+
+@pytest.mark.asyncio
+async def test_late_hook_failure_does_not_overwrite_user_cancellation() -> None:
+    """A cancel committed during an in-flight hook remains terminal."""
+    controller = AutopilotController()
+    machine = AutopilotStateMachine(project_id="cancel_late")
+    run = controller.start("cancel_late", machine)
+    run.cancel_event = asyncio.Event()
+    started = asyncio.Event()
+    resume_hook = asyncio.Event()
+
+    async def fail_after_cancel(_run):
+        started.set()
+        await resume_hook.wait()
+        raise RuntimeError("late provider failure after cancel")
+
+    task = asyncio.create_task(
+        Orchestrator(
+            hooks=OrchestratorHooks(validate_input=fail_after_cancel),
+        ).run_pipeline(run),
+    )
+    await asyncio.wait_for(started.wait(), timeout=2)
+    controller.cancel("cancel_late", reason="user_requested")
+    resume_hook.set()
+    finished = await asyncio.wait_for(task, timeout=2)
+
+    assert finished.machine.state == AutopilotState.CANCELLED
+    assert run.machine.history[-1].to_state == AutopilotState.CANCELLED
+    assert not any(
+        transition.to_state.value.startswith("FAILED")
+        for transition in run.machine.history
+    )

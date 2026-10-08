@@ -70,9 +70,9 @@ def _run(repo: DurableRunRepository) -> str:
 def test_migration_creates_exact_durable_tables_and_indices(tmp_path: Path) -> None:
     db = tmp_path / "work.sqlite3"
     _work(db)
-    assert WORK_MIGRATIONS[-1].version == 6
+    assert WORK_MIGRATIONS[-1].version == 7
     with repository_read(db) as conn:
-        for name in ("runs", "run_steps", "work_leases"):
+        for name in ("runs", "run_steps", "work_leases", "run_step_attempts"):
             assert conn.execute(
                 "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
                 (name,),
@@ -85,10 +85,10 @@ def test_migration_creates_exact_durable_tables_and_indices(tmp_path: Path) -> N
 
 def test_existing_work_v5_upgrades_without_losing_history(tmp_path: Path) -> None:
     db = tmp_path / "work.sqlite3"
-    _work(db, migrations=WORK_MIGRATIONS[:-1])
+    _work(db, migrations=WORK_MIGRATIONS[:5])
     before = db.stat().st_size
     result = bootstrap_work_database(db, work_id="work_test")
-    assert result.migration.applied_versions == (6,)
+    assert result.migration.applied_versions == (6, 7)
     assert result.migration.backup_path is not None
     assert result.migration.backup_path.exists()
     assert before > 0
@@ -110,6 +110,10 @@ def test_run_and_step_survive_reinstantiation_and_keep_fingerprint(tmp_path: Pat
     clock = Clock()
     repo = DurableRunRepository(db, clock=clock)
     run_id = _run(repo)
+    repo.acquire_lease(
+        work_id="work_test", lease_owner="worker_a",
+        lease_kind="MUTATION", ttl_seconds=60, run_id=run_id,
+    )
     repo.transition_run(run_id, expected_status="PENDING",
                         new_status="RUNNING", lease_owner="worker_a")
     step = repo.create_step(
