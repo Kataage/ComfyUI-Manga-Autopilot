@@ -187,7 +187,13 @@ class WorkPageExportService:
         if type(outer_border) is not bool:
             raise PageExportValidationError("outer_border must be a boolean")
 
-        state = self.pages.get_page(work_id, page_id)
+        # Internal full snapshot is intentional: archived rows participate in
+        # revision guards but never in the active compositing inputs.
+        state = self.pages.get_page(work_id, page_id, include_archived=True)
+        if state["page"]["archived_at"] is not None:
+            raise PageExportValidationError(
+                f"Page {page_id} is archived; unarchive it before PNG export."
+            )
         layout = state["layout"]
         if layout is None:
             raise PageExportValidationError(
@@ -209,16 +215,21 @@ class WorkPageExportService:
             )
 
         slots = {slot["id"]: slot for slot in state["slots"]}
-        if not state["panels"]:
+        active_panels = [
+            panel for panel in state["panels"]
+            if panel["archived_at"] is None
+        ]
+        if not active_panels:
             raise PageExportValidationError(
-                f"Page {page_id}: no persisted Panels available to export"
+                f"Page {page_id}: no active Panels available to export; "
+                "unarchive at least one Panel before exporting."
             )
         artifact_repo = ArtifactRepository(self.storage_root, work_id)
         work = WorkLifecycleRepository(self.storage_root).open_work(work_id)
         layouts: list[PanelLayout] = []
         dependencies: list[dict[str, Any]] = []
         total_input_pixels = 0
-        for panel in state["panels"]:
+        for panel in active_panels:
             panel_id = panel["id"]
             slot_id = panel["layout_slot_id"]
             if not slot_id or slot_id not in slots:
@@ -295,7 +306,7 @@ class WorkPageExportService:
         # sorted by Panel ID for stable provenance independently of page order.
         dependencies_by_order = [
             next(item for item in dependencies if item["panel_id"] == panel["id"])
-            for panel in state["panels"]
+            for panel in active_panels
         ]
 
         # Renderer writes only into a disposable private directory; it never
@@ -333,7 +344,7 @@ class WorkPageExportService:
                 )
             # This compares the same persisted Page snapshot consumed by
             # Page Editor; reject renders overtaken by a concurrent edit.
-            if _snapshot_fingerprint(self.pages.get_page(work_id, page_id)) != (
+            if _snapshot_fingerprint(self.pages.get_page(work_id, page_id, include_archived=True)) != (
                 fingerprint_payload["page_state_sha256"]
             ):
                 raise PageExportConflictError(
@@ -361,12 +372,17 @@ class WorkPageExportService:
                         f"Page {page_id} changed before PNG commit; "
                         "reload and export again."
                     )
+                if current["page"]["archived_at"] is not None:
+                    raise PageExportConflictError(
+                        f"Page {page_id} was archived before PNG commit."
+                    )
                 # Artifacts are immutable, but candidate publication itself
                 # changes implicit selection when no ID was pinned to a Panel.
                 # Verify the selected inputs and unique fallback under the
                 # same lock, without a nested repository/file-system read.
                 for panel, dependency in zip(
-                    current["panels"], dependencies_by_order, strict=True
+                    (p for p in current["panels"] if p["archived_at"] is None),
+                    dependencies_by_order, strict=True
                 ):
                     row = conn.execute(
                         """SELECT artifact_type, scope_type, scope_id,
