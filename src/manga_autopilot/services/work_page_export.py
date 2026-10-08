@@ -422,13 +422,10 @@ class WorkPageExportService:
 
             artifact_id = new_id("artifact")
             relative_path = f"exports/pages/{page_id}_{artifact_id}.png"
-            artifact = artifact_repo.register_local_file(
+            artifact = artifact_repo._register_verified_page_render_file(
                 source_path=result.output_path,
                 relative_path=relative_path,
-                artifact_type="page_render",
-                scope_type="page",
-                scope_id=page_id,
-                mime_type="image/png",
+                page_id=page_id,
                 dependency_fingerprint=fingerprint,
                 artifact_id=artifact_id,
                 commit_guard=guard_source_revision,
