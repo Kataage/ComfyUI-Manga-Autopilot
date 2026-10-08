@@ -14,6 +14,7 @@ from typing import Any
 
 from manga_autopilot.repositories.page_domain import (
     LayoutRepository,
+    PageDomainArchivedError,
     PageDomainNotFoundError,
 )
 from manga_autopilot.repositories.work_lifecycle import WorkLifecycleRepository
@@ -83,22 +84,39 @@ class PageApplicationService:
     def __init__(self, storage_root: str | Path) -> None:
         self.lifecycle = WorkLifecycleRepository(storage_root)
 
-    def list_pages(self, work_id: str) -> list[dict[str, Any]]:
+    def list_pages(
+        self, work_id: str, *, include_archived: bool = False,
+    ) -> list[dict[str, Any]]:
         handle = self.lifecycle.open_work(work_id)
         with repository_read(handle.database_path) as db:
             return [
                 _decode(row) for row in db.execute(
-                    "SELECT * FROM pages ORDER BY order_key, page_number, id"
+                    """SELECT * FROM pages WHERE (? = 1 OR archived_at IS NULL)
+                       ORDER BY order_key, page_number, id""",
+                    (int(include_archived),),
                 )
             ]
 
-    def get_page(self, work_id: str, page_id: str) -> dict[str, Any]:
+    def get_page(
+        self, work_id: str, page_id: str, *, include_archived: bool = False,
+    ) -> dict[str, Any]:
         handle = self.lifecycle.open_work(work_id)
         with repository_read(handle.database_path) as db:
             # A stable read snapshot shared by all Page projection queries.
             db.execute("BEGIN")
             try:
-                return read_page_state_in_transaction(db, handle.work_id, page_id)
+                state = read_page_state_in_transaction(db, handle.work_id, page_id)
+                if not include_archived:
+                    if state["page"]["archived_at"] is not None:
+                        raise PageDomainArchivedError(
+                            f"Page {page_id} is archived; unarchive it before editing "
+                            "or request include_archived=1 for read-only recovery."
+                        )
+                    state["panels"] = [
+                        panel for panel in state["panels"]
+                        if panel["archived_at"] is None
+                    ]
+                return state
             finally:
                 db.rollback()
 

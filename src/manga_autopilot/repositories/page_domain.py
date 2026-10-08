@@ -32,6 +32,10 @@ class PageDomainOwnershipError(PersistenceError):
     """An entity reference crosses Page or Layout ownership boundaries."""
 
 
+class PageDomainArchivedError(PageDomainOwnershipError):
+    """Archived Page cannot be edited through active Page Editor commands."""
+
+
 class PageDomainCandidateSelectionError(PageDomainOwnershipError):
     """A Panel's selected candidate is not its own current image Artifact."""
 
@@ -463,6 +467,11 @@ class LayoutRepository:
         attrs = _values(changes, _LAYOUT_FIELDS)
         with repository_write(self.database_path) as conn:
             layout = _read_row(conn, "layout_instances", _id(layout_id, "layout_id"))
+            owning_page = _read_row(conn, "pages", layout["page_id"])
+            if owning_page["archived_at"] is not None:
+                raise PageDomainArchivedError(
+                    f"Page {layout['page_id']} is archived; unarchive before editing."
+                )
             _positive(expected_revision, "expected_revision")
             assert_expected_revision(
                 entity_type="layout_instances",
@@ -666,6 +675,7 @@ class PanelRepository:
 
 __all__ = [
     "LayoutRepository",
+    "PageDomainArchivedError",
     "PageDomainCandidateSelectionError",
     "PageDomainNotFoundError",
     "PageDomainOwnershipError",
