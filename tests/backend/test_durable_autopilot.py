@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections import Counter
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -348,3 +349,43 @@ def test_append_only_step_attempt_receipts_and_foreign_keys(tmp_path: Path) -> N
             "SELECT COUNT(*) FROM run_step_attempts WHERE run_step_id = ?",
             (step["id"],),
         ).fetchone()[0] == 2
+
+
+@pytest.mark.asyncio
+async def test_long_running_hook_renews_the_same_work_lease(
+    tmp_path: Path,
+) -> None:
+    db = work(tmp_path)
+
+    class Clock:
+        moment = datetime(2026, 10, 9, tzinfo=timezone.utc)
+
+        def __call__(self):
+            return self.moment
+
+    clock = Clock()
+    repo = DurableRunRepository(db, clock=clock)
+    run_id = start(repo)
+    observations = []
+
+    async def slow_render(_run):
+        before = repo.inspect_lease("work_246")
+        assert before is not None
+        clock.moment += timedelta(seconds=4)
+        await asyncio.sleep(2.3)
+        after = repo.inspect_lease("work_246")
+        assert after is not None
+        observations.extend((before["expires_at"], after["expires_at"]))
+        return {"rendered": True}
+
+    result = await DurableAutopilotOrchestrator(
+        repository=repo, work_id="work_246",
+        hooks=OrchestratorHooks(render_pages=slow_render),
+        lease_ttl_seconds=6,
+    ).execute(
+        run_id, input_payload={}, step_inputs={}, lease_owner="heartbeat_owner",
+    )
+    assert result.machine.state.value == "COMPLETED"
+    assert len(observations) == 2
+    assert observations[1] > observations[0]
+    assert repo.inspect_lease("work_246") is None
