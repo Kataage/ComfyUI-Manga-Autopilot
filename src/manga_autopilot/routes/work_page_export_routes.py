@@ -49,12 +49,25 @@ async def _run_page_export(
         return await asyncio.shield(worker)
     except asyncio.CancelledError:
         cancelled.set()
-        # Do not abandon an unowned thread still holding the render slot or
-        # writing Work files. Let it complete cleanup before this task exits.
-        try:
-            await asyncio.shield(worker)
-        except Exception:
-            pass
+        # Cancellation is repeatable: a second task.cancel() while this
+        # coroutine drains the thread must not detach the still-running
+        # renderer. Keep the worker owned until its temp files and render
+        # semaphore have been released (the worker owns both).
+        while not worker.done():
+            try:
+                await asyncio.shield(worker)
+            except asyncio.CancelledError:
+                # A subsequent cancellation targets this HTTP task, not the
+                # protected worker. Do not return while its IO is in flight.
+                continue
+            except Exception:
+                # A failed worker is finished; preserve the original caller
+                # cancellation instead of converting it to an HTTP error.
+                break
+        if worker.done() and not worker.cancelled():
+            # Observe a late worker failure even if repeated cancellations
+            # raced with completion; avoids an unhandled-task-exception log.
+            worker.exception()
         raise
 
 
