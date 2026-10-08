@@ -504,7 +504,8 @@ export function mountPageEditor(container, opts = {}) {
   loadBtn.addEventListener("click", loadWorkPages);
   pageSelect.addEventListener("change", () => loadPage(pageSelect.value));
   reloadBtn.addEventListener("click", () => {
-    if (currentPageId) loadPage(currentPageId, true);
+    if (currentPageId) return loadPage(currentPageId, true);
+    return undefined;
   });
   saveBtn.addEventListener("click", async () => {
     if (!dirty || busy || stale || !snapshot?.layout) return;
