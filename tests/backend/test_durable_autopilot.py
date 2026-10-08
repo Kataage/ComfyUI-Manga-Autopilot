@@ -369,28 +369,43 @@ async def test_long_running_hook_renews_the_same_work_lease(
     clock = Clock()
     repo = DurableRunRepository(db, clock=clock)
     run_id = start(repo)
-    observations = []
+    entered = threading.Event()
+    release = threading.Event()
 
     def slow_render(_run):
-        before = repo.inspect_lease("work_246")
-        assert before is not None
-        clock.moment += timedelta(seconds=4)
-        time.sleep(2.3)
-        after = repo.inspect_lease("work_246")
-        assert after is not None
-        observations.extend((before["expires_at"], after["expires_at"]))
+        entered.set()
+        assert release.wait(timeout=30), "heartbeat test did not release worker"
         return {"rendered": True}
 
-    result = await DurableAutopilotOrchestrator(
+    task = asyncio.create_task(DurableAutopilotOrchestrator(
         repository=repo, work_id="work_246",
         hooks=OrchestratorHooks(render_pages=slow_render),
         lease_ttl_seconds=6,
     ).execute(
         run_id, input_payload={}, step_inputs={}, lease_owner="heartbeat_owner",
-    )
+    ))
+    try:
+        for _ in range(600):
+            if entered.is_set():
+                break
+            await asyncio.sleep(0.05)
+        assert entered.is_set(), "render thread never started"
+        before = repo.inspect_lease("work_246")
+        assert before is not None
+        clock.moment += timedelta(seconds=4)
+        after = None
+        for _ in range(600):
+            after = repo.inspect_lease("work_246")
+            if after is not None and after["expires_at"] > before["expires_at"]:
+                break
+            await asyncio.sleep(0.05)
+        assert after is not None
+        assert after["expires_at"] > before["expires_at"]
+        assert not task.done()
+    finally:
+        release.set()
+    result = await asyncio.wait_for(task, timeout=30)
     assert result.machine.state.value == "COMPLETED"
-    assert len(observations) == 2
-    assert observations[1] > observations[0]
     assert repo.inspect_lease("work_246") is None
 
 
@@ -622,6 +637,13 @@ async def test_failed_work_lease_heartbeat_drains_sync_hook_before_interrupting(
 
     class BrokenRenewalRepository(DurableRunRepository):
         def heartbeat_lease(self, *, work_id, lease_owner, ttl_seconds):
+            # Under concurrent Windows CI load, the guardian can tick
+            # before the sync thread starts; inject loss only IN-FLIGHT.
+            if not started.is_set():
+                return super().heartbeat_lease(
+                    work_id=work_id, lease_owner=lease_owner,
+                    ttl_seconds=ttl_seconds,
+                )
             failed.set()
             raise OSError("injected lease renewal IO failure")
 
@@ -646,12 +668,20 @@ async def test_failed_work_lease_heartbeat_drains_sync_hook_before_interrupting(
     ).execute(run_id, input_payload={}, step_inputs={},
               lease_owner="failed_guardian"))
     try:
-        assert await asyncio.to_thread(started.wait, 10)
+        for _ in range(600):
+            if started.is_set():
+                break
+            await asyncio.sleep(0.05)
+        assert started.is_set(), "generation thread never started"
         step = next(
             x for x in competitor.list_steps(run_id)
             if x["step_key"] == "generate_panels"
         )
-        assert await asyncio.to_thread(failed.wait, 10)
+        for _ in range(600):
+            if failed.is_set():
+                break
+            await asyncio.sleep(0.05)
+        assert failed.is_set(), "injected guardian failure not observed"
         await asyncio.sleep(0.05)
         assert not task.done(), "guardian failure detached the local OS worker"
         assert not worker_finished.is_set()
@@ -935,6 +965,9 @@ async def test_failed_step_heartbeat_stops_guardian_and_does_not_claim_success(
 
     class FailStepHeartbeatRepository(DurableRunRepository):
         def heartbeat_step(self, step_id, *, lease_owner):
+            # Fault starts only once the local worker has entered its hook.
+            if not started.is_set():
+                return super().heartbeat_step(step_id, lease_owner=lease_owner)
             attempted.set()
             raise OSError("injected RunStep heartbeat storage failure")
 
@@ -957,8 +990,16 @@ async def test_failed_step_heartbeat_stops_guardian_and_does_not_claim_success(
     ).execute(run_id, input_payload={}, step_inputs={},
               lease_owner="failed_step_heartbeat"))
     try:
-        assert await asyncio.to_thread(started.wait, 10)
-        assert await asyncio.to_thread(attempted.wait, 10)
+        for _ in range(600):
+            if started.is_set():
+                break
+            await asyncio.sleep(0.05)
+        assert started.is_set(), "generation thread never started"
+        for _ in range(600):
+            if attempted.is_set():
+                break
+            await asyncio.sleep(0.05)
+        assert attempted.is_set(), "injected Step heartbeat failure not observed"
         await asyncio.sleep(0.05)
         assert not task.done()
         assert not completed.is_set()
