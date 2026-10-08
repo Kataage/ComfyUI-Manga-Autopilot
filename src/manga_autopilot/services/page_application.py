@@ -14,8 +14,8 @@ from typing import Any
 
 from manga_autopilot.repositories.page_domain import (
     LayoutRepository,
-    PageDomainNotFoundError,
     PageDomainArchivedError,
+    PageDomainNotFoundError,
 )
 from manga_autopilot.repositories.work_lifecycle import WorkLifecycleRepository
 from manga_autopilot.storage.repository import repository_read
