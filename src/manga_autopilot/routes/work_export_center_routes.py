@@ -119,13 +119,15 @@ def _error(exc: Exception) -> web.Response:
 
 def _present(row: dict[str, Any], freshness: dict[str, Any]) -> dict[str, Any]:
     return {
+        **{
+            field: row[field]
+            for field in (
+                "id", "artifact_type", "scope_type", "scope_id", "relative_path",
+                "mime_type", "sha256", "file_size", "width", "height",
+                "dependency_fingerprint", "created_at", "status",
+            )
+        },
         **freshness,
-        field: row[field]
-        for field in (
-            "id", "artifact_type", "scope_type", "scope_id", "relative_path",
-            "mime_type", "sha256", "file_size", "width", "height",
-            "dependency_fingerprint", "created_at", "status",
-        )
     }
 
 
