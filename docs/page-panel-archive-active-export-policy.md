@@ -38,6 +38,33 @@ without partial history or revision changes. After an explicit revision-guarded
 Panel unarchive, that Panel can again participate in active binding updates.
 This is the #344 closure of the read-model / command-model gap in #337.
 
+## Atomic layout save acknowledgement (#350)
+
+The successful `PATCH /pages/{page_id}/layout` response contains the persisted
+Page, LayoutInstance, LayoutSlots and **active Panels** as they stood **within
+the same `BEGIN IMMEDIATE` transaction that accepted the save**. The
+repository validates ownership, Page/Panel archived status, expected Layout/
+Slot/Panel revisions, then applies the batch and reads the resulting Page
+projection while it still owns the write lock. A no-op command produces that
+same transaction-owned projection without creating an extra Work commit.
+Repository clients that request only the Layout row retain their previous
+return-value contract.
+
+An independent writer can archive the Page or edit Layout/Slots/Panel bindings
+immediately *after* that commit and *before* the PATCH response reaches the
+browser. Such a later change must not retroactively turn an accepted save
+into HTTP `409 page_archived` or `409 revision_conflict`; nor may its
+newer state leak into the prior save's success acknowledgement. A subsequent
+`GET` may correctly show the later change (or reject an archived Page).
+Conversely, an archive or revision conflict encountered **under the original
+write lock before mutation** still returns the existing explicit HTTP 409,
+with no partial batch or new Work history.
+
+The response snapshot is fully materialized before transaction commit: a
+projection/decode failure rolls the write back instead of causing a
+post-commit failure. This preserves the #344 archive guards and revision/
+invalidation provenance without importing legacy project JSON.
+
 Both Page Editor and Export Center rely on the same active Page list
 endpoint for selectors, so archived Pages are never silently offered as
 ordinary editable/exportable Pages. Historical exports remain visible

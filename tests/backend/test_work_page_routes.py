@@ -496,3 +496,175 @@ async def test_archived_panel_binding_is_rejected_atomically_and_unarchive_recov
     reopened = await restarted.get(prefix + "/page_001")
     assert reopened.status == 200
     assert await reopened.json() == saved
+
+
+
+async def test_layout_patch_ack_is_pre_archive_snapshot_even_if_page_archived_after_commit(
+    api, monkeypatch,
+):
+    client, prefix, _, handle = api
+    pages = PageRepository(handle.database_path)
+    layout_repo = LayoutRepository(handle.database_path)
+    _, original_state = await _state(client, prefix)
+    original_revision = original_state["layout"]["revision"]
+    original_page = original_state["page"]
+    original_update = LayoutRepository.update_layout
+    archive_events = []
+
+    def commit_then_archive(self, layout_id, **kwargs):
+        # Inject a *real* later independent transaction after the first
+        # repository write commits but before the HTTP route constructs its
+        # response. The former service post-commit get_page() returns HTTP 409.
+        command_result = original_update(self, layout_id, **kwargs)
+        current_page = pages.get_page("page_001")
+        archived = pages.update_page(
+            "page_001", expected_revision=current_page["revision"],
+            archived_at="2026-10-08T14:00:00Z",
+        )
+        archive_events.append(archived)
+        return command_result
+
+    monkeypatch.setattr(LayoutRepository, "update_layout", commit_then_archive)
+    with repository_read(handle.database_path) as db:
+        commits_before = db.execute("SELECT COUNT(*) FROM commits").fetchone()[0]
+    response = await client.patch(
+        prefix + "/page_001/layout",
+        json={
+            "expected_revision": original_revision,
+            "geometry_json": {"width": 1750, "height": 2100},
+        },
+    )
+    assert response.status == 200, await response.text()
+    accepted = await response.json()
+    assert len(archive_events) == 1
+    assert accepted["page"] == original_page
+    assert accepted["page"]["archived_at"] is None
+    assert accepted["layout"]["revision"] == original_revision + 1
+    assert accepted["layout"]["geometry_json"] == {
+        "width": 1750, "height": 2100,
+    }
+    assert accepted["work_id"] == "work_api_001"
+    assert [panel["id"] for panel in accepted["panels"]] == [
+        "panel_001", "panel_002",
+    ]
+    assert accepted["layout"]["updated_commit_seq"] < (
+        archive_events[0]["updated_commit_seq"]
+    )
+    with repository_read(handle.database_path) as db:
+        # Exactly one Layout commit, followed by one Page archive commit.
+        assert db.execute("SELECT COUNT(*) FROM commits").fetchone()[0] == (
+            commits_before + 2
+        )
+        revisions = [
+            dict(r) for r in db.execute(
+                """SELECT entity_type, entity_id, commit_seq
+                   FROM entity_revisions
+                   WHERE commit_seq > ? ORDER BY commit_seq""",
+                (accepted["layout"]["created_commit_seq"],),
+            )
+        ]
+    assert any(row["entity_type"] == "layout_instance" for row in revisions)
+    assert any(row["entity_type"] == "page" for row in revisions)
+
+    normal = await client.get(prefix + "/page_001")
+    assert normal.status == 409
+    assert (await normal.json())["error"] == "page_archived"
+    archived_resp = await client.get(
+        prefix + "/page_001?include_archived=1"
+    )
+    assert archived_resp.status == 200
+    latest = await archived_resp.json()
+    assert latest["layout"] == accepted["layout"]
+    assert latest["page"]["archived_at"] is not None
+    assert latest["page"]["updated_commit_seq"] > (
+        accepted["layout"]["updated_commit_seq"]
+    )
+    assert layout_repo.get_layout("layout_001")["revision"] == original_revision + 1
+
+
+async def test_layout_patch_ack_excludes_later_layout_slot_and_panel_commit(
+    api, monkeypatch,
+):
+    client, prefix, _, handle = api
+    _, before = await _state(client, prefix)
+    original_update = LayoutRepository.update_layout
+    updates = []
+
+    def commit_then_edit_again(self, layout_id, **kwargs):
+        first_snapshot = original_update(self, layout_id, **kwargs)
+        # A second genuine Work write lands after the first commit. It may
+        # update Layout, Slot and Panel in the same transaction, independently
+        # of the first caller's already accepted edit.
+        latest_layout = LayoutRepository(handle.database_path).get_layout(layout_id)
+        latest_slot = LayoutRepository(handle.database_path).get_slot("slot_001")
+        latest_panel = PanelRepository(handle.database_path).get_panel("panel_001")
+        original_update(
+            self, layout_id, expected_revision=latest_layout["revision"],
+            geometry_json={"width": 1999, "height": 2000},
+            slot_updates=[{
+                "id": "slot_001",
+                "expected_revision": latest_slot["revision"],
+                "geometry_json": {"x": 90, "y": 90, "width": 200, "height": 200},
+            }],
+            panel_bindings=[{
+                "id": "panel_001",
+                "expected_revision": latest_panel["revision"],
+                "layout_slot_id": "slot_001",
+            }],
+        )
+        updates.append(True)
+        return first_snapshot
+
+    monkeypatch.setattr(LayoutRepository, "update_layout", commit_then_edit_again)
+    with repository_read(handle.database_path) as db:
+        before_commits = db.execute("SELECT COUNT(*) FROM commits").fetchone()[0]
+    result = await client.patch(
+        prefix + "/page_001/layout",
+        json={
+            "expected_revision": before["layout"]["revision"],
+            "geometry_json": {"width": 1700, "height": 2100},
+            "slot_updates": [{
+                "id": "slot_001", "expected_revision": before["slots"][0]["revision"],
+                "geometry_json": {"x": 70, "y": 45, "width": 300, "height": 300},
+            }],
+            "panel_bindings": [{
+                "id": "panel_001",
+                "expected_revision": before["panels"][0]["revision"],
+                "layout_slot_id": "slot_002",
+            }],
+        },
+    )
+    assert result.status == 200, await result.text()
+    accepted = await result.json()
+    assert updates == [True]
+    assert accepted["layout"]["geometry_json"]["width"] == 1700
+    assert accepted["layout"]["revision"] == before["layout"]["revision"] + 1
+    assert accepted["slots"][0]["geometry_json"]["x"] == 70
+    assert accepted["slots"][0]["revision"] == before["slots"][0]["revision"] + 1
+    assert accepted["panels"][0]["layout_slot_id"] == "slot_002"
+    assert accepted["panels"][0]["revision"] == before["panels"][0]["revision"] + 1
+    assert accepted["panels"][0]["action_json"] == before["panels"][0]["action_json"]
+    assert accepted["page"] == before["page"]
+
+    fresh_resp, latest = await _state(client, prefix)
+    assert fresh_resp.status == 200
+    assert latest["layout"]["geometry_json"]["width"] == 1999
+    assert latest["slots"][0]["geometry_json"]["x"] == 90
+    assert latest["panels"][0]["layout_slot_id"] == "slot_001"
+    assert latest["layout"]["revision"] == accepted["layout"]["revision"] + 1
+    assert latest["slots"][0]["revision"] == accepted["slots"][0]["revision"] + 1
+    assert latest["panels"][0]["revision"] == accepted["panels"][0]["revision"] + 1
+    assert latest["layout"]["updated_commit_seq"] > (
+        accepted["layout"]["updated_commit_seq"]
+    )
+    with repository_read(handle.database_path) as db:
+        assert db.execute("SELECT COUNT(*) FROM commits").fetchone()[0] == (
+            before_commits + 2
+        )
+        affected = {
+            row["target_type"] for row in db.execute(
+                "SELECT target_type FROM invalidations WHERE created_commit_seq = ?",
+                (accepted["layout"]["updated_commit_seq"],),
+            )
+        }
+    assert {"page_render", "page_export"} <= affected

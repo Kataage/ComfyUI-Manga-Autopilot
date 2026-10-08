@@ -9,7 +9,7 @@ Downstream invalidations and entity-revision snapshots belong to issue #236.
 from __future__ import annotations
 
 import sqlite3
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -460,13 +460,18 @@ class LayoutRepository:
         expected_revision: int,
         slot_updates: Sequence[Mapping[str, Any]] = (),
         panel_bindings: Sequence[Mapping[str, Any]] = (),
+        _read_snapshot: Callable[[sqlite3.Connection], dict[str, Any]] | None = None,
         **changes: Any,
     ) -> dict[str, Any]:
-        """Atomically mutate selected geometry and Panel-Slot bindings.
+        """Atomically mutate geometry/bindings and optionally read its result.
 
-        Every slot update needs id + expected_revision. Optional layout_id
-        and page_id are explicit ownership assertions (never mutable).
-        Any failed ownership check or stale revision rolls back all changes.
+        The internal read-only _read_snapshot callback runs under this same
+        BEGIN IMMEDIATE write transaction, *after* all changes (also on no-op)
+        and *before* commit. It must not open another DB connection or write.
+        This gives HTTP a command-owned acknowledgement, not a later writer's
+        state or a false post-commit 409 after an unrelated Page archive.
+        Existing repository callers still receive the updated Layout row.
+        Every failed precondition or snapshot read rolls back all changes.
         """
         attrs = _values(changes, _LAYOUT_FIELDS)
         with repository_write(self.database_path) as conn:
@@ -566,7 +571,7 @@ class LayoutRepository:
                 for pid, _, slot_id in staged_bindings
             )
             if not layout_changed and not slots_changed and not bindings_changed:
-                return layout
+                return _read_snapshot(conn) if _read_snapshot is not None else layout
             seq, at = _commit(conn, "update_layout")
             if layout_changed:
                 layout, _ = _patch(
@@ -586,7 +591,7 @@ class LayoutRepository:
                     expected_revision=rev, attrs={"layout_slot_id": target_slot},
                     commit_seq=seq, timestamp=at,
                 )
-            return layout
+            return _read_snapshot(conn) if _read_snapshot is not None else layout
 
 
 class PanelRepository:
