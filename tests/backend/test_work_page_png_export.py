@@ -903,3 +903,135 @@ async def test_offloaded_http_renderer_error_releases_busy_slot(api, monkeypatch
     monkeypatch.setattr(module, "render_page_to_png", original)
     response, result = await _export(client, base)
     assert response.status == 201, result
+
+
+async def test_page_png_attests_verified_private_candidate_bytes_not_swapped_live_path(
+    api, monkeypatch,
+):
+    client, base, _, handle, _, _, _, artifacts = api
+    import manga_autopilot.services.work_page_export as exporter
+    from manga_autopilot.storage import repository_read
+
+    original_renderer = exporter.render_page_to_png
+    candidate_path = handle.root / "assets/panels/candidate_main.png"
+    original_candidate = candidate_path.read_bytes()
+    original_sha = hashlib.sha256(original_candidate).hexdigest()
+    blue_candidate = _png((10, 20, 240))
+    snapshots = []
+
+    def swapped_during_render(*args, **kwargs):
+        panel_layouts = args[1]
+        assert len(panel_layouts) == 1
+        pinned_path = Path(panel_layouts[0].image_path)
+        assert pinned_path != candidate_path
+        assert pinned_path.parent != candidate_path.parent
+        assert pinned_path.read_bytes() == original_candidate
+        snapshots.append(pinned_path)
+        # The old exporter passed the mutable registered pathname to Pillow
+        # and could certify blue rendered pixels against red source SHA256.
+        candidate_path.write_bytes(blue_candidate)
+        try:
+            return original_renderer(*args, **kwargs)
+        finally:
+            candidate_path.write_bytes(original_candidate)
+
+    monkeypatch.setattr(exporter, "render_page_to_png", swapped_during_render)
+    response, exported = await _export(client, base)
+    assert response.status == 201, exported
+    assert len(snapshots) == 1
+    assert not snapshots[0].exists(), "disposable input snapshots must be removed"
+    assert candidate_path.read_bytes() == original_candidate
+    assert artifacts.verify_registered_file("candidate_main")["sha256"] == original_sha
+
+    with Image.open(handle.root / exported["relative_path"]) as png:
+        assert png.getpixel((50, 45)) == (235, 15, 25)
+        assert png.getpixel((50, 45)) != (10, 20, 240)
+
+    with repository_read(handle.database_path) as db:
+        commit = db.execute(
+            "SELECT operation_type, reason FROM commits WHERE commit_seq = ?",
+            (artifacts.get(exported["artifact_id"])["created_commit_seq"],),
+        ).fetchone()
+    assert commit["operation_type"] == "register_verified_page_render_v1"
+    import json
+    proof = json.loads(commit["reason"])
+    assert proof["source_fingerprint_payload"]["panel_artifacts"][0]["sha256"] == (
+        original_sha
+    )
+
+    current = await client.get(
+        "/manga_autopilot/api/v2/works/work_export_1/exports/"
+        + exported["artifact_id"] + "/png?require_current=1"
+    )
+    assert current.status == 200
+    assert current.headers["X-Work-Export-Freshness"] == "CURRENT"
+    assert await current.read() == (handle.root / exported["relative_path"]).read_bytes()
+
+
+async def test_candidate_replaced_after_selection_before_snapshot_is_rejected(
+    api, monkeypatch,
+):
+    client, base, _, handle, _, _, _, artifacts = api
+    import manga_autopilot.services.work_page_export as exporter
+
+    candidate_path = handle.root / "assets/panels/candidate_main.png"
+    red_bytes = candidate_path.read_bytes()
+    original_copy = exporter._copy_verified_candidate_snapshot
+    invoked = []
+
+    def swap_before_copy(source, destination, artifact, **kwargs):
+        assert source == candidate_path
+        candidate_path.write_bytes(_png((10, 20, 240)))
+        try:
+            invoked.append(True)
+            return original_copy(source, destination, artifact, **kwargs)
+        finally:
+            candidate_path.write_bytes(red_bytes)
+
+    monkeypatch.setattr(exporter, "_copy_verified_candidate_snapshot", swap_before_copy)
+    response, payload = await _export(client, base)
+    assert response.status == 422, payload
+    assert payload["error"] == "export_precondition_failed"
+    assert "copied input" in payload["message"]
+    assert invoked == [True]
+    assert artifacts.list_for_scope("page", "page_main") == []
+    assert candidate_path.read_bytes() == red_bytes
+    assert artifacts.verify_registered_file("candidate_main")["status"] == "READY"
+    assert not list((handle.root / "assets/temp").glob("page-export-*"))
+    export_dir = handle.root / "exports/pages"
+    assert not export_dir.exists() or not list(export_dir.glob("*.png"))
+
+
+async def test_candidate_snapshot_byte_budget_rejects_oversized_record_before_copy(
+    api, monkeypatch,
+):
+    client, base, _, handle, _, _, _, artifacts = api
+    from dataclasses import replace
+
+    import manga_autopilot.services.page_png_budget as budgets
+    import manga_autopilot.services.work_page_export as exporter
+
+    candidate_bytes = (handle.root / "assets/panels/candidate_main.png").stat().st_size
+    assert candidate_bytes > 1
+    original_budget = budgets.PROFILES["screen"]
+    monkeypatch.setitem(
+        budgets.PROFILES, "screen",
+        replace(
+            original_budget,
+            max_input_bytes=candidate_bytes - 1,
+            max_total_input_bytes=candidate_bytes - 1,
+        ),
+    )
+    original_snapshot = exporter._copy_verified_candidate_snapshot
+    seen = []
+
+    def unexpected_copy(*args, **kwargs):
+        seen.append(True)
+        return original_snapshot(*args, **kwargs)
+
+    monkeypatch.setattr(exporter, "_copy_verified_candidate_snapshot", unexpected_copy)
+    response, payload = await _export(client, base)
+    assert response.status == 422, payload
+    assert "encoded Candidate input budget" in payload["message"]
+    assert seen == []
+    assert artifacts.list_for_scope("page", "page_main") == []

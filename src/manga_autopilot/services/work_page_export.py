@@ -10,15 +10,18 @@ from __future__ import annotations
 
 import hashlib
 import math
+import os
+import stat
 import tempfile
 import threading
 from pathlib import Path
 from typing import Any
 
+from PIL import Image, UnidentifiedImageError
+
 from manga_autopilot.models.panel import PanelLayout
 from manga_autopilot.primitives import canonical_json, new_id
 from manga_autopilot.repositories import (
-    ArtifactIntegrityError,
     ArtifactNotFoundError,
     ArtifactRepository,
     PageDomainNotFoundError,
@@ -30,6 +33,7 @@ from manga_autopilot.services.page_application import (
 )
 from manga_autopilot.services.page_png_budget import (
     DEFAULT_PROFILE,
+    PNG_IO_CHUNK_BYTES,
     resolve_page_png_budget,
 )
 from manga_autopilot.services.page_renderer import render_page_to_png
@@ -114,14 +118,86 @@ def _selected_artifact(
             f"Panel {panel_id}: Artifact {artifact['id']} is not a current "
             "READY image owned by this Panel."
         )
-    try:
-        repository.verify_registered_file(str(artifact["id"]))
-    except (ArtifactIntegrityError, ValueError, FileNotFoundError) as exc:
-        raise PageExportValidationError(
-            f"Panel {panel_id}: registered Artifact {artifact['id']} file is "
-            f"missing, unsafe, or corrupt: {exc}"
-        ) from exc
+    # The actual on-disk integrity check happens *after* the named byte and
+    # decoded-pixel budgets are checked, when a verified private input copy is
+    # materialized for Pillow. Avoid an unbounded preliminary hash read of a
+    # very large (or currently swapped) registered Candidate pathname.
     return artifact
+
+
+def _copy_verified_candidate_snapshot(
+    source: Path, destination: Path, artifact: dict[str, Any],
+    *, max_bytes: int, cancel_event: threading.Event | None,
+) -> None:
+    """Materialize exactly the attested Candidate bytes for Pillow's later open.
+
+    The renderer must never re-open a mutable registered Candidate path.
+    The private disposable copy is hash-, length-, format- and size-verified
+    before it becomes an input; copying is bounded and uses a pinned regular
+    non-symlink descriptor. Failure leaves only TemporaryDirectory-owned bytes.
+    """
+    expected_bytes = artifact["file_size"]
+    if (
+        type(expected_bytes) is not int or expected_bytes < 1
+        or expected_bytes > max_bytes
+    ):
+        raise PageExportValidationError(
+            f"Panel Candidate {artifact['id']}: stored image file exceeds "
+            f"the encoded source input budget of {max_bytes:,} bytes"
+        )
+    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0)
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(source, flags)
+    except OSError as exc:
+        raise PageExportValidationError(
+            f"Panel Candidate {artifact['id']}: source image is missing or unsafe: {exc}"
+        ) from exc
+    try:
+        with os.fdopen(descriptor, "rb") as stream, destination.open("xb") as output:
+            if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
+                raise PageExportValidationError(
+                    f"Panel Candidate {artifact['id']}: source image is not a regular file"
+                )
+            digest = hashlib.sha256()
+            total = 0
+            while chunk := stream.read(PNG_IO_CHUNK_BYTES):
+                if cancel_event is not None and cancel_event.is_set():
+                    raise PageExportConflictError("Page PNG export cancelled while copying inputs")
+                total += len(chunk)
+                if total > expected_bytes or total > max_bytes:
+                    raise PageExportValidationError(
+                        f"Panel Candidate {artifact['id']}: corrupt or modified "
+                        "copied input exceeds recorded length or encoded source budget"
+                    )
+                digest.update(chunk)
+                output.write(chunk)
+            if total != expected_bytes or digest.hexdigest() != artifact["sha256"]:
+                raise PageExportValidationError(
+                    f"Panel Candidate {artifact['id']}: corrupt or modified "
+                    "copied input hash/size differs from the verified Work Artifact; "
+                    "retry export"
+                )
+    except OSError as exc:
+        raise PageExportValidationError(
+            f"Panel Candidate {artifact['id']}: cannot copy source image: {exc}"
+        ) from exc
+
+    formats = {"image/png": "PNG", "image/jpeg": "JPEG", "image/webp": "WEBP"}
+    try:
+        with Image.open(destination) as image:
+            if (image.format != formats.get(artifact["mime_type"])
+                or image.size != (artifact["width"], artifact["height"])):
+                raise PageExportValidationError(
+                    f"Panel Candidate {artifact['id']}: copied input image format "
+                    "or dimensions differ from the registered Artifact"
+                )
+            image.verify()
+    except (UnidentifiedImageError, OSError, SyntaxError, Image.DecompressionBombError) as exc:
+        raise PageExportValidationError(
+            f"Panel Candidate {artifact['id']}: copied source image is corrupt or unsafe"
+        ) from exc
 
 
 def _snapshot_fingerprint(state: dict[str, Any]) -> str:
@@ -241,8 +317,10 @@ class WorkPageExportService:
         artifact_repo = ArtifactRepository(self.storage_root, work_id)
         work = WorkLifecycleRepository(self.storage_root).open_work(work_id)
         layouts: list[PanelLayout] = []
+        input_artifacts: list[dict[str, Any]] = []
         dependencies: list[dict[str, Any]] = []
         total_input_pixels = 0
+        total_input_bytes = 0
         for panel in active_panels:
             panel_id = panel["id"]
             slot_id = panel["layout_slot_id"]
@@ -273,6 +351,12 @@ class WorkPageExportService:
                 )
             input_area = iw * ih
             total_input_pixels += input_area
+            encoded_bytes = artifact["file_size"]
+            if type(encoded_bytes) is not int or encoded_bytes < 1:
+                raise PageExportValidationError(
+                    f"Panel {panel_id}: selected Artifact has invalid stored byte size"
+                )
+            total_input_bytes += encoded_bytes
             if input_area > budget.max_input_pixels or (
                 total_input_pixels > budget.max_total_input_pixels
             ):
@@ -281,6 +365,15 @@ class WorkPageExportService:
                     "registered candidate image input pixel budget exceeded "
                     f"for export_profile {budget.name!r}. Use smaller images "
                     "or the explicit 'print' profile."
+                )
+            if encoded_bytes > budget.max_input_bytes or (
+                total_input_bytes > budget.max_total_input_bytes
+            ):
+                raise PageExportValidationError(
+                    f"Work {work_id}, Page {page_id}, Panel {panel_id}: "
+                    "encoded Candidate input budget exceeded for "
+                    f"export_profile {budget.name!r}; use smaller images "
+                    "or the explicit print profile."
                 )
             image_path = assert_managed_path(
                 work.root.joinpath(*artifact["relative_path"].split("/")),
@@ -293,6 +386,7 @@ class WorkPageExportService:
                     z_index=panel["order_index"], image_path=str(image_path),
                 )
             )
+            input_artifacts.append(artifact)
             dependencies.append({
                 "panel_id": panel_id,
                 "panel_revision": panel["revision"],
@@ -333,9 +427,32 @@ class WorkPageExportService:
         )
         temp_root.mkdir(parents=True, exist_ok=True)
         with tempfile.TemporaryDirectory(prefix="page-export-", dir=temp_root) as render_dir:
+            # Every image path supplied to Pillow points to bytes already
+            # independently pinned and verified from the Candidate Artifact.
+            # A local actor changing a registered path during rendering can
+            # neither alter these disposable private source snapshots nor
+            # substitute pixels for the SHA256 attested in this Work commit.
+            pinned_layouts: list[PanelLayout] = []
+            for index, (panel_layout, artifact) in enumerate(
+                zip(layouts, input_artifacts, strict=True)
+            ):
+                check_not_cancelled()
+                suffix = {
+                    "image/png": ".png", "image/jpeg": ".jpg",
+                    "image/webp": ".webp",
+                }[artifact["mime_type"]]
+                verified_path = Path(render_dir) / f"input_{index:06d}{suffix}"
+                _copy_verified_candidate_snapshot(
+                    Path(panel_layout.image_path), verified_path, artifact,
+                    max_bytes=budget.max_input_bytes, cancel_event=cancel_event,
+                )
+                pinned_layouts.append(
+                    panel_layout.model_copy(update={"image_path": str(verified_path)})
+                )
+            check_not_cancelled()
             result = render_page_to_png(
                 f"page_{state['page']['page_number']}",
-                layouts,
+                pinned_layouts,
                 output_dir=render_dir,
                 page_width=width,
                 page_height=height,

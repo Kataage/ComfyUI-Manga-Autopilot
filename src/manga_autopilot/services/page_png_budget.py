@@ -16,13 +16,21 @@ class PagePngBudget:
     max_input_pixels: int
     max_total_input_pixels: int
     max_png_bytes: int
+    max_input_bytes: int
+    max_total_input_bytes: int
 
 
 PROFILES: dict[str, PagePngBudget] = {
     # Allow common screen/comic spreads; roughly 48 MiB RGB / 64 MiB RGBA.
-    "screen": PagePngBudget("screen", 12_000_000, 16_000_000, 32_000_000, 48 * 1024 * 1024),
+    "screen": PagePngBudget(
+        "screen", 12_000_000, 16_000_000, 32_000_000,
+        48 * 1024 * 1024, 48 * 1024 * 1024, 96 * 1024 * 1024,
+    ),
     # Opt-in print layout (e.g. 6000 x 4000); roughly 96 MiB RGB.
-    "print": PagePngBudget("print", 24_000_000, 24_000_000, 48_000_000, 96 * 1024 * 1024),
+    "print": PagePngBudget(
+        "print", 24_000_000, 24_000_000, 48_000_000,
+        96 * 1024 * 1024, 96 * 1024 * 1024, 192 * 1024 * 1024,
+    ),
 }
 DEFAULT_PROFILE = "screen"
 MAX_SERVABLE_PNG_BYTES = max(p.max_png_bytes for p in PROFILES.values())
