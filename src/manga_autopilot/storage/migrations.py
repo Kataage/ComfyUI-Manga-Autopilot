@@ -617,6 +617,35 @@ Migration(
             """,
         ),
     ),
+
+    Migration(
+        version=7,
+        name="W0007_durable_step_attempt_history",
+        statements=(
+            """
+            CREATE TABLE run_step_attempts (
+                id TEXT PRIMARY KEY,
+                run_step_id TEXT NOT NULL REFERENCES run_steps(id),
+                attempt_no INTEGER NOT NULL CHECK (attempt_no > 0),
+                input_fingerprint TEXT NOT NULL,
+                status TEXT NOT NULL CHECK (status IN (
+                    'RUNNING', 'COMPLETED', 'FAILED_RETRYABLE',
+                    'FAILED_TERMINAL', 'INTERRUPTED',
+                    'NEEDS_ATTENTION', 'CANCELLED'
+                )),
+                output_json TEXT NOT NULL,
+                error_json TEXT NOT NULL,
+                started_at TEXT NOT NULL,
+                finished_at TEXT,
+                UNIQUE(run_step_id, attempt_no)
+            )
+            """,
+            """
+            CREATE INDEX idx_run_step_attempts_step
+            ON run_step_attempts(run_step_id, attempt_no)
+            """,
+        ),
+    ),
 )
 
 
