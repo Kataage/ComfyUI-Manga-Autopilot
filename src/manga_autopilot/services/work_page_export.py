@@ -21,9 +21,13 @@ from manga_autopilot.repositories import (
     ArtifactIntegrityError,
     ArtifactNotFoundError,
     ArtifactRepository,
+    PageDomainNotFoundError,
     WorkLifecycleRepository,
 )
-from manga_autopilot.services.page_application import PageApplicationService
+from manga_autopilot.services.page_application import (
+    PageApplicationService,
+    read_page_state_in_transaction,
+)
 from manga_autopilot.services.page_png_budget import (
     DEFAULT_PROFILE,
     resolve_page_png_budget,
@@ -287,6 +291,13 @@ class WorkPageExportService:
             canonical_json(fingerprint_payload).encode("utf-8")
         ).hexdigest()
 
+        # Preserve Panel order for the commit guard. The fingerprint list is
+        # sorted by Panel ID for stable provenance independently of page order.
+        dependencies_by_order = [
+            next(item for item in dependencies if item["panel_id"] == panel["id"])
+            for panel in state["panels"]
+        ]
+
         # Renderer writes only into a disposable private directory; it never
         # replaces an existing Work export. ArtifactRepository publishes the
         # validated output to an immutable Work path and commits provenance.
@@ -330,6 +341,69 @@ class WorkPageExportService:
                 )
             for dependency in dependencies:
                 artifact_repo.verify_registered_file(dependency["artifact_id"])
+            # Recheck the EXACT persisted input projection inside the final
+            # Artifact registration's BEGIN IMMEDIATE transaction. The earlier
+            # post-render read is only a fast-fail optimization: it cannot
+            # protect the window while output bytes are copied and published.
+            def guard_source_revision(conn):
+                try:
+                    current = read_page_state_in_transaction(
+                        conn, work.work_id, page_id
+                    )
+                except PageDomainNotFoundError as exc:
+                    raise PageExportConflictError(
+                        f"Page {page_id} disappeared before PNG commit; retry export."
+                    ) from exc
+                if _snapshot_fingerprint(current) != (
+                    fingerprint_payload["page_state_sha256"]
+                ):
+                    raise PageExportConflictError(
+                        f"Page {page_id} changed before PNG commit; "
+                        "reload and export again."
+                    )
+                # Artifacts are immutable, but candidate publication itself
+                # changes implicit selection when no ID was pinned to a Panel.
+                # Verify the selected inputs and unique fallback under the
+                # same lock, without a nested repository/file-system read.
+                for panel, dependency in zip(
+                    current["panels"], dependencies_by_order, strict=True
+                ):
+                    row = conn.execute(
+                        """SELECT artifact_type, scope_type, scope_id,
+                                  status, archived_at, mime_type, sha256
+                           FROM artifacts WHERE id = ?""",
+                        (dependency["artifact_id"],),
+                    ).fetchone()
+                    if row is None or (
+                        row["artifact_type"] != "panel_candidate"
+                        or row["scope_type"] != "panel"
+                        or row["scope_id"] != panel["id"]
+                        or row["status"] != "READY"
+                        or row["archived_at"] is not None
+                        or row["mime_type"] not in {
+                            "image/png", "image/jpeg", "image/webp"
+                        }
+                        or row["sha256"] != dependency["sha256"]
+                    ):
+                        raise PageExportConflictError(
+                            f"Page {page_id} candidate inputs changed before PNG commit."
+                        )
+                    if panel["selected_candidate_id"] is None:
+                        available = conn.execute(
+                            """SELECT id FROM artifacts
+                               WHERE artifact_type = 'panel_candidate'
+                                 AND scope_type = 'panel' AND scope_id = ?
+                                 AND status = 'READY' AND archived_at IS NULL""",
+                            (panel["id"],),
+                        ).fetchall()
+                        if len(available) != 1 or available[0]["id"] != (
+                            dependency["artifact_id"]
+                        ):
+                            raise PageExportConflictError(
+                                f"Page {page_id} candidate choice changed before "
+                                "PNG commit; select a candidate and retry."
+                            )
+
             artifact_id = new_id("artifact")
             relative_path = f"exports/pages/{page_id}_{artifact_id}.png"
             artifact = artifact_repo.register_local_file(
@@ -341,6 +415,7 @@ class WorkPageExportService:
                 mime_type="image/png",
                 dependency_fingerprint=fingerprint,
                 artifact_id=artifact_id,
+                commit_guard=guard_source_revision,
             )
         return {
             "work_id": work_id,
