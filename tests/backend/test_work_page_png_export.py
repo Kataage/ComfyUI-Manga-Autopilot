@@ -343,7 +343,9 @@ async def test_oversized_output_area_rejected_before_renderer_or_artifact(api, m
     assert "print" in data["message"]
     assert invoked == []
     assert artifacts.list_for_scope("page", "page_main") == []
-    assert not (handle.root / "assets" / "temp").exists()
+    # Artifact fixture setup already creates assets/temp; reject renders must
+    # not create or leave any transient page-export render directory.
+    assert not list((handle.root / "assets" / "temp").glob("page-export-*"))
 
 
 async def test_print_profile_allowed_to_reach_renderer_but_hard_caps_enforced(api, monkeypatch):
