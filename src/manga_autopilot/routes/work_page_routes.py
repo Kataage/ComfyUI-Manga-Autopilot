@@ -13,6 +13,7 @@ from typing import Any
 from aiohttp import web
 
 from manga_autopilot.repositories.page_domain import (
+    PageDomainArchivedError,
     PageDomainNotFoundError,
     PageDomainOwnershipError,
 )
@@ -53,6 +54,8 @@ def _translate(exc: Exception) -> web.Response:
             expected_revision=exc.expected_revision,
             actual_revision=exc.actual_revision,
         )
+    if isinstance(exc, PageDomainArchivedError):
+        return _problem(409, "page_archived", str(exc))
     if isinstance(exc, (PageDomainNotFoundError, WorkNotFoundError)):
         return _problem(404, "not_found", str(exc))
     if isinstance(exc, (PageDomainOwnershipError, WorkIdentityMismatchError)):
@@ -76,9 +79,18 @@ async def _payload(request: web.Request) -> dict[str, Any]:
     return body
 
 
+def _include_archived(request: web.Request) -> bool:
+    value = request.query.get("include_archived", "0")
+    if value not in {"0", "1"}:
+        raise ValueError("include_archived must be 0 or 1")
+    return value == "1"
+
+
 async def list_work_pages(request: web.Request) -> web.Response:
     try:
-        pages = _service(request).list_pages(request.match_info["work_id"])
+        pages = _service(request).list_pages(
+            request.match_info["work_id"], include_archived=_include_archived(request)
+        )
     except Exception as exc:
         return _translate(exc)
     return web.json_response({"pages": pages})
@@ -87,7 +99,8 @@ async def list_work_pages(request: web.Request) -> web.Response:
 async def get_work_page(request: web.Request) -> web.Response:
     try:
         state = _service(request).get_page(
-            request.match_info["work_id"], request.match_info["page_id"]
+            request.match_info["work_id"], request.match_info["page_id"],
+            include_archived=_include_archived(request),
         )
     except Exception as exc:
         return _translate(exc)
