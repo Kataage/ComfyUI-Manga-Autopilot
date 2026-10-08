@@ -451,6 +451,36 @@ WORK_MIGRATIONS: tuple[Migration, ...] = (
             """,
         ),
     ),
+Migration(
+        version=4,
+        name="W0004_dependency_invalidations",
+        statements=(
+            """
+            CREATE TABLE invalidations (
+                id TEXT PRIMARY KEY,
+                source_entity_type TEXT NOT NULL,
+                source_entity_id TEXT NOT NULL,
+                source_revision INTEGER NOT NULL,
+                target_type TEXT NOT NULL,
+                target_id TEXT,
+                invalidation_kind TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                created_commit_seq INTEGER NOT NULL REFERENCES commits(commit_seq),
+                resolved_commit_seq INTEGER REFERENCES commits(commit_seq),
+                created_at TEXT NOT NULL,
+                resolved_at TEXT
+            )
+            """,
+            """
+            CREATE INDEX idx_invalidations_target
+            ON invalidations(target_type, target_id, resolved_commit_seq)
+            """,
+            """
+            CREATE INDEX idx_invalidations_source
+            ON invalidations(source_entity_type, source_entity_id)
+            """,
+        ),
+    ),
 )
 
 

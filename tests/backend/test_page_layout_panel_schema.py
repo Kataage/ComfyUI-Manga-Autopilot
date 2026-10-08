@@ -604,7 +604,7 @@ def test_upgrade_existing_w0002_work_to_page_schema_preserves_history(
     result = migrate_work_database(
         database,
         work_id="work_001",
-        migrations=WORK_MIGRATIONS,
+        migrations=WORK_MIGRATIONS[:3],
     )
 
     assert result.current_version == 3
@@ -624,7 +624,9 @@ def test_upgrade_existing_w0002_work_to_page_schema_preserves_history(
             "SELECT version FROM schema_migrations ORDER BY version"
         )] == [1, 2, 3]
 
-    second = migrate_work_database(database, work_id="work_001")
+    second = migrate_work_database(
+        database, work_id="work_001", migrations=WORK_MIGRATIONS[:3]
+    )
     assert second.applied_versions == ()
     assert second.backup_path is None
 

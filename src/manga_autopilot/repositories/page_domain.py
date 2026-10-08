@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any
 
 from manga_autopilot.primitives import canonical_json, new_id
+from manga_autopilot.repositories.revision_invalidation import record_domain_change
 from manga_autopilot.storage.repository import (
     PersistenceError,
     assert_expected_revision,
@@ -134,7 +135,17 @@ def _insert(
         f"INSERT INTO {table} ({cols}) VALUES ({marks})",
         tuple(data.values()),
     )
-    return _read_row(connection, table, entity_id)
+    inserted = _read_row(connection, table, entity_id)
+    record_domain_change(
+        connection,
+        table=table,
+        before=None,
+        after=inserted,
+        changed_fields=attrs.keys(),
+        commit_seq=commit_seq,
+        created_at=timestamp,
+    )
+    return inserted
 
 
 def _patch(
@@ -173,7 +184,17 @@ def _patch(
     )
     if result.rowcount != 1:
         raise PersistenceError(f"{table} update lost its revision guard: {entity_id}")
-    return _read_row(connection, table, entity_id), True
+    updated = _read_row(connection, table, entity_id)
+    record_domain_change(
+        connection,
+        table=table,
+        before=existing,
+        after=updated,
+        changed_fields=changed.keys(),
+        commit_seq=commit_seq,
+        created_at=timestamp,
+    )
+    return updated, True
 
 
 def _check_slot_page(connection: sqlite3.Connection, slot_id: str, page_id: str) -> None:

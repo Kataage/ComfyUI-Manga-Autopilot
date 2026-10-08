@@ -7,6 +7,7 @@ from manga_autopilot.repositories.page_domain import (
     PageRepository,
     PanelRepository,
 )
+from manga_autopilot.repositories.revision_invalidation import PageDomainAuditRepository
 from manga_autopilot.repositories.work_lifecycle import (
     PortableWorkInspection,
     WorkCatalogEntry,
@@ -23,6 +24,7 @@ from manga_autopilot.repositories.work_lifecycle import (
 )
 
 __all__ = [
+    "PageDomainAuditRepository",
     "LayoutRepository",
     "PageDomainNotFoundError",
     "PageDomainOwnershipError",
