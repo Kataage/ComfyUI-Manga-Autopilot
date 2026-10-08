@@ -39,6 +39,40 @@ ROUTE_PREFIX = "/manga_autopilot/api/v2/works/{work_id}/exports"
 _DOWNLOAD_SLOTS = threading.BoundedSemaphore(value=2)
 
 
+async def _owned_download_thread(
+    operation: Any, *args: Any, close_cancelled_result: bool = False,
+) -> Any:
+    """Drain synchronous IO before releasing the HTTP handler's spool slot.
+
+    Cancelling an asyncio.to_thread await never interrupts the underlying OS
+    worker. A cancelled request still owns that worker until it finishes, and
+    an orphaned verified snapshot must be explicitly closed when no response
+    coroutine remains to consume it. Repeated task cancellation cannot release
+    the slot or close the snapshot while an IO worker is still using it.
+    """
+    worker = asyncio.create_task(asyncio.to_thread(operation, *args))
+    try:
+        return await asyncio.shield(worker)
+    except asyncio.CancelledError:
+        while not worker.done():
+            try:
+                await asyncio.shield(worker)
+            except asyncio.CancelledError:
+                # A second cancellation cannot detach the active copy/read.
+                continue
+            except Exception:
+                # The worker is finished with an exception, now safe to exit.
+                break
+        if close_cancelled_result and not worker.cancelled():
+            try:
+                snapshot = worker.result()
+            except BaseException:
+                pass
+            else:
+                snapshot.close()
+        raise
+
+
 def _verified_png_snapshot(path: Path, row: dict[str, Any]):
     """Copy and verify one pinned input file descriptor before serving bytes.
 
@@ -226,7 +260,9 @@ async def get_work_export_png(request: web.Request) -> web.Response:
             )
             # Validate a pinned original file descriptor and copy in bounded
             # chunks. Stream only from the verified independent temp snapshot.
-            snapshot = await asyncio.to_thread(_verified_png_snapshot, path, row)
+            snapshot = await _owned_download_thread(
+                _verified_png_snapshot, path, row, close_cancelled_result=True,
+            )
             try:
                 response = web.StreamResponse(
                     status=200,
@@ -239,7 +275,9 @@ async def get_work_export_png(request: web.Request) -> web.Response:
                 )
                 response.content_length = row["file_size"]
                 await response.prepare(request)
-                while chunk := await asyncio.to_thread(snapshot.read, PNG_IO_CHUNK_BYTES):
+                while chunk := await _owned_download_thread(
+                    snapshot.read, PNG_IO_CHUNK_BYTES,
+                ):
                     await response.write(chunk)
                 await response.write_eof()
                 return response

@@ -62,6 +62,21 @@ spools are permitted per worker; additional requests get HTTP 429
 request and controls concurrent temporary-disk consumption; free disk capacity
 must still be provisioned.
 
+**HTTP cancellation during downloads (#353):** each slot is held until *all*
+file-copy or streamed-file-read workers belonging to the request have actually
+finished, even if aiohttp cancels its coroutine. `asyncio.to_thread()` does
+not terminate a running thread; the handler awaits shielded workers through
+cancellation and releases the spool semaphore only after they drain.
+A verified `SpooledTemporaryFile` returned after cancellation is explicitly
+closed even when no HTTP response consumes it. If cancellation occurs during
+a streaming `snapshot.read()`, the handler completes that read before closing
+the snapshot, never concurrently closing a file another thread is reading.
+Repeated cancellation cannot create extra copy workers or release capacity
+early. The copy is not forcibly interrupted (it may finish after the client
+disconnects), and a TCP disconnect is not guaranteed to cancel the aiohttp
+handler; the budget still bounds its work. Existing point-in-time freshness,
+hash-verified snapshot, and immutable historical PNG semantics are unchanged.
+
 These ceilings protect the **v2 Work PNG path**, not every legacy renderer,
 remote executor or other unrelated image-generating route. GPU/real ComfyUI
 resource limits are separate responsibilities.
