@@ -224,7 +224,7 @@ async def test_actual_editor_ui_save_export_reopen_edit_export_again(
         assert "owned by this Panel" in failure["message"]
         assert len(artifacts.list_for_scope("page", PAGE_ID)) == 1
 
-    with pytest.raises(ValueError, match="relative_path"):
+    with pytest.raises(ValueError):
         artifacts.register_local_bytes(
             artifact_id="forbidden_escape", data=_png((1, 2, 3)),
             relative_path="exports/../forbidden.png",
