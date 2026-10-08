@@ -7,6 +7,7 @@ from manga_autopilot.repositories.artifacts import (
 )
 from manga_autopilot.repositories.page_domain import (
     LayoutRepository,
+    PageDomainCandidateSelectionError,
     PageDomainNotFoundError,
     PageDomainOwnershipError,
     PageRepository,
@@ -34,6 +35,7 @@ __all__ = [
     "ArtifactRepository",
     "PageDomainAuditRepository",
     "LayoutRepository",
+    "PageDomainCandidateSelectionError",
     "PageDomainNotFoundError",
     "PageDomainOwnershipError",
     "PageRepository",
