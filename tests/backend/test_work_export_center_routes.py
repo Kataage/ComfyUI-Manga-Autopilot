@@ -12,7 +12,10 @@ from aiohttp import web
 from PIL import Image
 
 from manga_autopilot.repositories import (
-    ArtifactRepository, LayoutRepository, PageRepository, PanelRepository,
+    ArtifactRepository,
+    LayoutRepository,
+    PageRepository,
+    PanelRepository,
     WorkLifecycleRepository,
 )
 from manga_autopilot.routes import register_all
