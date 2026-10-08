@@ -190,7 +190,6 @@ async def test_verified_download_snapshot_is_immune_to_original_path_replacement
 
 async def test_download_rejects_declared_oversize_before_copying(browser_api, monkeypatch):
     client, _, artifacts = browser_api
-    import manga_autopilot.routes.work_export_center_routes as routes
     from manga_autopilot.services.page_png_budget import MAX_SERVABLE_PNG_BYTES
     from manga_autopilot.storage import repository_write
 
