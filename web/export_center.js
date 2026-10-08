@@ -245,7 +245,15 @@ export function mountExportCenter(root, opts = {}) {
       return;
     }
     for (const entry of entries) {
-      const item = element("li");
+      // READY is immutable publication status; freshness is separate.
+      const freshness = entry.freshness === "CURRENT" ? "CURRENT"
+        : entry.freshness === "STALE" ? "STALE" : "UNVERIFIED";
+      const label = {
+        CURRENT: "Current", STALE: "Stale (historical)",
+        UNVERIFIED: "Unverified (historical)",
+      }[freshness];
+      const item = element("li", "", "manga-export-" + freshness.toLowerCase());
+      item.appendChild(element("strong", label + " · "));
       const caption = [
         "Page " + entry.scope_id,
         entry.relative_path,
@@ -256,6 +264,14 @@ export function mountExportCenter(root, opts = {}) {
       link.target = "_blank";
       link.rel = "noopener noreferrer";
       item.appendChild(link);
+      if (freshness !== "CURRENT") {
+        const hint = entry.freshness_reason === "page_inputs_changed"
+          ? " · Saved Page changed; export again for current output."
+          : entry.freshness_reason === "candidate_choice_changed"
+            ? " · Candidate choice changed; export again."
+            : " · Current provenance cannot be confirmed.";
+        item.appendChild(element("span", hint));
+      }
       list.appendChild(item);
     }
   }
