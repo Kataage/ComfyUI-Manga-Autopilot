@@ -102,7 +102,7 @@ export async function exportSavedPagePng(workId, pageId, settings = {}) {
     throw new TypeError("Export settings must be an object.");
   }
   const invalid = Object.keys(settings).filter((key) =>
-    key !== "background" && key !== "outer_border");
+    key !== "background" && key !== "outer_border" && key !== "export_profile");
   if (invalid.length) {
     throw new Error("Unsupported export settings: " + invalid.join(", "));
   }
@@ -172,6 +172,20 @@ export function mountExportCenter(root, opts = {}) {
   const pageSelect = document.createElement("select");
   pageLabel.appendChild(pageSelect);
   toolbar.appendChild(pageLabel);
+  const profileLabel = element("label", "PNG profile");
+  const profileSelect = document.createElement("select");
+  for (const [value, caption] of [
+    ["screen", "Screen (up to 12 MP)"],
+    ["print", "Print (up to 24 MP)"],
+  ]) {
+    const option = document.createElement("option");
+    option.value = value;
+    option.textContent = caption;
+    profileSelect.appendChild(option);
+  }
+  profileSelect.value = "screen";
+  profileLabel.appendChild(profileSelect);
+  toolbar.appendChild(profileLabel);
   const exportButton = element("button", "Export PNG");
   exportButton.type = "button";
   toolbar.appendChild(exportButton);
@@ -205,6 +219,7 @@ export function mountExportCenter(root, opts = {}) {
     pagesButton.disabled = busy;
     workInput.disabled = busy;
     pageSelect.disabled = busy || !loadedWorkId || !pageSelect.options.length;
+    profileSelect.disabled = busy;
     exportButton.disabled = busy || !loadedWorkId || !loadedPageId;
     refreshButton.disabled = busy || !loadedWorkId;
   }
@@ -321,7 +336,9 @@ export function mountExportCenter(root, opts = {}) {
     showStatus("Exporting saved Page " + page + " in Work " + work + "...");
     result.replaceChildren();
     try {
-      const exported = await exportSavedPagePng(work, page);
+      const settings = profileSelect.value === "print"
+        ? { export_profile: "print" } : {};
+      const exported = await exportSavedPagePng(work, page, settings);
       if (disposed || token !== requestToken) return;
       result.appendChild(element("p",
         "PNG registered: " + exported.relative_path));
