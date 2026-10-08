@@ -162,13 +162,14 @@ const disposeEditor = editor.mountPageEditor(editorRoot,
 await until(() => editorRoot.textContent.includes("Loaded saved Page"), "editor initial load");
 assert.ok(!editorRoot.textContent.includes("panel_01"), "no phantom Panels");
 const previousRevision = initial.slots.find((slot) => slot.id === SLOT_RED).revision;
-const slot = editorRoot.querySelectorAll("div").find((node) => node.dataset.slotId === SLOT_RED);
-assert.ok(slot, "real persisted slot available to drag");
 if (phase === "reopen") {
   const width = find(editorRoot, "label", "Page width").querySelectorAll("input")[0];
   width.value = "360";
   await width.fire("change");
 }
+// Changing page dimensions redraws the slot nodes; drag the *current* node.
+const slot = editorRoot.querySelectorAll("div").find((node) => node.dataset.slotId === SLOT_RED);
+assert.ok(slot, "real persisted slot available to drag");
 await slot.fire("pointerdown", { clientX: 0, clientY: 0 });
 await document.fire("pointermove", { clientX: 120, clientY: 0 });
 await document.fire("pointerup");
