@@ -12,6 +12,30 @@ page geometry, input image file paths, output limits or an arbitrary budget.
 | `screen` (default) | 12,000,000 | 16,000,000 | 32,000,000 | 48 MiB |
 | `print` (explicit opt-in) | 24,000,000 | 24,000,000 | 48,000,000 | 96 MiB |
 
+The candidate source-bytes snapshot contract (#354) also bounds encoded
+input bytes, not only decoded pixels. For `screen`, one selected Candidate
+Artifact file may be up to **48 MiB** and all selected files together up to
+**96 MiB**; for explicitly selected `print`, the corresponding caps are
+**96 MiB** and **192 MiB**. These named server limits are checked against
+persisted Artifact file sizes before any snapshot copying begins, and each
+copy enforces its expected byte length during a 256 KiB chunked read.
+
+**Verified Candidate source binding (#354):** the exporter opens each source
+file with a pinned regular-file descriptor (no symlink traversal), copies it
+to a per-export private disposable directory, and verifies the *copied*
+length and SHA-256 against the selected Work Artifact, as well as image media
+format and registered dimensions. Only those independently verified snapshot
+paths are ever passed to Pillow. A registered Candidate pathname changed
+before/during rendering cannot introduce pixels outside the bytes bound to the
+`register_verified_page_render_v1` source attestation; source corruption
+before the snapshot is rejected without publishing a READY Page PNG. The
+existing post-render verification of registered live Candidate files and the
+`BEGIN IMMEDIATE` provenance/selection guard remain conservative.
+Input snapshots are removed together with the rendering temp directory on
+success, cancellation and failure. This guarantees consistency against
+concurrent mutation of original Work Candidate paths, not a hostile process
+that can also modify the exporter's private temporary directory itself.
+
 Additionally, each saved Page dimension must be an integer from 1 to 16,384.
 The combined pixel area is checked **before** the Pillow renderer is invoked,
 and selected candidate metadata is checked against the profile before Pillow
