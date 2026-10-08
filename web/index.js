@@ -177,15 +177,21 @@ function createWorkspaceView() {
     const mounts = resolveMounts();
 
     const showTab = (id) => {
-        if (!activeProjectId) {
+        // Always release the previous editor's event listeners and in-flight
+        // handlers, even when the destination requires a legacy Project ID.
+        const prev = disposers.get(activeTab);
+        if (typeof prev === "function") prev();
+        disposers.delete(activeTab);
+        // Projects and the v2 Work-backed Page Editor must be accessible
+        // before an unrelated legacy project ID has been selected.
+        if (!activeProjectId && id !== "projects" && id !== "editor") {
             content.replaceChildren();
             const msg = document.createElement("p");
             msg.textContent = "Set an active project id in the Projects tab to continue.";
             content.appendChild(msg);
+            activeTab = id;
             return;
         }
-        const prev = disposers.get(activeTab);
-        if (typeof prev === "function") prev();
         content.replaceChildren();
 
         const mountInto = (mountFn, key) => {
@@ -193,7 +199,8 @@ function createWorkspaceView() {
             content.appendChild(host);
             if (typeof mountFn === "function") {
                 try {
-                    disposers.set(key, mountFn(host, { projectId: activeProjectId }));
+                    disposers.set(key, mountFn(host, key === "editor"
+                        ? {} : { projectId: activeProjectId }));
                 } catch (err) {
                     const errEl = document.createElement("pre");
                     errEl.textContent = `${key} mount failed: ${err.message}`;
