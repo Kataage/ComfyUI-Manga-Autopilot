@@ -409,9 +409,10 @@ class LayoutRepository:
         *,
         expected_revision: int,
         slot_updates: Sequence[Mapping[str, Any]] = (),
+        panel_bindings: Sequence[Mapping[str, Any]] = (),
         **changes: Any,
     ) -> dict[str, Any]:
-        """Atomically mutate selected geometry without replacing slots or panels.
+        """Atomically mutate selected geometry and Panel-Slot bindings.
 
         Every slot update needs id + expected_revision. Optional layout_id
         and page_id are explicit ownership assertions (never mutable).
@@ -455,12 +456,52 @@ class LayoutRepository:
                 )
                 staged.append((slot_id, slot_revision, _values(item, _SLOT_FIELDS)))
 
+            # Bindings are semantic Panel updates, not Panel replacements. Validate
+            # every participant before the first write so an ownership/revision
+            # error rejects the whole command. A concurrent writer cannot slip in
+            # because repository_write holds BEGIN IMMEDIATE for this transaction.
+            staged_bindings: list[tuple[str, int, str | None]] = []
+            bound: set[str] = set()
+            for binding in panel_bindings:
+                item = dict(binding)
+                panel_id = _id(item.pop("id", None), "panel id")
+                panel_revision = _positive(
+                    item.pop("expected_revision", None), "panel expected_revision"
+                )
+                if "layout_slot_id" not in item:
+                    raise ValueError("panel binding requires layout_slot_id")
+                slot_binding = item.pop("layout_slot_id")
+                asserted_page = item.pop("page_id", layout["page_id"])
+                if item:
+                    raise ValueError(f"unsupported panel binding fields: {sorted(item)}")
+                if panel_id in bound:
+                    raise ValueError(f"duplicate panel binding: {panel_id}")
+                bound.add(panel_id)
+                panel = _read_row(conn, "panels", panel_id)
+                if panel["page_id"] != layout["page_id"] or asserted_page != layout["page_id"]:
+                    raise PageDomainOwnershipError(
+                        f"panel {panel_id!r} does not belong to layout Page"
+                    )
+                if slot_binding is not None:
+                    _check_slot_page(
+                        conn, _id(slot_binding, "layout_slot_id"), layout["page_id"]
+                    )
+                assert_expected_revision(
+                    entity_type="panels", entity_id=panel_id,
+                    expected_revision=panel_revision, actual_revision=panel["revision"],
+                )
+                staged_bindings.append((panel_id, panel_revision, slot_binding))
+
             layout_changed = any(layout[k] != v for k, v in attrs.items())
             slots_changed = any(
                 any(_read_row(conn, "layout_slots", sid)[k] != v for k, v in values.items())
                 for sid, _, values in staged
             )
-            if not layout_changed and not slots_changed:
+            bindings_changed = any(
+                _read_row(conn, "panels", pid)["layout_slot_id"] != slot_id
+                for pid, _, slot_id in staged_bindings
+            )
+            if not layout_changed and not slots_changed and not bindings_changed:
                 return layout
             seq, at = _commit(conn, "update_layout")
             if layout_changed:
@@ -473,6 +514,12 @@ class LayoutRepository:
                 _patch(
                     conn, "layout_slots", sid,
                     expected_revision=rev, attrs=values,
+                    commit_seq=seq, timestamp=at,
+                )
+            for pid, rev, target_slot in staged_bindings:
+                _patch(
+                    conn, "panels", pid,
+                    expected_revision=rev, attrs={"layout_slot_id": target_slot},
                     commit_seq=seq, timestamp=at,
                 )
             return layout
