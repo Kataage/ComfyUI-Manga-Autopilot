@@ -49,6 +49,7 @@ _RUN_TRANSITIONS = {
 }
 _STEP_STARTABLE = frozenset({
     "PENDING", "INTERRUPTED", "FAILED_RETRYABLE", "STALE",
+    "NEEDS_ATTENTION",
 })
 _STEP_TERMINAL = frozenset({
     "COMPLETED", "FAILED_RETRYABLE", "FAILED_TERMINAL",
@@ -176,6 +177,21 @@ class DurableRunRepository:
                 _required(lease_owner, "lease_owner")
                 if old["lease_owner"] not in (None, lease_owner):
                     raise DurableRunStateError("Run lease owner mismatch")
+                if expected_status == "RUNNING":
+                    self._assert_owner(conn, run_id, lease_owner)
+                elif new_status == "RUNNING":
+                    lease = conn.execute(
+                        """SELECT expires_at FROM work_leases
+                           WHERE run_id = ? AND lease_owner = ?""",
+                        (run_id, lease_owner),
+                    ).fetchone()
+                    if (
+                        lease is None
+                        or _utc(datetime.fromisoformat(
+                            lease["expires_at"]
+                        )) <= self._now()
+                    ):
+                        raise WorkLeaseConflictError("no current lease to start Run")
             conn.execute(
                 """
                 UPDATE runs SET status = ?,
@@ -300,6 +316,7 @@ class DurableRunRepository:
         scope_type: str | None = None,
         scope_id: str | None = None,
         step_id: str | None = None,
+        lease_owner: str | None = None,
     ) -> dict[str, Any]:
         _required(step_key, "step_key")
         _required(input_fingerprint, "input_fingerprint")
@@ -311,6 +328,7 @@ class DurableRunRepository:
         identifier = _required(step_id or new_id("step"), "step_id")
         with repository_write(self.database_path) as conn:
             self._get(conn, "runs", run_id)
+            self._assert_owner(conn, run_id, lease_owner)
             conn.execute(
                 """
                 INSERT INTO run_steps (
@@ -377,9 +395,10 @@ class DurableRunRepository:
                 )
             if old["status"] == "COMPLETED":
                 raise DurableRunStateError("completed step cannot restart")
-            if old["status"] != "STALE" and (
-                old["input_fingerprint"] != input_fingerprint
-            ):
+            if old["status"] not in {
+                "STALE", "FAILED_RETRYABLE", "INTERRUPTED",
+                "NEEDS_ATTENTION",
+            } and old["input_fingerprint"] != input_fingerprint:
                 raise DurableRunStateError(
                     "new fingerprint requires explicit invalidation"
                 )
