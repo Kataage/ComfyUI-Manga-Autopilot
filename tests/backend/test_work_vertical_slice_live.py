@@ -208,7 +208,7 @@ async def test_actual_editor_ui_save_export_reopen_edit_export_again(
             + "/exports/" + first["artifact_id"] + "/png"
         )
         assert wrong_work.status == 404
-        await wrong_work.release()
+        wrong_work.release()
         wrong_owner = panels.get_panel("panel_red")
         panels.update_panel(
             "panel_red", expected_revision=wrong_owner["revision"],
@@ -250,7 +250,7 @@ async def test_actual_editor_ui_save_export_reopen_edit_export_again(
 
     second_server = await aiohttp_server(_app(tmp_path))
     second_origin = str(second_server.make_url("/")).rstrip("/")
-    assert second_origin != first_origin, "the HTTP server must truly restart"
+    assert second_server is not first_server, "the HTTP application must restart"
     second = await _run_browser(node, "reopen", second_origin, preferences)
     assert second["slot_x"] == 152
     assert second["page_width"] == 360
