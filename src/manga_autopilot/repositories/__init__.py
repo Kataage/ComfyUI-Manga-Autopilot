@@ -1,5 +1,12 @@
 """Repository implementations for v2 persistence."""
 
+from manga_autopilot.repositories.page_domain import (
+    LayoutRepository,
+    PageDomainNotFoundError,
+    PageDomainOwnershipError,
+    PageRepository,
+    PanelRepository,
+)
 from manga_autopilot.repositories.work_lifecycle import (
     PortableWorkInspection,
     WorkCatalogEntry,
@@ -16,6 +23,11 @@ from manga_autopilot.repositories.work_lifecycle import (
 )
 
 __all__ = [
+    "LayoutRepository",
+    "PageDomainNotFoundError",
+    "PageDomainOwnershipError",
+    "PageRepository",
+    "PanelRepository",
     "PortableWorkInspection",
     "WorkCatalogEntry",
     "WorkCreationError",
