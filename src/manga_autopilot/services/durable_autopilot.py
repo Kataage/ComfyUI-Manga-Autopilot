@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import json
 import secrets
+from contextlib import suppress
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -116,6 +117,20 @@ class DurableAutopilotOrchestrator:
             run_id=run_id,
             reclaim_expired_owner=reclaim_expired_owner,
         )
+        heartbeat_task: asyncio.Task[None] | None = None
+
+        async def renew_lease() -> None:
+            # Running ComfyUI hooks can exceed one lease TTL. Refresh the
+            # Work-exclusive token and durable Run heartbeat cooperatively.
+            period = max(1, min(60, self.lease_ttl_seconds // 3))
+            while True:
+                await asyncio.sleep(period)
+                self.repository.heartbeat_lease(
+                    work_id=self.work_id, lease_owner=owner,
+                    ttl_seconds=self.lease_ttl_seconds,
+                )
+                self.repository.heartbeat_run(run_id, lease_owner=owner)
+
         try:
             durable = self.repository.get_run(run_id)
             if durable["status"] == "RUNNING":
@@ -133,6 +148,9 @@ class DurableAutopilotOrchestrator:
             self.repository.transition_run(
                 run_id, expected_status=str(durable["status"]),
                 new_status="RUNNING", lease_owner=owner,
+            )
+            heartbeat_task = asyncio.create_task(
+                renew_lease(), name=f"durable-autopilot-heartbeat-{run_id}",
             )
             upstream = input_fingerprint({
                 "run_kind": durable["run_kind"],
@@ -270,6 +288,10 @@ class DurableAutopilotOrchestrator:
             # Best-effort legacy files are supplemental; Work DB is authority.
             return legacy._finalize(run)
         finally:
+            if heartbeat_task is not None:
+                heartbeat_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await heartbeat_task
             # Old process owners cannot release a newly reclaimed lease.
             try:
                 self.repository.release_lease(
