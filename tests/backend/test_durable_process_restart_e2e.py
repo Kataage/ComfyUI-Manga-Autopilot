@@ -199,7 +199,10 @@ def test_hard_kill_and_fresh_application_resume_only_missing_step(
     assert repo.get_run(run_id)["status"] == "COMPLETED"
     assert repo.inspect_lease("work_247") is None
     after_steps = {s["step_key"]: s for s in repo.list_steps(run_id)}
-    assert set(after_steps) == set(before_steps)
+    assert set(before_steps).issubset(after_steps)
+    assert set(after_steps) - set(before_steps) == {
+        "qa_panels", "lettering", "render_pages", "export", "finalize",
+    }
     for name in ("validate_input", "plan_story"):
         assert after_steps[name]["id"] == before_steps[name]["id"]
         assert after_steps[name]["attempt_count"] == 1
@@ -257,7 +260,8 @@ def test_changed_stage_input_after_reopen_reexecutes_only_downstream(
     assert [item["generation_version"] for item in entries
             if item["stage"] == "generate_panels"] == ["v1", "v2"]
     after = {s["step_key"]: s for s in repo.list_steps(run_id)}
-    assert set(after) == set(before)
+    assert set(before).issubset(after)
+    assert set(after) - set(before) == {"export", "finalize"}
     assert all(after[k]["id"] == before[k]["id"] for k in before)
     assert after["validate_input"]["attempt_count"] == 1
     assert after["plan_story"]["attempt_count"] == 1
