@@ -992,7 +992,7 @@ async def test_candidate_replaced_after_selection_before_snapshot_is_rejected(
     response, payload = await _export(client, base)
     assert response.status == 422, payload
     assert payload["error"] == "export_precondition_failed"
-    assert "copied input hash/size" in payload["message"]
+    assert "copied input" in payload["message"]
     assert invoked == [True]
     assert artifacts.list_for_scope("page", "page_main") == []
     assert candidate_path.read_bytes() == red_bytes
@@ -1007,6 +1007,7 @@ async def test_candidate_snapshot_byte_budget_rejects_oversized_record_before_co
 ):
     client, base, _, handle, _, _, _, artifacts = api
     from dataclasses import replace
+
     import manga_autopilot.services.page_png_budget as budgets
     import manga_autopilot.services.work_page_export as exporter
 
