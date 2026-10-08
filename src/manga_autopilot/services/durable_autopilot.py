@@ -60,12 +60,41 @@ async def _invoke_durable_hook(hook: Any, run: AutopilotRun) -> Any:
 
     Lease renewal must continue even while synchronous Pillow or filesystem
     hooks execute. Awaitable hook results are awaited on the calling loop.
+    A cancelled synchronous invocation is drained before returning cancellation;
+    the enclosing RunStep/Work lease remains RUNNING until the OS thread exits.
     """
     if hook is None:
         return None
     if inspect.iscoroutinefunction(hook):
         return await hook(run)
-    result = await asyncio.to_thread(hook, run)
+    # Cancelling an asyncio.to_thread await does not stop the OS thread.
+    # Keep ownership of the worker until it exits: execute() must not mark
+    # the RunStep INTERRUPTED or release its Work lease while synchronous
+    # rendering/generation side effects may still be in progress.
+    worker = asyncio.create_task(asyncio.to_thread(hook, run))
+    try:
+        result = await asyncio.shield(worker)
+    except asyncio.CancelledError:
+        # The outer execute() coroutine can be cancelled repeatedly while
+        # a hook is blocked. Keep draining under shield across *every*
+        # cancellation, leaving its heartbeat and Work lease active.
+        while not worker.done():
+            try:
+                await asyncio.shield(worker)
+            except asyncio.CancelledError:
+                continue
+            except Exception:
+                # A failed thread is finished; the caller still receives
+                # cancellation, not a misleading hook failure.
+                break
+        if not worker.cancelled():
+            # Observe late hook exceptions rather than leaking "Task
+            # exception was never retrieved" during cancellation.
+            try:
+                worker.result()
+            except BaseException:
+                pass
+        raise
     if inspect.isawaitable(result):
         return await result
     return result
