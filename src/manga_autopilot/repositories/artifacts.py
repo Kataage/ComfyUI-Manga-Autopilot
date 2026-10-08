@@ -140,6 +140,19 @@ def _publish_exclusive(temp: Path, destination: Path) -> None:
     _fsync_dir(temp.parent)
 
 
+# A verified-page-render Work commit is an immutable attestation minted only
+# after the exporter checks its exact Page/Panel/Candidate source projection
+# under the Artifact publication transaction. Generic imports never mint it.
+VERIFIED_PAGE_RENDER_OPERATION = "register_verified_page_render_v1"
+
+
+def verified_page_render_reason(
+    artifact_id: str, page_id: str, fingerprint: str,
+) -> str:
+    """Bind a Page export's artifact identity, owner and input digest."""
+    return f"page_export_attestation_v1:{artifact_id}:{page_id}:{fingerprint}"
+
+
 class ArtifactRepository:
     """Register immutable local Artifact files against one validated Work DB.
 
@@ -257,6 +270,49 @@ class ArtifactRepository:
                 commit_guard=commit_guard,
             )
 
+    def _register_verified_page_render_file(
+        self,
+        *,
+        source_path: str | Path,
+        relative_path: str,
+        page_id: str,
+        dependency_fingerprint: str,
+        artifact_id: str,
+        commit_guard: Callable[[sqlite3.Connection], None],
+    ) -> dict[str, Any]:
+        """Internal exporter-only registration of a source-guarded Page PNG.
+
+        Call exclusively after WorkPageExportService prepared its persisted
+        source snapshot and final BEGIN IMMEDIATE revision/candidate guard.
+        The generic public register_local_file/bytes APIs NEVER create a
+        trusted provenance commit, even when their caller supplies a guard.
+        """
+        if not callable(commit_guard):
+            raise ValueError("verified Page render requires a commit guard")
+        if (
+            len(dependency_fingerprint) != 64
+            or any(ch not in "0123456789abcdef" for ch in dependency_fingerprint)
+        ):
+            raise ValueError("verified Page render requires canonical SHA256 fingerprint")
+        source = Path(source_path)
+        if source.is_symlink() or not source.is_file():
+            raise ValueError("source_path must be an existing regular non-symlink file")
+        with source.open("rb") as handle:
+            return self._register_stream(
+                handle,
+                relative_path=relative_path,
+                artifact_type="page_render",
+                dependency_fingerprint=dependency_fingerprint,
+                artifact_id=artifact_id,
+                scope_type="page",
+                scope_id=page_id,
+                mime_type="image/png",
+                run_id=None,
+                generation_attempt_id=None,
+                commit_guard=commit_guard,
+                _verified_page_render=True,
+            )
+
     def _register_stream(
         self,
         stream: BinaryIO,
@@ -271,6 +327,7 @@ class ArtifactRepository:
         run_id: str | None,
         generation_attempt_id: str | None,
         commit_guard: Callable[[sqlite3.Connection], None] | None = None,
+        _verified_page_render: bool = False,
     ) -> dict[str, Any]:
         relative = _valid_relative_path(relative_path)
         kind = _nonempty(artifact_type, "artifact_type")
@@ -340,12 +397,23 @@ class ArtifactRepository:
             # The already-published immutable file remains a recoverable orphan.
             if commit_guard is not None:
                 commit_guard(conn)
+            # Attestation and Artifact row MUST share one atomic Work commit.
+            # The private verified path is used only after the complete source
+            # validation callback succeeds inside this BEGIN IMMEDIATE lock.
             commit = create_work_commit(
                 conn,
                 commit_id=new_id("commit"),
                 actor_type="system",
-                operation_type="register_artifact",
-                reason=f"publish {kind}",
+                operation_type=(
+                    VERIFIED_PAGE_RENDER_OPERATION
+                    if _verified_page_render else "register_artifact"
+                ),
+                reason=(
+                    verified_page_render_reason(
+                        artifact_key, scope_id, fingerprint,
+                    )
+                    if _verified_page_render else f"publish {kind}"
+                ),
             )
             conn.execute(
                 """INSERT INTO artifacts (
