@@ -10,9 +10,9 @@ import pytest
 from manga_autopilot.storage import (
     WORK_MIGRATIONS,
     bootstrap_work_database,
+    create_work_commit,
     migrate_work_database,
     read_work_identity,
-    create_work_commit,
     repository_write,
     write_connection,
 )
