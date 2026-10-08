@@ -728,15 +728,12 @@ async def test_expired_guardian_keeps_reclaim_proof_and_never_commits_hook_outpu
     try:
         assert await asyncio.to_thread(started.wait, 10)
         clock.moment += timedelta(seconds=4)
-        for _ in range(200):
-            if fresh.inspect_lease("work_246")["expired"] and task.cancelling():
-                break
-            await asyncio.sleep(0.02)
-        # The heartbeat fails at its 1-second renewal tick. While draining,
-        # the old task must not return or falsely record an output.
+        # The guardian's first renewal must fail at the one-second tick.
+        # Use portable task inspection (Python 3.10+), not Task.cancelling().
+        # The hook remains blocked while the owner detects lease expiry.
+        await asyncio.sleep(1.2)
         assert fresh.inspect_lease("work_246")["expired"]
-        await asyncio.sleep(1.1)
-        assert not task.done()
+        assert not task.done(), "expired owner detached its in-flight sync hook"
         assert not ended.is_set()
     finally:
         release.set()
