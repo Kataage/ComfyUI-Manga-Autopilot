@@ -78,6 +78,22 @@ def read_page_state_in_transaction(
     }
 
 
+def _active_page_state_in_transaction(
+    db: sqlite3.Connection, work_id: str, page_id: str,
+) -> dict[str, Any]:
+    """One active Page Editor projection, without opening another connection."""
+    state = read_page_state_in_transaction(db, work_id, page_id)
+    if state["page"]["archived_at"] is not None:
+        raise PageDomainArchivedError(
+            f"Page {page_id} is archived; unarchive it before editing "
+            "or request include_archived=1 for read-only recovery."
+        )
+    state["panels"] = [
+        panel for panel in state["panels"] if panel["archived_at"] is None
+    ]
+    return state
+
+
 class PageApplicationService:
     """A Work-scoped query/command facade suitable for HTTP or a UI adapter."""
 
@@ -105,18 +121,9 @@ class PageApplicationService:
             # A stable read snapshot shared by all Page projection queries.
             db.execute("BEGIN")
             try:
-                state = read_page_state_in_transaction(db, handle.work_id, page_id)
-                if not include_archived:
-                    if state["page"]["archived_at"] is not None:
-                        raise PageDomainArchivedError(
-                            f"Page {page_id} is archived; unarchive it before editing "
-                            "or request include_archived=1 for read-only recovery."
-                        )
-                    state["panels"] = [
-                        panel for panel in state["panels"]
-                        if panel["archived_at"] is None
-                    ]
-                return state
+                if include_archived:
+                    return read_page_state_in_transaction(db, handle.work_id, page_id)
+                return _active_page_state_in_transaction(db, handle.work_id, page_id)
             finally:
                 db.rollback()
 
@@ -145,15 +152,20 @@ class PageApplicationService:
                     f"layout not found for page: {page_id}"
                 )
             layout_id = str(row["id"])
-        # Ownership is checked again under BEGIN IMMEDIATE by the repository.
-        LayoutRepository(handle.database_path).update_layout(
+        # The read-only projection is captured after the update *inside*
+        # the same BEGIN IMMEDIATE write transaction. A later writer cannot
+        # make an accepted save look rejected, nor pollute its acknowledgement
+        # with a different commit. Ownership is rechecked under that lock.
+        return LayoutRepository(handle.database_path).update_layout(
             layout_id,
             expected_revision=expected_revision,
             slot_updates=slot_updates or (),
             panel_bindings=panel_bindings or (),
+            _read_snapshot=lambda conn: _active_page_state_in_transaction(
+                conn, handle.work_id, page_id,
+            ),
             **changes,
         )
-        return self.get_page(work_id, page_id)
 
 
 __all__ = ["PageApplicationService", "read_page_state_in_transaction"]
