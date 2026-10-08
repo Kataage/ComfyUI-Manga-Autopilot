@@ -110,6 +110,10 @@ def test_run_and_step_survive_reinstantiation_and_keep_fingerprint(tmp_path: Pat
     clock = Clock()
     repo = DurableRunRepository(db, clock=clock)
     run_id = _run(repo)
+    repo.acquire_lease(
+        work_id="work_test", lease_owner="worker_a",
+        lease_kind="MUTATION", ttl_seconds=60, run_id=run_id,
+    )
     repo.transition_run(run_id, expected_status="PENDING",
                         new_status="RUNNING", lease_owner="worker_a")
     step = repo.create_step(
