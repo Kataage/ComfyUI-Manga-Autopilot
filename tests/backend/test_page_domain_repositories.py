@@ -432,3 +432,96 @@ def test_archived_panel_binding_rejected_by_domain_repo_before_any_write(
     assert changed["revision"] == original_layout["revision"]
     assert panels.get_panel("panel_001")["layout_slot_id"] == "slot_002"
     assert panels.get_panel("panel_001")["revision"] == revived["revision"] + 1
+
+
+
+def test_layout_atomic_snapshot_callback_observes_batch_and_noop_without_commit(
+    repositories,
+):
+    pages, layouts, panels = repositories
+    _setup(repositories)
+    seen = []
+
+    def snapshot(db):
+        assert db.in_transaction
+        row = db.execute(
+            "SELECT revision, geometry_json FROM layout_instances WHERE id = ?",
+            ("layout_001",),
+        ).fetchone()
+        slot = db.execute(
+            "SELECT revision, geometry_json FROM layout_slots WHERE id = ?",
+            ("slot_001",),
+        ).fetchone()
+        seen.append((row["revision"], slot["revision"]))
+        return {
+            "layout": dict(row),
+            "slot": dict(slot),
+        }
+
+    before = _commits(pages)
+    result = layouts.update_layout(
+        "layout_001", expected_revision=1,
+        slot_updates=[{
+            "id": "slot_001", "expected_revision": 1,
+            "geometry_json": {"x": 50, "y": 20, "width": 450, "height": 400},
+        }],
+        _read_snapshot=snapshot,
+    )
+    assert result["layout"]["revision"] == 1
+    assert result["slot"]["revision"] == 2
+    assert json.loads(result["slot"]["geometry_json"])["x"] == 50
+    assert seen == [(1, 2)]
+    assert _commits(pages) == before + 1
+    assert panels.get_panel("panel_001")["layout_slot_id"] == "slot_001"
+
+    unchanged = layouts.update_layout(
+        "layout_001", expected_revision=1,
+        _read_snapshot=snapshot,
+    )
+    assert unchanged == result
+    assert seen == [(1, 2), (1, 2)]
+    assert _commits(pages) == before + 1
+
+
+def test_layout_atomic_snapshot_failure_rolls_back_batch_and_commit(repositories):
+    pages, layouts, panels = repositories
+    _setup(repositories)
+    before = _commits(pages)
+    old_layout = layouts.get_layout("layout_001")
+    old_slot = layouts.get_slot("slot_001")
+    old_panel = panels.get_panel("panel_001")
+
+    def broken_reader(db):
+        assert db.in_transaction
+        row = db.execute(
+            "SELECT revision FROM layout_instances WHERE id = 'layout_001'",
+        ).fetchone()
+        assert row["revision"] == 2
+        raise RuntimeError("failed to materialize command response")
+
+    with pytest.raises(RuntimeError, match="materialize command response"):
+        layouts.update_layout(
+            "layout_001", expected_revision=1,
+            geometry_json={"width": 1550, "height": 1750},
+            slot_updates=[{
+                "id": "slot_001", "expected_revision": 1,
+                "geometry_json": {"x": 30, "y": 30, "width": 400, "height": 400},
+            }],
+            panel_bindings=[{
+                "id": "panel_001", "expected_revision": 1,
+                "layout_slot_id": None,
+            }],
+            _read_snapshot=broken_reader,
+        )
+    assert _commits(pages) == before
+    assert layouts.get_layout("layout_001") == old_layout
+    assert layouts.get_slot("slot_001") == old_slot
+    assert panels.get_panel("panel_001") == old_panel
+    with repository_read(pages.database_path) as db:
+        assert not db.execute(
+            "SELECT 1 FROM commits WHERE operation_type = 'update_layout'"
+        ).fetchone()
+        assert not db.execute(
+            "SELECT 1 FROM entity_revisions WHERE entity_type = 'layout_instance'"
+            " AND entity_revision = 2 AND entity_id = 'layout_001'"
+        ).fetchone()
