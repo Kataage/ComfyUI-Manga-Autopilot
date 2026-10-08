@@ -250,3 +250,152 @@ async def test_multiple_downloads_have_bounded_parallel_spool_slots(
     for response in responses:
         assert response.status == 200
         assert await response.read() == _png()
+
+
+@pytest.fixture
+async def fresh_api(aiohttp_client, tmp_path: Path):
+    handle = WorkLifecycleRepository(tmp_path).create_work(
+        work_id="work_fresh", title="Fresh output"
+    )
+    pages = PageRepository(handle.database_path)
+    layouts = LayoutRepository(handle.database_path)
+    panels = PanelRepository(handle.database_path)
+    artifacts = ArtifactRepository(tmp_path, "work_fresh")
+    pages.create_page(
+        page_id="page_a", page_number=1, order_key="0001", page_purpose="Proof",
+    )
+    layouts.create_layout(
+        layout_id="layout_a", page_id="page_a",
+        geometry={"width": 200, "height": 160},
+    )
+    layouts.create_slot(
+        slot_id="slot_a", layout_id="layout_a", slot_key="main",
+        reading_order=1, geometry={"x": 5, "y": 5, "width": 100, "height": 100},
+    )
+    panels.create_panel(
+        panel_id="panel_a", page_id="page_a", order_index=1,
+        panel_purpose="Proof", layout_slot_id="slot_a",
+    )
+    artifacts.register_local_bytes(
+        artifact_id="candidate_a", data=_png(),
+        relative_path="assets/panels/candidate_a.png",
+        artifact_type="panel_candidate", scope_type="panel",
+        scope_id="panel_a", mime_type="image/png",
+        dependency_fingerprint="candidate",
+    )
+    panel = panels.get_panel("panel_a")
+    panels.update_panel(
+        "panel_a", expected_revision=panel["revision"],
+        selected_candidate_id="candidate_a",
+    )
+    app = web.Application()
+    register_all(app, storage_root=str(tmp_path))
+    return (
+        await aiohttp_client(app), tmp_path, handle, pages, layouts,
+        panels, artifacts,
+    )
+
+
+async def _export_fresh(client):
+    res = await client.post(
+        "/manga_autopilot/api/v2/works/work_fresh/pages/page_a/export/png",
+        json={},
+    )
+    body = await res.json()
+    assert res.status == 201, body
+    return body
+
+
+async def _list_fresh(client):
+    res = await client.get("/manga_autopilot/api/v2/works/work_fresh/exports")
+    assert res.status == 200
+    return (await res.json())["exports"]
+
+
+async def test_saved_page_edits_stale_old_exports_without_mutating_history(
+    fresh_api, aiohttp_client,
+):
+    client, root, handle, pages, layouts, _, artifacts = fresh_api
+    first = await _export_fresh(client)
+    initial = (await _list_fresh(client))[0]
+    assert initial["is_current"] is True
+    assert initial["freshness"] == "CURRENT"
+    artifact_before = artifacts.get(first["artifact_id"])
+    old_bytes = (handle.root / first["relative_path"]).read_bytes()
+
+    slot = layouts.get_slot("slot_a")
+    layouts.update_slot(
+        "slot_a", expected_revision=slot["revision"],
+        geometry_json={"x": 25, "y": 5, "width": 100, "height": 100},
+    )
+    with repository_read(handle.database_path) as db:
+        newer = db.execute(
+            """SELECT COUNT(*) FROM invalidations
+               WHERE target_type = 'page_export' AND target_id = 'page_a'
+                 AND created_commit_seq > ?""",
+            (artifact_before["created_commit_seq"],),
+        ).fetchone()[0]
+    assert newer == 1
+    stale = (await _list_fresh(client))[0]
+    assert stale["freshness"] == "STALE"
+    assert stale["is_current"] is False
+    assert stale["freshness_reason"] == "page_inputs_changed"
+    url = ("/manga_autopilot/api/v2/works/work_fresh/exports/"
+           + first["artifact_id"] + "/png")
+    historical = await client.get(url)
+    assert historical.status == 200
+    assert historical.headers["X-Work-Export-Freshness"] == "STALE"
+    assert await historical.read() == old_bytes
+    gated = await client.get(url + "?require_current=1")
+    assert gated.status == 409
+    assert (await gated.json())["error"] == "stale_export"
+
+    second = await _export_fresh(client)
+    rows = await _list_fresh(client)
+    assert [r["freshness"] for r in rows] == ["CURRENT", "STALE"]
+    assert [r["id"] for r in rows] == [second["artifact_id"], first["artifact_id"]]
+    assert artifacts.get(first["artifact_id"]) == artifact_before
+    assert (handle.root / first["relative_path"]).read_bytes() == old_bytes
+    await _export_fresh(client)
+    assert [r["freshness"] for r in await _list_fresh(client)] == [
+        "CURRENT", "CURRENT", "STALE"
+    ]
+    pages.create_page(
+        page_id="other_page", page_number=2, order_key="0002",
+        page_purpose="Unrelated",
+    )
+    assert [r["freshness"] for r in await _list_fresh(client)] == [
+        "CURRENT", "CURRENT", "STALE"
+    ]
+    reopened = web.Application()
+    register_all(reopened, storage_root=str(root))
+    other_client = await aiohttp_client(reopened)
+    assert [r["freshness"] for r in await _list_fresh(other_client)] == [
+        "CURRENT", "CURRENT", "STALE"
+    ]
+
+
+async def test_later_unpinned_candidate_cannot_leave_page_png_current(fresh_api):
+    client, _, _, _, _, panels, artifacts = fresh_api
+    panel = panels.get_panel("panel_a")
+    panels.update_panel(
+        "panel_a", expected_revision=panel["revision"], selected_candidate_id=None
+    )
+    exported = await _export_fresh(client)
+    assert (await _list_fresh(client))[0]["freshness"] == "CURRENT"
+    artifacts.register_local_bytes(
+        artifact_id="candidate_late", data=_png("#bb5522"),
+        relative_path="assets/panels/candidate_late.png",
+        artifact_type="panel_candidate", scope_type="panel",
+        scope_id="panel_a", mime_type="image/png",
+        dependency_fingerprint="candidate:later",
+    )
+    stale = (await _list_fresh(client))[0]
+    assert stale["id"] == exported["artifact_id"]
+    assert stale["freshness"] == "STALE"
+    assert stale["freshness_reason"] == "candidate_choice_changed"
+    gated = await client.get(
+        "/manga_autopilot/api/v2/works/work_fresh/exports/"
+        + exported["artifact_id"] + "/png?require_current=1"
+    )
+    assert gated.status == 409
