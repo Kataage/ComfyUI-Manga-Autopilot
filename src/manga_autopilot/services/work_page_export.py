@@ -365,7 +365,9 @@ class WorkPageExportService:
                 # changes implicit selection when no ID was pinned to a Panel.
                 # Verify the selected inputs and unique fallback under the
                 # same lock, without a nested repository/file-system read.
-                for panel, dependency in zip(current["panels"], dependencies_by_order):
+                for panel, dependency in zip(
+                    current["panels"], dependencies_by_order, strict=True
+                ):
                     row = conn.execute(
                         """SELECT artifact_type, scope_type, scope_id,
                                   status, archived_at, mime_type, sha256
