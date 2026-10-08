@@ -182,9 +182,9 @@ function createWorkspaceView() {
         const prev = disposers.get(activeTab);
         if (typeof prev === "function") prev();
         disposers.delete(activeTab);
-        // Projects and the v2 Work-backed Page Editor must be accessible
-        // before an unrelated legacy project ID has been selected.
-        if (!activeProjectId && id !== "projects" && id !== "editor") {
+        // Work-backed Page Editor and Export Center do not require a
+        // legacy Project ID; keep the remaining legacy tabs gated.
+        if (!activeProjectId && !["projects", "editor", "export"].includes(id)) {
             content.replaceChildren();
             const msg = document.createElement("p");
             msg.textContent = "Set an active project id in the Projects tab to continue.";
