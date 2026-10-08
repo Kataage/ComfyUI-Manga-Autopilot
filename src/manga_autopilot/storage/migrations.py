@@ -528,6 +528,95 @@ Migration(
             """,
         ),
     ),
+
+    Migration(
+        version=6,
+        name="W0006_durable_runs_and_work_leases",
+        statements=(
+            """
+            CREATE TABLE runs (
+                id TEXT PRIMARY KEY,
+                run_kind TEXT NOT NULL,
+                scope_type TEXT NOT NULL,
+                scope_id TEXT,
+                status TEXT NOT NULL CHECK (status IN (
+                    'PENDING', 'RUNNING', 'PAUSED', 'COMPLETED',
+                    'FAILED_RETRYABLE', 'FAILED_TERMINAL',
+                    'INTERRUPTED', 'NEEDS_ATTENTION', 'CANCELLED'
+                )),
+                requested_by TEXT NOT NULL,
+                parent_run_id TEXT REFERENCES runs(id),
+                lease_owner TEXT,
+                heartbeat_at TEXT,
+                input_fingerprint TEXT NOT NULL,
+                metadata_json TEXT NOT NULL,
+                started_at TEXT,
+                finished_at TEXT,
+                created_at TEXT NOT NULL
+            )
+            """,
+            """
+            CREATE INDEX idx_runs_status_created
+            ON runs(status, created_at)
+            """,
+            """
+            CREATE INDEX idx_runs_scope_created
+            ON runs(scope_type, scope_id, created_at)
+            """,
+            """
+            CREATE INDEX idx_runs_parent
+            ON runs(parent_run_id)
+            """,
+            """
+            CREATE TABLE run_steps (
+                id TEXT PRIMARY KEY,
+                run_id TEXT NOT NULL REFERENCES runs(id),
+                step_key TEXT NOT NULL,
+                scope_type TEXT,
+                scope_id TEXT,
+                status TEXT NOT NULL CHECK (status IN (
+                    'PENDING', 'RUNNING', 'COMPLETED',
+                    'FAILED_RETRYABLE', 'FAILED_TERMINAL',
+                    'INTERRUPTED', 'NEEDS_ATTENTION', 'STALE', 'CANCELLED'
+                )),
+                attempt_count INTEGER NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),
+                input_fingerprint TEXT NOT NULL,
+                output_json TEXT NOT NULL,
+                error_json TEXT NOT NULL,
+                started_at TEXT,
+                finished_at TEXT,
+                heartbeat_at TEXT,
+                CHECK ((scope_type IS NULL) = (scope_id IS NULL)),
+                CHECK (scope_type IS NULL OR (
+                    length(scope_type) > 0 AND length(scope_id) > 0
+                ))
+            )
+            """,
+            """
+            CREATE UNIQUE INDEX uq_run_steps_nullable_scope
+            ON run_steps(run_id, step_key,
+                COALESCE(scope_type, ''), COALESCE(scope_id, ''))
+            """,
+            """
+            CREATE INDEX idx_run_steps_run_status
+            ON run_steps(run_id, status)
+            """,
+            """
+            CREATE TABLE work_leases (
+                work_id TEXT PRIMARY KEY REFERENCES work_metadata(work_id),
+                lease_owner TEXT NOT NULL,
+                lease_kind TEXT NOT NULL,
+                run_id TEXT REFERENCES runs(id),
+                heartbeat_at TEXT NOT NULL,
+                expires_at TEXT NOT NULL
+            )
+            """,
+            """
+            CREATE INDEX idx_work_leases_expires
+            ON work_leases(expires_at)
+            """,
+        ),
+    ),
 )
 
 
