@@ -1,5 +1,10 @@
 """Repository implementations for v2 persistence."""
 
+from manga_autopilot.repositories.artifacts import (
+    ArtifactIntegrityError,
+    ArtifactNotFoundError,
+    ArtifactRepository,
+)
 from manga_autopilot.repositories.page_domain import (
     LayoutRepository,
     PageDomainNotFoundError,
@@ -24,6 +29,9 @@ from manga_autopilot.repositories.work_lifecycle import (
 )
 
 __all__ = [
+    "ArtifactIntegrityError",
+    "ArtifactNotFoundError",
+    "ArtifactRepository",
     "PageDomainAuditRepository",
     "LayoutRepository",
     "PageDomainNotFoundError",
