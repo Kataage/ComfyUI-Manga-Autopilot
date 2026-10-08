@@ -163,8 +163,8 @@ def register_all(
         health_routes,
         panel_routes,
         project_routes,
-        workflow_routes,
         work_page_routes,
+        workflow_routes,
     )
 
     app = _ensure_app(router)
