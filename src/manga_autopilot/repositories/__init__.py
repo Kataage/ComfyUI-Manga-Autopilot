@@ -5,6 +5,12 @@ from manga_autopilot.repositories.artifacts import (
     ArtifactNotFoundError,
     ArtifactRepository,
 )
+from manga_autopilot.repositories.durable_runs import (
+    DurableRunNotFoundError,
+    DurableRunRepository,
+    DurableRunStateError,
+    WorkLeaseConflictError,
+)
 from manga_autopilot.repositories.page_domain import (
     LayoutRepository,
     PageDomainCandidateSelectionError,
@@ -32,6 +38,10 @@ from manga_autopilot.repositories.work_lifecycle import (
 __all__ = [
     "ArtifactIntegrityError",
     "ArtifactNotFoundError",
+    "DurableRunNotFoundError",
+    "DurableRunRepository",
+    "DurableRunStateError",
+    "WorkLeaseConflictError",
     "ArtifactRepository",
     "PageDomainAuditRepository",
     "LayoutRepository",

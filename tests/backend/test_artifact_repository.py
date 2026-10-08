@@ -78,7 +78,7 @@ def test_w0005_schema_contract_indexes_and_fk(work):
         fks = {
             item["table"] for item in db.execute("PRAGMA foreign_key_list(artifacts)")
         }
-    assert version == 5
+    assert version >= 5
     assert {
         "id", "artifact_type", "scope_type", "scope_id", "relative_path",
         "mime_type", "sha256", "file_size", "width", "height", "run_id",
@@ -89,8 +89,8 @@ def test_w0005_schema_contract_indexes_and_fk(work):
         "idx_artifacts_scope_type", "idx_artifacts_sha256",
         "idx_artifacts_run_id", "idx_artifacts_status",
     } <= indexes
-    # Runs/GenerationAttempts do not yet have v2 tables. Their textual
-    # reference columns are retained without impossible forward FK targets.
+    # The immutable W0005 Artifact schema stores Run/Attempt references as
+    # text; adding W0006 Runs does not retroactively change its foreign keys.
     assert fks == {"commits"}
 
 
@@ -368,7 +368,9 @@ def test_w0004_to_w0005_upgrade_preserves_identity_backup_and_history(tmp_path):
         w4 = db.execute(
             "SELECT checksum FROM schema_migrations WHERE version = 4"
         ).fetchone()[0]
-    upgraded = migrate_work_database(old, work_id="historic_work")
+    upgraded = migrate_work_database(
+        old, work_id="historic_work", migrations=WORK_MIGRATIONS[:5]
+    )
     assert upgraded.applied_versions == (5,)
     assert upgraded.backup_path is not None
     assert upgraded.backup_path.is_file()
@@ -384,6 +386,8 @@ def test_w0004_to_w0005_upgrade_preserves_identity_backup_and_history(tmp_path):
             "SELECT name FROM sqlite_master WHERE name = 'artifacts'"
         ).fetchone() is not None
         assert db.execute("PRAGMA foreign_key_check").fetchall() == []
-    again = migrate_work_database(old, work_id="historic_work")
+    again = migrate_work_database(
+        old, work_id="historic_work", migrations=WORK_MIGRATIONS[:5]
+    )
     assert again.applied_versions == ()
     assert again.backup_path is None

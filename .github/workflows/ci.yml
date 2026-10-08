@@ -59,6 +59,7 @@ jobs:
           tests/backend/test_legacy_inventory.py
           tests/backend/test_work_manifest.py
           tests/backend/test_repository_transactions.py
+          tests/backend/test_durable_runs.py
           tests/backend/test_work_lifecycle_repository.py
           tests/backend/test_artifact_repository.py
           tests/backend/test_panel_candidate_selection.py
