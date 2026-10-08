@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-import threading
 import io
+import threading
 from pathlib import Path
 
 import pytest
@@ -418,8 +418,8 @@ async def test_candidate_pixel_metadata_budget_rejected_before_decode(api, monke
 async def test_generated_png_file_size_budget_before_artifact_registration(api, monkeypatch):
     client, base, _, handle, _, _, _, artifacts = api
     import manga_autopilot.services.work_page_export as module
-    from manga_autopilot.services.page_renderer import PageRenderResult
     from manga_autopilot.services.page_png_budget import PROFILES
+    from manga_autopilot.services.page_renderer import PageRenderResult
 
     def sparse_oversized_render(page_id, layouts, *, output_dir, **kwargs):
         path = Path(output_dir) / "page_0001.png"
