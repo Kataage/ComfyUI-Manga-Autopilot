@@ -64,4 +64,5 @@ jobs:
           tests/backend/test_work_page_png_export.py
           tests/backend/test_work_export_center_routes.py
           tests/backend/test_export_center_browser_contract.py
+          tests/backend/test_work_vertical_slice_live.py
           -q
