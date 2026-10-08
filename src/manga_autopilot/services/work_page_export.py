@@ -9,7 +9,6 @@ but rendered bytes are registered through the immutable Work ArtifactRepository.
 from __future__ import annotations
 
 import hashlib
-import json
 import math
 import tempfile
 from pathlib import Path
