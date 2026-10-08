@@ -380,7 +380,13 @@ class DurableRunRepository:
         with repository_write(self.database_path) as conn:
             self._assert_work(conn, work_id)
             if run_id is not None:
-                self._get(conn, "runs", run_id)
+                run = self._get(conn, "runs", run_id)
+                if run["scope_type"] == "WORK" and run["scope_id"] != work_id:
+                    raise WorkLeaseConflictError("Run belongs to a different Work")
+            if reclaim_expired_owner == lease_owner:
+                raise WorkLeaseConflictError(
+                    "recovery must rotate the unique lease owner token"
+                )
             old = conn.execute(
                 "SELECT * FROM work_leases WHERE work_id = ?",
                 (work_id,),
