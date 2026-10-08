@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-import asyncio
+import time
 from collections import Counter
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -368,11 +368,11 @@ async def test_long_running_hook_renews_the_same_work_lease(
     run_id = start(repo)
     observations = []
 
-    async def slow_render(_run):
+    def slow_render(_run):
         before = repo.inspect_lease("work_246")
         assert before is not None
         clock.moment += timedelta(seconds=4)
-        await asyncio.sleep(2.3)
+        time.sleep(2.3)
         after = repo.inspect_lease("work_246")
         assert after is not None
         observations.extend((before["expires_at"], after["expires_at"]))
