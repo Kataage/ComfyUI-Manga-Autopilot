@@ -522,3 +522,123 @@ async def test_attestation_identity_is_checked_not_merely_commit_type(fresh_api)
         + rendered["artifact_id"] + "/png?require_current=1"
     )
     assert download.status == 409
+
+
+async def test_archived_panel_candidate_publication_does_not_stale_current_page_png(
+    fresh_api, aiohttp_client,
+):
+    client, root, handle, _, layouts, panels, artifacts = fresh_api
+    # Page A has a selected current candidate. Panel B is archived before
+    # rendering, has no selection or candidate, and is not a compositing input.
+    layouts.create_slot(
+        slot_id="slot_b", layout_id="layout_a", slot_key="secondary",
+        reading_order=2,
+        geometry={"x": 120, "y": 10, "width": 70, "height": 80},
+    )
+    panels.create_panel(
+        panel_id="panel_b", page_id="page_a", order_index=2,
+        panel_purpose="Historical only", layout_slot_id="slot_b",
+    )
+    panel_b = panels.get_panel("panel_b")
+    archived = panels.update_panel(
+        "panel_b", expected_revision=panel_b["revision"],
+        archived_at="2026-10-08T13:00:00Z",
+    )
+    assert archived["selected_candidate_id"] is None
+
+    original = await _export_fresh(client)
+    original_record = artifacts.get(original["artifact_id"])
+    original_bytes = (handle.root / original["relative_path"]).read_bytes()
+    listed = await _list_fresh(client)
+    assert len(listed) == 1
+    assert listed[0]["freshness"] == "CURRENT"
+    assert listed[0]["is_current"] is True
+    png_url = (
+        "/manga_autopilot/api/v2/works/work_fresh/exports/"
+        + original["artifact_id"] + "/png"
+    )
+    current = await client.get(png_url + "?require_current=1")
+    assert current.status == 200
+    assert current.headers["X-Work-Export-Freshness"] == "CURRENT"
+    assert await current.read() == original_bytes
+
+    with repository_read(handle.database_path) as db:
+        invalidations_before = db.execute(
+            "SELECT COUNT(*) FROM invalidations",
+        ).fetchone()[0]
+    artifacts.register_local_bytes(
+        artifact_id="candidate_for_archived_panel", data=_png("#772244"),
+        relative_path="assets/panels/candidate_for_archived_panel.png",
+        artifact_type="panel_candidate", scope_type="panel",
+        scope_id="panel_b", mime_type="image/png",
+        dependency_fingerprint="archive-candidate-b",
+    )
+    # Candidate publication adds an Artifact commit, but neither edits the
+    # archived Panel nor changes the Page input revision/invalidations.
+    assert panels.get_panel("panel_b") == archived
+    with repository_read(handle.database_path) as db:
+        assert db.execute(
+            "SELECT COUNT(*) FROM invalidations",
+        ).fetchone()[0] == invalidations_before
+
+    still_current = (await _list_fresh(client))[0]
+    assert still_current["id"] == original["artifact_id"]
+    assert still_current["freshness"] == "CURRENT"
+    assert still_current["freshness_reason"] is None
+    assert still_current["is_current"] is True
+    gated = await client.get(png_url + "?require_current=1")
+    assert gated.status == 200
+    assert gated.headers["X-Work-Export-Freshness"] == "CURRENT"
+    assert await gated.read() == original_bytes
+    assert artifacts.get(original["artifact_id"]) == original_record
+    assert (handle.root / original["relative_path"]).read_bytes() == original_bytes
+
+    # The classifier must produce the same result after a new app/reopen.
+    restarted_app = web.Application()
+    register_all(restarted_app, storage_root=str(root))
+    restarted = await aiohttp_client(restarted_app)
+    assert (await _list_fresh(restarted))[0]["freshness"] == "CURRENT"
+
+    # Unarchiving is a revisioned source edit: older PNG becomes STALE,
+    # even though an archived Candidate did not incorrectly stale it.
+    revived = panels.update_panel(
+        "panel_b", expected_revision=archived["revision"], archived_at=None,
+    )
+    assert revived["revision"] == archived["revision"] + 1
+    old_after_unarchive = (await _list_fresh(client))[0]
+    assert old_after_unarchive["freshness"] == "STALE"
+    assert old_after_unarchive["freshness_reason"] == "page_inputs_changed"
+    denied = await client.get(png_url + "?require_current=1")
+    assert denied.status == 409
+    historical = await client.get(png_url)
+    assert historical.status == 200
+    assert historical.headers["X-Work-Export-Freshness"] == "STALE"
+    assert await historical.read() == original_bytes
+
+    # Now that B is active and has one implicit candidate, a new export
+    # legitimately depends on B and is eligible for CURRENT.
+    refreshed = await _export_fresh(client)
+    rows = await _list_fresh(client)
+    assert [row["freshness"] for row in rows] == ["CURRENT", "STALE"]
+    assert rows[0]["id"] == refreshed["artifact_id"]
+
+    # An additional Candidate for an *active* unpinned Panel B must still
+    # invalidate that newer PNG, preserving #333's ambiguity guard.
+    artifacts.register_local_bytes(
+        artifact_id="candidate_for_active_panel", data=_png("#1177aa"),
+        relative_path="assets/panels/candidate_for_active_panel.png",
+        artifact_type="panel_candidate", scope_type="panel",
+        scope_id="panel_b", mime_type="image/png",
+        dependency_fingerprint="active-candidate-b-later",
+    )
+    newer = (await _list_fresh(client))[0]
+    assert newer["id"] == refreshed["artifact_id"]
+    assert newer["freshness"] == "STALE"
+    assert newer["freshness_reason"] == "candidate_choice_changed"
+    fresh_only = await client.get(
+        "/manga_autopilot/api/v2/works/work_fresh/exports/"
+        + refreshed["artifact_id"] + "/png?require_current=1"
+    )
+    assert fresh_only.status == 409
+    assert artifacts.get(original["artifact_id"]) == original_record
+    assert (handle.root / original["relative_path"]).read_bytes() == original_bytes
