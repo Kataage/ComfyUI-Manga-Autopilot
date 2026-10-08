@@ -583,9 +583,22 @@ class DurableRunRepository:
     def release_lease(self, *, work_id: str, lease_owner: str) -> None:
         _required(lease_owner, "lease_owner")
         with repository_write(self.database_path) as conn:
-            cursor = conn.execute(
+            lease = conn.execute(
+                "SELECT expires_at FROM work_leases "
+                "WHERE work_id = ? AND lease_owner = ?",
+                (work_id, lease_owner),
+            ).fetchone()
+            if (
+                lease is None
+                or _utc(datetime.fromisoformat(lease["expires_at"])) <= self._now()
+            ):
+                # An expired owner is no longer authorized to erase its
+                # recovery evidence. Keep the tombstone for explicit,
+                # matching-token reclaim by a different owner.
+                raise WorkLeaseConflictError(
+                    "mutation lease missing, expired or owner mismatch"
+                )
+            conn.execute(
                 "DELETE FROM work_leases WHERE work_id = ? AND lease_owner = ?",
                 (work_id, lease_owner),
             )
-            if cursor.rowcount != 1:
-                raise WorkLeaseConflictError("mutation lease owner mismatch")
