@@ -429,6 +429,7 @@ class WorkPageExportService:
                 dependency_fingerprint=fingerprint,
                 artifact_id=artifact_id,
                 commit_guard=guard_source_revision,
+                source_fingerprint_payload=fingerprint_payload,
             )
         return {
             "work_id": work_id,
