@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import io
+import json
 import threading
 from pathlib import Path
 
@@ -402,3 +403,122 @@ async def test_later_unpinned_candidate_cannot_leave_page_png_current(fresh_api)
         + exported["artifact_id"] + "/png?require_current=1"
     )
     assert gated.status == 409
+
+
+async def test_generic_sha_looking_page_render_never_acquires_current_attestation(
+    fresh_api, aiohttp_client,
+):
+    client, root, handle, _, _, _, artifacts = fresh_api
+    imported = artifacts.register_local_bytes(
+        artifact_id="manual_page_png",
+        data=_png("#f00a77"),
+        relative_path="exports/pages/manual_page_png.png",
+        artifact_type="page_render", scope_type="page", scope_id="page_a",
+        mime_type="image/png", dependency_fingerprint="0" * 64,
+    )
+    path = "/manga_autopilot/api/v2/works/work_fresh/exports/manual_page_png/png"
+    rows = await _list_fresh(client)
+    assert len(rows) == 1
+    assert rows[0]["id"] == "manual_page_png"
+    assert rows[0]["freshness"] == "UNVERIFIED"
+    assert rows[0]["is_current"] is False
+    assert rows[0]["freshness_reason"] == "source_provenance_unavailable"
+    gated = await client.get(path + "?require_current=1")
+    assert gated.status == 409
+    assert (await gated.json())["freshness"] == "UNVERIFIED"
+    old = await client.get(path)
+    assert old.status == 200
+    assert old.headers["X-Work-Export-Freshness"] == "UNVERIFIED"
+    assert await old.read() == _png("#f00a77")
+    with repository_read(handle.database_path) as db:
+        operation = db.execute(
+            "SELECT operation_type FROM commits WHERE commit_seq = ?",
+            (imported["created_commit_seq"],),
+        ).fetchone()["operation_type"]
+    assert operation == "register_artifact"
+
+    # Generic file registration with a caller-supplied no-op guard must not
+    # certify itself either: only the exporter-private attested path may do it.
+    candidate_file = handle.root / "assets/panels/candidate_a.png"
+    supplied_guard = artifacts.register_local_file(
+        source_path=candidate_file,
+        relative_path="exports/pages/manual_guarded_png.png",
+        artifact_id="manual_guarded_png",
+        artifact_type="page_render", scope_type="page", scope_id="page_a",
+        mime_type="image/png", dependency_fingerprint="1" * 64,
+        commit_guard=lambda connection: None,
+    )
+    assert supplied_guard["status"] == "READY"
+    assert [row["freshness"] for row in await _list_fresh(client)] == [
+        "UNVERIFIED", "UNVERIFIED",
+    ]
+
+    rendered = await _export_fresh(client)
+    rows = await _list_fresh(client)
+    assert [row["freshness"] for row in rows] == [
+        "CURRENT", "UNVERIFIED", "UNVERIFIED",
+    ]
+    assert rows[0]["id"] == rendered["artifact_id"]
+    with repository_read(handle.database_path) as db:
+        row = db.execute(
+            """SELECT c.operation_type, c.reason
+               FROM artifacts a JOIN commits c ON c.commit_seq = a.created_commit_seq
+               WHERE a.id = ?""",
+            (rendered["artifact_id"],),
+        ).fetchone()
+    assert row["operation_type"] == "register_verified_page_render_v1"
+    attestation = json.loads(row["reason"])
+    assert attestation["attestation_version"] == 1
+    assert attestation["artifact_id"] == rendered["artifact_id"]
+    assert attestation["page_id"] == "page_a"
+    assert attestation["dependency_fingerprint"] == (
+        rendered["dependency_fingerprint"]
+    )
+    source = attestation["source_fingerprint_payload"]
+    assert source["page_id"] == "page_a"
+    assert source["panel_artifacts"][0]["artifact_id"] == "candidate_a"
+    assert source["background"] == "#ffffff"
+    assert source["outer_border"] is True
+    assert source["export_profile"] == "screen"
+    authorized = await client.get(
+        "/manga_autopilot/api/v2/works/work_fresh/exports/"
+        + rendered["artifact_id"] + "/png?require_current=1"
+    )
+    assert authorized.status == 200
+    assert authorized.headers["X-Work-Export-Freshness"] == "CURRENT"
+    assert await authorized.read() != _png("#f00a77")
+
+    restarted_app = web.Application()
+    register_all(restarted_app, storage_root=str(root))
+    restarted = await aiohttp_client(restarted_app)
+    restored = await _list_fresh(restarted)
+    assert [row["freshness"] for row in restored] == [
+        "CURRENT", "UNVERIFIED", "UNVERIFIED",
+    ]
+    assert artifacts.get("manual_page_png") == imported
+
+
+async def test_attestation_identity_is_checked_not_merely_commit_type(fresh_api):
+    client, _, handle, _, _, _, _ = fresh_api
+    rendered = await _export_fresh(client)
+    from manga_autopilot.storage import repository_write
+
+    with repository_write(handle.database_path) as db:
+        # Simulate a Work DB that contains a mismatching/unrelated commit
+        # reason despite the artifact pointing to a trusted operation name.
+        db.execute(
+            "UPDATE commits SET reason = ? WHERE commit_seq = ?",
+            ("page_export_attestation_v1:wrong_artifact:page_a:" + "0" * 64,
+             db.execute(
+                 "SELECT created_commit_seq FROM artifacts WHERE id = ?",
+                 (rendered["artifact_id"],),
+             ).fetchone()[0]),
+        )
+    row = (await _list_fresh(client))[0]
+    assert row["freshness"] == "UNVERIFIED"
+    assert row["is_current"] is False
+    download = await client.get(
+        "/manga_autopilot/api/v2/works/work_fresh/exports/"
+        + rendered["artifact_id"] + "/png?require_current=1"
+    )
+    assert download.status == 409

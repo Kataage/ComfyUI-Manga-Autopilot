@@ -352,12 +352,12 @@ async def test_edit_after_post_render_check_cannot_commit_stale_png(api, monkeyp
     client, base, _, handle, _, layouts, _, artifacts = api
     from manga_autopilot.storage import repository_read
 
-    original = ArtifactRepository.register_local_file
+    original = ArtifactRepository._register_verified_page_render_file
     mutations = []
 
     def edit_before_artifact_copy(self, **kwargs):
         # This is AFTER the exporter's old final self.pages.get_page() check.
-        if kwargs["artifact_type"] == "page_render":
+        if kwargs["page_id"] == "page_main":
             current = layouts.get_layout("layout_main")
             layouts.update_layout(
                 "layout_main", expected_revision=current["revision"],
@@ -367,7 +367,8 @@ async def test_edit_after_post_render_check_cannot_commit_stale_png(api, monkeyp
         return original(self, **kwargs)
 
     monkeypatch.setattr(
-        ArtifactRepository, "register_local_file", edit_before_artifact_copy
+        ArtifactRepository, "_register_verified_page_render_file",
+        edit_before_artifact_copy
     )
     response, body = await _export(client, base)
     assert response.status == 409, body
