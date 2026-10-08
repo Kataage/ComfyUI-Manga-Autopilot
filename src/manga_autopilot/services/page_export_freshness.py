@@ -92,14 +92,17 @@ def page_png_freshness(
             "stale_since_commit_seq": invalidation,
         }
 
-    # The exporter may use a sole unpinned READY candidate if Panel has no
-    # selection. A later Candidate publication makes that choice ambiguous
-    # without a Panel revision change, so the invalidation ledger alone is
-    # insufficient. A new candidate is a conservative stale signal.
+    # The exporter may use a sole unpinned READY candidate if an *active*
+    # Panel has no selection. A later Candidate publication makes that choice
+    # ambiguous without a Panel revision. Archived Panels, however, are
+    # excluded from #337's compositing inputs and must not stale active PNGs
+    # merely because their unrelated Candidate history grows. All checks use
+    # this same Work SQLite read snapshot as Page/archive and invalidations.
     ambiguous = connection.execute(
         """SELECT 1 FROM panels p
            JOIN artifacts a ON a.scope_type = 'panel' AND a.scope_id = p.id
-           WHERE p.page_id = ? AND p.selected_candidate_id IS NULL
+           WHERE p.page_id = ? AND p.archived_at IS NULL
+             AND p.selected_candidate_id IS NULL
              AND a.artifact_type = 'panel_candidate'
              AND a.status = 'READY' AND a.archived_at IS NULL
              AND a.created_commit_seq > ?

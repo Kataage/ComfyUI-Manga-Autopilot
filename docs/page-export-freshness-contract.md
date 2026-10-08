@@ -10,14 +10,15 @@ must not be rewritten when later Page editing occurs.
 `GET /api/v2/works/{work_id}/exports` returns every non-archived READY
 `page_render` PNG row with a separate read-model freshness field:
 
-- `CURRENT` / `is_current=true`: registered, attributable to a Page render,
+- `CURRENT` / `is_current=true`: a source-guarded #343 exporter
+  registration with its canonical Work-commit provenance attestation verified,
   owning Page/Layout present, and no later relevant committed source change.
 - `STALE` / `is_current=false`: a later Page, Layout, Slot or Panel change
   invalidated the source; the Page was archived; or a new READY Candidate
   made an unpinned implicit Candidate selection ambiguous.
-- `UNVERIFIED` / `is_current=false`: historical/manual Artifact lacks the
-  v2 render fingerprint or its source Page/Layout is absent, so freshness
-  cannot be positively established.
+- `UNVERIFIED` / `is_current=false`: historical/manual Artifact lacks
+  a valid #343 Work-commit source-provenance attestation, or its source
+  Page/Layout is absent, so freshness cannot be positively established.
 
 Additional response fields: `freshness_reason` and
 `stale_since_commit_seq` (the earliest relevant post-publication
@@ -39,10 +40,23 @@ Artifact lifecycle value. Editing another Page cannot stale unrelated
 outputs. Repeated exports from unchanged source may both be CURRENT. This
 classifier intentionally does not depend on legacy Project JSON.
 
-When Panel selection is NULL and a sole READY panel Candidate is used by the
-exporter, a later newly registered READY Candidate for that Panel also
-invalidates the earlier implicit choice, even without a formal Panel update.
-The exporter itself continues to require an unambiguous candidate at creation.
+When an **active** Panel's selection is NULL and a sole READY panel Candidate
+is used by the exporter, a later newly registered READY Candidate for that
+Panel also invalidates the earlier implicit choice, even without a formal
+Panel update. The exporter itself continues to require an unambiguous
+candidate at creation.
+
+**Archive isolation (#345):** `panels.archived_at IS NULL` must be enforced
+for the implicit Candidate-ambiguity query in the same Work SQLite read
+snapshot as archive status, attestation and invalidations. #337's exporter
+excludes archived Panels from the current rendering dependency set. Merely
+registering an additional READY Candidate against an archived, unpinned Panel
+must **not** stale a correctly attested Page PNG rendered *after* that Panel
+was archived. Explicitly unarchiving the Panel is a revisioned domain change
+that **does** stale previous Page PNGs; a subsequent render incorporating the
+newly active Panel is once again sensitive to later Candidate ambiguity.
+The existing invalidation chronology still marks source edits STALE and no
+historical Artifact status, SHA256 or PNG bytes are mutated.
 
 ## Access and safety
 
