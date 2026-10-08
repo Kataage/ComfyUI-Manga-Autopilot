@@ -48,6 +48,63 @@ class InterruptedStepError(RuntimeError):
     """The hook reports an interrupted or uncertain operation."""
 
 
+class DurableHeartbeatLostError(WorkLeaseConflictError):
+    """The background Work lease heartbeat is no longer protecting this Run."""
+
+
+def _check_heartbeat(task: asyncio.Task[None]) -> None:
+    """Never begin or acknowledge an effect after its lease guardian exits."""
+    if not task.done():
+        return
+    if task.cancelled():
+        raise DurableHeartbeatLostError("durable Work lease heartbeat was cancelled")
+    try:
+        task.result()
+    except Exception as exc:
+        raise DurableHeartbeatLostError(
+            "durable Work lease heartbeat failed; reconcile any external effects"
+        ) from exc
+    raise DurableHeartbeatLostError("durable Work lease heartbeat stopped unexpectedly")
+
+
+async def _invoke_guarded_hook(
+    hook: Any, run: AutopilotRun, heartbeat_task: asyncio.Task[None],
+) -> Any:
+    """Race the hook against lease loss, then drain every owned local worker.
+
+    An asyncio cancellation cannot stop a synchronous ComfyUI/Pillow hook.
+    The parent still holds its Work lease and must never detach the child task.
+    On lost ownership its durable results are NOT persisted as successful.
+    """
+    _check_heartbeat(heartbeat_task)
+    hook_task = asyncio.create_task(_invoke_durable_hook(hook, run))
+    try:
+        await asyncio.wait(
+            {hook_task, heartbeat_task}, return_when=asyncio.FIRST_COMPLETED,
+        )
+        # Lease loss wins even if hook and guardian finished in the same tick.
+        _check_heartbeat(heartbeat_task)
+        return await hook_task
+    except (Exception, asyncio.CancelledError):
+        if not hook_task.done():
+            hook_task.cancel()
+        # Cancellation of the parent may repeat during the drain; the
+        # to_thread hook still owns its OS worker until it actually exits.
+        while not hook_task.done():
+            try:
+                await asyncio.shield(hook_task)
+            except asyncio.CancelledError:
+                continue
+            except Exception:
+                break
+        if not hook_task.cancelled():
+            try:
+                hook_task.result()
+            except BaseException:
+                pass  # The original failure/cancellation owns this outcome.
+        raise
+
+
 def _json_value(value: Any) -> Any:
     """Use only data that survives a new process and exact JSON replay."""
     if isinstance(value, BaseModel):
@@ -128,8 +185,10 @@ class DurableAutopilotOrchestrator:
         approve_needs_attention_retry: bool = False,
     ) -> AutopilotRun:
         """Execute/resume a Work-scoped Run with persist-first step outcomes."""
-        if self.lease_ttl_seconds <= 0:
-            raise ValueError("lease_ttl_seconds must be positive")
+        # The guardian ticks at least once per second. Smaller TTLs expire
+        # on or before their first renewal, so fail before acquiring a lease.
+        if type(self.lease_ttl_seconds) is not int or self.lease_ttl_seconds < 3:
+            raise ValueError("lease_ttl_seconds must be an integer >= 3")
         if not isinstance(input_payload, Mapping) or not isinstance(step_inputs, Mapping):
             raise TypeError("durable inputs must be mappings")
         durable = self.repository.get_run(run_id)
@@ -170,11 +229,16 @@ class DurableAutopilotOrchestrator:
             period = max(1, min(60, self.lease_ttl_seconds // 3))
             while True:
                 await asyncio.sleep(period)
-                self.repository.heartbeat_lease(
-                    work_id=self.work_id, lease_owner=owner,
-                    ttl_seconds=self.lease_ttl_seconds,
-                )
-                self.repository.heartbeat_run(run_id, lease_owner=owner)
+                try:
+                    self.repository.heartbeat_lease(
+                        work_id=self.work_id, lease_owner=owner,
+                        ttl_seconds=self.lease_ttl_seconds,
+                    )
+                    self.repository.heartbeat_run(run_id, lease_owner=owner)
+                except Exception as exc:
+                    raise DurableHeartbeatLostError(
+                        "durable Work lease heartbeat renewal failed"
+                    ) from exc
 
         try:
             durable = self.repository.get_run(run_id)
@@ -206,6 +270,7 @@ class DurableAutopilotOrchestrator:
                 for step in self.repository.list_steps(run_id)
             }
             for target_state, hook_name in _STEP_NAMES.items():
+                _check_heartbeat(heartbeat_task)
                 fingerprint = input_fingerprint({
                     "step_key": hook_name,
                     "stage_input": stage_inputs.get(hook_name),
@@ -271,9 +336,11 @@ class DurableAutopilotOrchestrator:
                 memory_step = run.record_step(hook_name, target_state)
                 run.log_event("step_started", {"step": hook_name})
                 try:
-                    result = await _invoke_durable_hook(
+                    result = await _invoke_guarded_hook(
                         getattr(self.hooks, hook_name, None), run,
+                        heartbeat_task,
                     )
+                    _check_heartbeat(heartbeat_task)
                     replayable = _json_value(result)
                     self.repository.finish_step(
                         step["id"], status="COMPLETED",
@@ -283,6 +350,24 @@ class DurableAutopilotOrchestrator:
                     if replayable is not None:
                         run.store(hook_name, replayable)
                     run.log_event("step_finished", {"step": hook_name})
+                except DurableHeartbeatLostError:
+                    # If this owner still has a valid lease, record an
+                    # INTERRUPTED attempt before releasing it. If the lease
+                    # already expired or was reclaimed, only the new owner
+                    # may reconcile the still-RUNNING attempt.
+                    try:
+                        self.repository.finish_step(
+                            step["id"], status="INTERRUPTED",
+                            error={"reason": "lease_heartbeat_lost"},
+                            lease_owner=owner,
+                        )
+                        self.repository.transition_run(
+                            run_id, expected_status="RUNNING",
+                            new_status="INTERRUPTED", lease_owner=owner,
+                        )
+                    except (WorkLeaseConflictError, DurableRunStateError):
+                        pass
+                    raise
                 except asyncio.CancelledError:
                     self.repository.finish_step(
                         step["id"], status="INTERRUPTED",
@@ -326,16 +411,28 @@ class DurableAutopilotOrchestrator:
                     )
                     return run
 
+            _check_heartbeat(heartbeat_task)
             self.repository.transition_run(
                 run_id, expected_status="RUNNING",
                 new_status="COMPLETED", lease_owner=owner,
             )
             # Best-effort legacy files are supplemental; Work DB is authority.
             return legacy._finalize(run)
+        except DurableHeartbeatLostError:
+            # Lease failure can also be noticed between stages, with no
+            # active Step. The Run must not be left as a normal success.
+            try:
+                self.repository.transition_run(
+                    run_id, expected_status="RUNNING",
+                    new_status="INTERRUPTED", lease_owner=owner,
+                )
+            except (WorkLeaseConflictError, DurableRunStateError):
+                pass
+            raise
         finally:
             if heartbeat_task is not None:
                 heartbeat_task.cancel()
-                with suppress(asyncio.CancelledError, WorkLeaseConflictError, DurableRunStateError):
+                with suppress(asyncio.CancelledError, DurableHeartbeatLostError):
                     await heartbeat_task
             # Old process owners cannot release a newly reclaimed lease.
             try:
@@ -347,6 +444,7 @@ class DurableAutopilotOrchestrator:
 
 
 __all__ = [
+    "DurableHeartbeatLostError",
     "DurableAutopilotOrchestrator",
     "InterruptedStepError",
     "NeedsAttentionStepError",
