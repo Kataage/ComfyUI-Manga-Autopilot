@@ -1866,14 +1866,15 @@ def test_phase_c_audit_recovery_requires_previously_owned_run(
         )
         clock.advance(4)
         reclaim = "maintenance"
-    recovery.acquire_lease(
-        work_id="work_test", lease_owner="new_owner",
-        lease_kind="AUTOPILOT_MUTATION", ttl_seconds=10,
-        run_id=run_id, reclaim_expired_owner=reclaim,
-    )
     before_lease = recovery.inspect_lease("work_test")
+    # Fail at the earliest transaction boundary. Otherwise an attached
+    # lease on an ownerless RUNNING Run cannot be ordinarily released (#382).
     with pytest.raises(WorkLeaseConflictError, match="prior|previous|reclaim"):
-        recovery.recover_interrupted_run(run_id, lease_owner="new_owner")
+        recovery.acquire_lease(
+            work_id="work_test", lease_owner="new_owner",
+            lease_kind="AUTOPILOT_MUTATION", ttl_seconds=10,
+            run_id=run_id, reclaim_expired_owner=reclaim,
+        )
 
     assert recovery.get_run(run_id) == before_run
     assert recovery.get_step(step["id"]) == before_step
@@ -2001,3 +2002,73 @@ def test_issue395_valid_recovery_rejects_late_original_owner(
     with pytest.raises(WorkLeaseConflictError):
         repo.heartbeat_run(run_id, lease_owner="lost")
     repo.release_lease(work_id="work_test", lease_owner="recovered")
+
+
+def test_issue395_ownerless_running_run_remains_generically_reconcilable(
+    tmp_path: Path,
+) -> None:
+    """Rejected lease must not strand unleased generic Run/Step/Attempt."""
+    db = tmp_path / "work.sqlite3"
+    _work(db)
+    repo = DurableRunRepository(db)
+    run_id = _run(repo)
+    repo.transition_run(run_id, expected_status="PENDING", new_status="RUNNING")
+    step = repo.create_step(
+        run_id=run_id, step_key="render", input_fingerprint="v1",
+    )
+    repo.start_step(step["id"], input_fingerprint="v1")
+    assert repo.inspect_lease("work_test") is None
+
+    with pytest.raises(WorkLeaseConflictError, match="prior"):
+        repo.acquire_lease(
+            work_id="work_test", lease_owner="new",
+            lease_kind="AUTOPILOT_MUTATION", ttl_seconds=10, run_id=run_id,
+        )
+    assert repo.inspect_lease("work_test") is None
+
+    repo.finish_step(step["id"], status="INTERRUPTED")
+    repo.transition_run(
+        run_id, expected_status="RUNNING", new_status="INTERRUPTED",
+    )
+    assert repo.get_run(run_id)["status"] == "INTERRUPTED"
+    assert repo.get_step(step["id"])["status"] == "INTERRUPTED"
+    assert repo.list_step_attempts(step["id"])[0]["status"] == "INTERRUPTED"
+
+
+def test_issue395_privileged_recovery_fences_legacy_ownerless_run_with_lease(
+    tmp_path: Path,
+) -> None:
+    """Recovery itself must still reject malformed, already attached leases."""
+    db = tmp_path / "work.sqlite3"
+    _work(db)
+    clock = Clock()
+    repo = DurableRunRepository(db, clock=clock)
+    run_id = _run(repo)
+    repo.transition_run(run_id, expected_status="PENDING", new_status="RUNNING")
+    step = repo.create_step(
+        run_id=run_id, step_key="render", input_fingerprint="v1",
+    )
+    repo.start_step(step["id"], input_fingerprint="v1")
+    # Fixture-only corrupted historical snapshot. The new acquire_lease()
+    # correctly refuses to manufacture this binding through production APIs.
+    with repository_write(db) as conn:
+        conn.execute(
+            """INSERT INTO work_leases (
+                work_id, lease_owner, lease_kind, run_id, heartbeat_at, expires_at
+            ) VALUES (?, ?, ?, ?, ?, ?)""",
+            (
+                "work_test", "fabricated", "AUTOPILOT_MUTATION", run_id,
+                clock.now.isoformat(),
+                (clock.now + timedelta(seconds=10)).isoformat(),
+            ),
+        )
+    before_run = repo.get_run(run_id)
+    before_step = repo.get_step(step["id"])
+    before_attempts = repo.list_step_attempts(step["id"])
+    before_lease = repo.inspect_lease("work_test")
+    with pytest.raises(WorkLeaseConflictError, match="prior"):
+        repo.recover_interrupted_run(run_id, lease_owner="fabricated")
+    assert repo.get_run(run_id) == before_run
+    assert repo.get_step(step["id"]) == before_step
+    assert repo.list_step_attempts(step["id"]) == before_attempts
+    assert repo.inspect_lease("work_test") == before_lease
