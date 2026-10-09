@@ -1507,19 +1507,19 @@ def test_terminal_run_rejects_all_step_edits_before_work_lease_release(
     before_steps = repo.list_steps(run_id)
     before_attempts = repo.list_step_attempts(finished)
     before_lease = repo.inspect_lease("work_test")
-    with pytest.raises(DurableRunStateError, match="terminal Run"):
+    with pytest.raises(WorkLeaseConflictError, match="stale or expired"):
         repo.create_step(
             run_id=run_id, step_key="appended", input_fingerprint="v2",
             lease_owner="live_owner",
         )
     if terminal_status == "COMPLETED":
-        with pytest.raises(DurableRunStateError, match="terminal Run"):
+        with pytest.raises(WorkLeaseConflictError, match="stale or expired"):
             repo.mark_step_stale(
                 finished, new_fingerprint="v2", lease_owner="live_owner",
             )
     else:
         assert pending is not None
-        with pytest.raises(DurableRunStateError, match="terminal Run"):
+        with pytest.raises(WorkLeaseConflictError, match="stale or expired"):
             repo.set_pending_fingerprint(
                 pending, input_fingerprint="v2", lease_owner="live_owner",
             )
@@ -1586,7 +1586,7 @@ def test_completed_step_can_be_staled_during_running_parent_but_not_after(
         run_id, expected_status="RUNNING", new_status="COMPLETED",
         lease_owner="owner",
     )["status"] == "COMPLETED"
-    with pytest.raises(DurableRunStateError, match="terminal Run"):
+    with pytest.raises(WorkLeaseConflictError, match="stale or expired"):
         repo.mark_step_stale(
             step_id, new_fingerprint="v3", lease_owner="owner",
         )
@@ -1625,7 +1625,7 @@ def test_legacy_terminal_parent_cannot_rewrite_running_step_attempt(
     before = repo.get_step(step_id)
     attempts = repo.list_step_attempts(step_id)
     lease = repo.inspect_lease("work_test")
-    with pytest.raises(DurableRunStateError, match="terminal Run"):
+    with pytest.raises(WorkLeaseConflictError, match="stale or expired"):
         if late_op == "heartbeat":
             repo.heartbeat_step(step_id, lease_owner="owner")
         else:
