@@ -362,9 +362,14 @@ class DurableRunRepository:
             if (
                 lease is None
                 or _utc(datetime.fromisoformat(lease["expires_at"])) <= self._now()
+                or run["lease_owner"] is None
                 or run["lease_owner"] == lease_owner
             ):
-                raise WorkLeaseConflictError("recovery requires a new active lease")
+                # A fresh lease attached to an ownerless generic RUNNING Run
+                # is not proof of a crashed, previously leased Run worker.
+                raise WorkLeaseConflictError(
+                    "recovery requires a prior Run owner and a new active lease"
+                )
             timestamp = self._now().isoformat()
             conn.execute(
                 """UPDATE run_step_attempts SET status = 'INTERRUPTED',
@@ -632,6 +637,24 @@ class DurableRunRepository:
                 "SELECT * FROM work_leases WHERE work_id = ?",
                 (work_id,),
             ).fetchone()
+            # A non-null Run owner is a durable crashed-worker marker, but
+            # it must not become a recovery capability on its own. Verify
+            # that the *previous* lease truly belonged to this Run/owner and
+            # was explicitly presented for rotation before replacing it.
+            # This also fences legacy orphan Run-owner snapshots.
+            if run_id is not None and run["status"] == "RUNNING" and (
+                run["lease_owner"] is not None
+            ):
+                if (
+                    old is None
+                    or old["run_id"] != run_id
+                    or old["lease_owner"] != run["lease_owner"]
+                    or reclaim_expired_owner != run["lease_owner"]
+                ):
+                    raise WorkLeaseConflictError(
+                        "RUNNING Run requires explicit recovery of its "
+                        "prior Run-bound lease owner"
+                    )
             if old is not None:
                 expiry = _utc(datetime.fromisoformat(old["expires_at"]))
                 if expiry > now:
