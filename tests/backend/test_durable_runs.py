@@ -797,3 +797,79 @@ def test_work_mutation_lease_rejects_nonmatching_run_scope(
             run_id=foreign,
         )
     assert repo.inspect_lease("work_test") is None
+
+
+# Regression matrix reproduced in independent Phase C audit for Issue #382. Do not merge this RED branch.
+def test_phase_c_audit_live_lease_release_cannot_orphan_running_run(
+    tmp_path: Path,
+) -> None:
+    db = tmp_path / "work.sqlite3"
+    _work(db)
+    repo = DurableRunRepository(db)
+    old_run = _run(repo)
+    other_run = _run(repo)
+    repo.acquire_lease(
+        work_id="work_test", lease_owner="still_running",
+        lease_kind="AUTOPILOT_MUTATION", ttl_seconds=60, run_id=old_run,
+    )
+    repo.transition_run(
+        old_run, expected_status="PENDING", new_status="RUNNING",
+        lease_owner="still_running",
+    )
+    step_id = repo.create_step(
+        run_id=old_run, step_key="generate_panels",
+        input_fingerprint="v1", lease_owner="still_running",
+    )["id"]
+    repo.start_step(
+        step_id, input_fingerprint="v1", lease_owner="still_running",
+    )
+    before_run = repo.get_run(old_run)
+    before_step = repo.get_step(step_id)
+    before_attempts = repo.list_step_attempts(step_id)
+    old_lease = repo.inspect_lease("work_test")
+    with pytest.raises(WorkLeaseConflictError):
+        repo.release_lease(work_id="work_test", lease_owner="still_running")
+    assert repo.get_run(old_run) == before_run
+    assert repo.get_step(step_id) == before_step
+    assert repo.list_step_attempts(step_id) == before_attempts
+    assert repo.inspect_lease("work_test") == old_lease
+    with pytest.raises(WorkLeaseConflictError):
+        repo.acquire_lease(
+            work_id="work_test", lease_owner="new_owner",
+            lease_kind="AUTOPILOT_MUTATION", ttl_seconds=60,
+            run_id=other_run,
+        )
+
+
+def test_phase_c_audit_live_lease_release_checks_orphan_step_attempts(
+    tmp_path: Path,
+) -> None:
+    db = tmp_path / "work.sqlite3"
+    _work(db)
+    repo = DurableRunRepository(db)
+    run_id = _run(repo)
+    repo.acquire_lease(
+        work_id="work_test", lease_owner="first",
+        lease_kind="AUTOPILOT_MUTATION", ttl_seconds=60, run_id=run_id,
+    )
+    repo.transition_run(
+        run_id, expected_status="PENDING", new_status="RUNNING",
+        lease_owner="first",
+    )
+    step_id = repo.create_step(
+        run_id=run_id, step_key="export",
+        input_fingerprint="v1", lease_owner="first",
+    )["id"]
+    repo.start_step(step_id, input_fingerprint="v1", lease_owner="first")
+    repo.transition_run(
+        run_id, expected_status="RUNNING", new_status="COMPLETED",
+        lease_owner="first",
+    )
+    assert repo.get_run(run_id)["status"] == "COMPLETED"
+    assert repo.get_step(step_id)["status"] == "RUNNING"
+    attempt_before = repo.list_step_attempts(step_id)
+    with pytest.raises(WorkLeaseConflictError):
+        repo.release_lease(work_id="work_test", lease_owner="first")
+    assert repo.inspect_lease("work_test") is not None
+    assert repo.list_step_attempts(step_id) == attempt_before
+
