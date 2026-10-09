@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
+from datetime import datetime, timezone
 from collections import Counter
 from pathlib import Path
 from typing import Any
@@ -120,6 +121,49 @@ def _events(path: Path) -> list[dict[str, Any]]:
         if line.strip()
     ]
 
+
+
+def test_new_python_process_cannot_take_unreconciled_cross_run_lease(
+    tmp_path: Path,
+) -> None:
+    """Independent interpreter cannot transfer another active Run's receipts."""
+    db, repo, old_id = _prepare_db(tmp_path)
+    new_id = repo.create_run(
+        run_kind="AUTOPILOT", scope_type="WORK", scope_id="work_247",
+        requested_by="restart_check", input_fingerprint="new:v1",
+    )["id"]
+    old = DurableRunRepository(
+        db, clock=lambda: datetime(2026, 10, 9, tzinfo=timezone.utc),
+    )
+    old.acquire_lease(
+        work_id="work_247", lease_owner="old_owner",
+        lease_kind="AUTOPILOT_MUTATION", ttl_seconds=10, run_id=old_id,
+    )
+    old.transition_run(
+        old_id, expected_status="PENDING", new_status="RUNNING",
+        lease_owner="old_owner",
+    )
+    step = old.create_step(
+        run_id=old_id, step_key="generate_panels",
+        input_fingerprint="v1", lease_owner="old_owner",
+    )
+    old.start_step(
+        step["id"], input_fingerprint="v1", lease_owner="old_owner",
+    )
+    events = tmp_path / "cross-run-denied.jsonl"
+    before = repo.list_step_attempts(step["id"])
+    result = _result(_invoke(
+        db=db, events=events, run_id=new_id, mode="normal",
+        owner="new_owner", offset=20, reclaim_owner="old_owner",
+    ))
+    assert result["outcome"] == "rejected"
+    assert result["type"] == "WorkLeaseConflictError"
+    assert repo.get_run(old_id)["status"] == "RUNNING"
+    assert repo.get_step(step["id"])["status"] == "RUNNING"
+    assert repo.list_step_attempts(step["id"]) == before
+    assert repo.get_run(new_id)["status"] == "PENDING"
+    assert repo.inspect_lease("work_247")["lease_owner"] == "old_owner"
+    assert not events.exists()
 
 def test_foreign_run_kind_stays_pending_across_fresh_processes(
     tmp_path: Path,
