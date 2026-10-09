@@ -118,12 +118,17 @@ def test_run_and_step_survive_reinstantiation_and_keep_fingerprint(tmp_path: Pat
                         new_status="RUNNING", lease_owner="worker_a")
     step = repo.create_step(
         run_id=run_id, step_key="PREFLIGHT", input_fingerprint="preflight:v1",
+        lease_owner="worker_a",
     )
     step_id = str(step["id"])
-    started = repo.start_step(step_id, input_fingerprint="preflight:v1")
+    started = repo.start_step(
+        step_id, input_fingerprint="preflight:v1", lease_owner="worker_a",
+    )
     assert started["attempt_count"] == 1
-    finished = repo.finish_step(step_id, status="COMPLETED",
-                                output={"passed": True})
+    finished = repo.finish_step(
+        step_id, status="COMPLETED", output={"passed": True},
+        lease_owner="worker_a",
+    )
     assert finished["input_fingerprint"] == "preflight:v1"
     assert finished["finished_at"]
     fresh = DurableRunRepository(db, clock=clock)
@@ -132,9 +137,15 @@ def test_run_and_step_survive_reinstantiation_and_keep_fingerprint(tmp_path: Pat
     assert fresh.get_step(step_id)["output_json"] == '{"passed":true}'
     assert len(fresh.list_steps(run_id)) == 1
     with pytest.raises(DurableRunStateError):
-        fresh.start_step(step_id, input_fingerprint="preflight:v1")
-    fresh.mark_step_stale(step_id, new_fingerprint="preflight:v2")
-    restarted = fresh.start_step(step_id, input_fingerprint="preflight:v2")
+        fresh.start_step(
+            step_id, input_fingerprint="preflight:v1", lease_owner="worker_a",
+        )
+    fresh.mark_step_stale(
+        step_id, new_fingerprint="preflight:v2", lease_owner="worker_a",
+    )
+    restarted = fresh.start_step(
+        step_id, input_fingerprint="preflight:v2", lease_owner="worker_a",
+    )
     assert restarted["attempt_count"] == 2
     assert restarted["output_json"] == "{}"
     assert restarted["input_fingerprint"] == "preflight:v2"
