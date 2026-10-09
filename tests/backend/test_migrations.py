@@ -1983,3 +1983,72 @@ def test_issue399_two_independent_python_processes_upgrade_existing_work_once(
             row["name"] for row in conn.execute("PRAGMA table_info(work_leases)")
         }
     assert not backup.with_name(backup.name + ".tmp").exists()
+
+
+def test_phase_c_audit_preexisting_backup_hardlink_to_live_work_is_rejected(
+    tmp_path: Path,
+) -> None:
+    """A named backup aliasing the live DB is not an independent recovery point.
+
+    This is a test-only independent audit negative. A same-inode v7 hardlink
+    passes schema version and database_id checks, but applying W0008 would
+    change both names and silently destroy the supposed pre-upgrade backup.
+    """
+    database = tmp_path / "work.sqlite3"
+    bootstrap_work_database(
+        database, work_id="work_backup_hardlink",
+        migrations=WORK_MIGRATIONS[:7],
+    )
+    backup = database.with_name(f"{database.name}.backup-v7-to-v8")
+    try:
+        backup.hardlink_to(database)
+    except OSError as exc:
+        pytest.skip(f"filesystem does not support creating hardlinks: {exc}")
+    assert backup.samefile(database)
+
+    with pytest.raises(MigrationBackupError, match="hardlink|same.file|alias|unsafe"):
+        migrate_work_database(database, work_id="work_backup_hardlink")
+
+    with read_connection(database) as conn:
+        assert conn.execute(
+            "SELECT MAX(version) FROM schema_migrations"
+        ).fetchone()[0] == 7
+        assert "recovery_run_owner" not in {
+            row["name"] for row in conn.execute("PRAGMA table_info(work_leases)")
+        }
+
+
+def test_issue401_existing_master_backup_hardlink_alias_is_rejected(
+    tmp_path: Path,
+) -> None:
+    """The shared migration runner must preserve an independent Master backup."""
+    database = tmp_path / "master.sqlite3"
+    bootstrap_master_database(database, database_id="master_alias")
+    current_version = MASTER_MIGRATIONS[-1].version
+    next_version = current_version + 1
+    pending = Migration(
+        version=next_version,
+        name=f"M{next_version:04d}_alias_guard",
+        statements=("CREATE TABLE after_backup (id INTEGER PRIMARY KEY)",),
+    )
+    backup = database.with_name(
+        f"{database.name}.backup-v{current_version}-to-v{next_version}"
+    )
+    try:
+        backup.hardlink_to(database)
+    except OSError as exc:
+        pytest.skip(f"filesystem does not support creating hardlinks: {exc}")
+
+    with pytest.raises(MigrationBackupError, match="hardlink|same.file|alias|unsafe"):
+        migrate_master_database(
+            database, migrations=(*MASTER_MIGRATIONS, pending),
+        )
+
+    assert backup.samefile(database)
+    with read_connection(database) as conn:
+        assert conn.execute(
+            "SELECT MAX(version) FROM schema_migrations"
+        ).fetchone()[0] == current_version
+        assert conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE name = 'after_backup'"
+        ).fetchone() is None
