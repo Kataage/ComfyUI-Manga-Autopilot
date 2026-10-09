@@ -1693,3 +1693,32 @@ async def test_early_orchestration_abort_keeps_lease_until_explicit_recovery(
             work_id="work_246", lease_owner="other_owner",
             lease_kind="AUTOPILOT_MUTATION", ttl_seconds=60,
         )
+
+
+def test_issue388_finalizer_start_wait_must_not_starve_single_worker_executor() -> None:
+    """An entry observer must not consume the sole worker needed by finalize.
+
+    The original asyncio.to_thread(entered.wait, ...) consumes a worker
+    from the same default pool as the synchronous _finalize bridge.
+    This focused test is intentionally RED until the observer is decoupled.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    async def scenario() -> None:
+        loop = asyncio.get_running_loop()
+        entered = threading.Event()
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            loop.set_default_executor(pool)
+
+            async def finalizer() -> None:
+                await asyncio.to_thread(entered.set)
+
+            task = asyncio.create_task(finalizer())
+            try:
+                # Deliberately demonstrate the original observer pattern.
+                assert await asyncio.to_thread(entered.wait, 2)
+            finally:
+                # Allow the actual worker to finish before the test exits.
+                await asyncio.wait_for(task, timeout=5)
+
+    asyncio.run(scenario())
