@@ -68,6 +68,7 @@ def start(repo: DurableRunRepository) -> str:
 
 def runner(repo: DurableRunRepository, hooks: OrchestratorHooks) -> DurableAutopilotOrchestrator:
     return DurableAutopilotOrchestrator(
+        allow_omitted_hooks=True,
         repository=repo, work_id="work_246", hooks=hooks,
     )
 
@@ -378,6 +379,7 @@ async def test_long_running_hook_renews_the_same_work_lease(
         return {"rendered": True}
 
     task = asyncio.create_task(DurableAutopilotOrchestrator(
+        allow_omitted_hooks=True,
         repository=repo, work_id="work_246",
         hooks=OrchestratorHooks(render_pages=slow_render),
         lease_ttl_seconds=6,
@@ -444,6 +446,7 @@ async def test_repeated_cancellation_keeps_sync_hook_lease_and_heartbeat_until_e
             finished.set()
 
     first = DurableAutopilotOrchestrator(
+        allow_omitted_hooks=True,
         repository=owner_repo, work_id="work_246",
         hooks=OrchestratorHooks(generate_panels=blocked_sync_hook),
         lease_ttl_seconds=3,
@@ -495,6 +498,7 @@ async def test_repeated_cancellation_keeps_sync_hook_lease_and_heartbeat_until_e
 
         with pytest.raises(WorkLeaseConflictError):
             await DurableAutopilotOrchestrator(
+        allow_omitted_hooks=True,
                 repository=competing_repo, work_id="work_246",
                 hooks=OrchestratorHooks(),
             ).execute(
@@ -525,6 +529,7 @@ async def test_repeated_cancellation_keeps_sync_hook_lease_and_heartbeat_until_e
     # A new repository/app is still denied blind replay after the worker has
     # exited, and an explicitly approved resume starts a new tracked attempt.
     recovered = DurableAutopilotOrchestrator(
+        allow_omitted_hooks=True,
         repository=competing_repo, work_id="work_246",
         hooks=OrchestratorHooks(generate_panels=lambda _: {"effect": "new"}),
     )
@@ -661,6 +666,7 @@ async def test_failed_work_lease_heartbeat_drains_sync_hook_before_interrupting(
             worker_finished.set()
 
     task = asyncio.create_task(DurableAutopilotOrchestrator(
+        allow_omitted_hooks=True,
         repository=owner_repo,
         work_id="work_246",
         hooks=OrchestratorHooks(generate_panels=slow_generation),
@@ -756,6 +762,7 @@ async def test_expired_guardian_keeps_reclaim_proof_and_never_commits_hook_outpu
             ended.set()
 
     task = asyncio.create_task(DurableAutopilotOrchestrator(
+        allow_omitted_hooks=True,
         repository=old, work_id="work_246",
         hooks=OrchestratorHooks(generate_panels=expired_hook),
         lease_ttl_seconds=3,
@@ -836,6 +843,7 @@ async def test_lease_guardian_failure_cancels_native_async_hook(
             hook_cancelled.set()
 
     task = asyncio.create_task(DurableAutopilotOrchestrator(
+        allow_omitted_hooks=True,
         repository=repo, work_id="work_246",
         hooks=OrchestratorHooks(plan_story=suspended),
         lease_ttl_seconds=3,
@@ -861,6 +869,7 @@ async def test_unsafe_lease_heartbeat_period_is_rejected_before_mutation(
     run_id = start(repo)
     with pytest.raises(ValueError, match="lease_ttl_seconds"):
         await DurableAutopilotOrchestrator(
+        allow_omitted_hooks=True,
             repository=repo, work_id="work_246",
             lease_ttl_seconds=ttl,
         ).execute(run_id, input_payload={}, step_inputs={})
@@ -895,6 +904,7 @@ async def test_async_stage_renews_step_run_and_work_heartbeats_together(
         return {"finished": True}
 
     task = asyncio.create_task(DurableAutopilotOrchestrator(
+        allow_omitted_hooks=True,
         repository=owning_repo, work_id="work_246",
         hooks=OrchestratorHooks(plan_story=blocked_async_hook),
         lease_ttl_seconds=3,
@@ -984,6 +994,7 @@ async def test_failed_step_heartbeat_stops_guardian_and_does_not_claim_success(
             completed.set()
 
     task = asyncio.create_task(DurableAutopilotOrchestrator(
+        allow_omitted_hooks=True,
         repository=owner, work_id="work_246",
         hooks=OrchestratorHooks(generate_panels=blocked_sync_hook),
         lease_ttl_seconds=3,
@@ -1070,6 +1081,7 @@ def test_durable_finalization_keeps_run_and_lease_running_through_file_copy(
     def execute_in_isolated_loop():
         try:
             result["run"] = asyncio.run(DurableAutopilotOrchestrator(
+        allow_omitted_hooks=True,
                 repository=owner, work_id="work_246",
                 hooks=OrchestratorHooks(),
                 project_root=root, lease_ttl_seconds=3,
@@ -1168,6 +1180,7 @@ async def test_repeated_cancellation_during_durable_finalization_drains_worker(
 
     monkeypatch.setattr(Orchestrator, "_finalize", delayed_finalize)
     task = asyncio.create_task(DurableAutopilotOrchestrator(
+        allow_omitted_hooks=True,
         repository=owner, work_id="work_246",
         project_root=root, lease_ttl_seconds=3,
     ).execute(run_id, input_payload={}, step_inputs={},
@@ -1216,10 +1229,12 @@ async def test_repeated_cancellation_during_durable_finalization_drains_worker(
     monkeypatch.setattr(Orchestrator, "_finalize", original_finalize)
     with pytest.raises(DurableRunStateError, match="reconciliation"):
         await DurableAutopilotOrchestrator(
+        allow_omitted_hooks=True,
             repository=observer, work_id="work_246", project_root=root,
         ).execute(run_id, input_payload={}, step_inputs={},
                   lease_owner="fresh_owner")
     done = await DurableAutopilotOrchestrator(
+        allow_omitted_hooks=True,
         repository=observer, work_id="work_246", project_root=root,
     ).execute(run_id, input_payload={}, step_inputs={},
               lease_owner="fresh_owner", approve_interrupted_retry=True)
@@ -1267,6 +1282,7 @@ async def test_finalization_heartbeat_failure_drains_and_records_interruption(
 
     monkeypatch.setattr(Orchestrator, "_finalize", blocking_finalize)
     task = asyncio.create_task(DurableAutopilotOrchestrator(
+        allow_omitted_hooks=True,
         repository=owner, work_id="work_246", project_root=root,
         lease_ttl_seconds=3,
     ).execute(run_id, input_payload={}, step_inputs={},
@@ -1310,6 +1326,7 @@ async def test_unexpected_finalization_error_has_no_success_receipt(
 
     monkeypatch.setattr(Orchestrator, "_finalize", failed_finalize)
     result = await DurableAutopilotOrchestrator(
+        allow_omitted_hooks=True,
         repository=repo, work_id="work_246",
         project_root=tmp_path / "project",
     ).execute(run_id, input_payload={}, step_inputs={},
