@@ -799,7 +799,7 @@ def test_work_mutation_lease_rejects_nonmatching_run_scope(
     assert repo.inspect_lease("work_test") is None
 
 
-# Regression matrix reproduced in independent Phase C audit for Issue #382. Do not merge this RED branch.
+# Regression matrix reproduced in independent Phase C audit for Issue #382.
 def test_phase_c_audit_live_lease_release_cannot_orphan_running_run(
     tmp_path: Path,
 ) -> None:
@@ -872,7 +872,6 @@ def test_phase_c_audit_live_lease_release_checks_orphan_step_attempts(
         repo.release_lease(work_id="work_test", lease_owner="first")
     assert repo.inspect_lease("work_test") is not None
     assert repo.list_step_attempts(step_id) == attempt_before
-
 
 
 def test_release_lease_preserves_explicit_recovery_after_running_owner_exits(
