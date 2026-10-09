@@ -110,6 +110,36 @@ from silently losing its lease but does not fix the creation of that
 inconsistency. The #374/#375/#378/#379 invariants are preserved.
 No real GPU, live ComfyUI, installer or browser signoff is implied.
 
+## Durable Run exit and child receipt consistency (Issue #383)
+
+A durable Run must not leave `RUNNING` while any RunStep or RunStepAttempt
+belonging to it is still `RUNNING`. Before `transition_run` accepts an
+ordinary exit to `COMPLETED`, `PAUSED`, `FAILED_RETRYABLE`,
+`FAILED_TERMINAL`, `INTERRUPTED`, `NEEDS_ATTENTION` or `CANCELLED`,
+it validates **both** child receipt tables inside the same
+`BEGIN IMMEDIATE` transaction as the Run UPDATE. A RunStep already marked
+terminal can still contain a historically malformed in-flight Attempt,
+so checking only current RunSteps is insufficient. Any unresolved child
+raises `DurableRunStateError`, preserving original status, owner, heartbeat,
+attempt provenance and the Work lease for explicit reconciliation.
+
+Orchestrated stage success, retryable failure and task cancellation first
+record a final Step **and Attempt** outcome under the live Work owner, then
+transition their Run. The special `recover_interrupted_run` function
+retains its privileged transactional crash-recovery path: with the
+reclaimed owner's fresh Work lease, it atomically marks the old active
+Step/Attempt receipts `INTERRUPTED` before marking the Run
+`INTERRUPTED`. Unknown external side effects are not silently treated as
+successful execution.
+
+For legacy malformed snapshots in the test suite, direct fixture-only SQL
+replicates a terminal Run with a `RUNNING` child; production
+`transition_run` must never be used to manufacture this inconsistency.
+The #382 live lease-release guard remains an independent fail-closed
+second layer. The #379 expired cross-Run transfer guard remains unchanged.
+Neither layer is a substitute for the #378 matching-owner Write fence.
+No real GPU/ComfyUI/browser/installer or manga-quality acceptance is implied.
+
 ## Supported, required, and explicitly omitted stages
 
 - **Supported/executed:** a callable hook is provided for a stage in `OrchestratorHooks`. Its result (including a genuine JSON `null`) is serialized with an explicit `execution: "EXECUTED"` provenance marker in the completed RunStep/attempt receipt.
