@@ -49,6 +49,38 @@ provenance (#371), Page/Artifact Work-commit lease gate (#374), and the
 separate cross-Run expired-lease recovery issue (#379). It does not certify
 real ComfyUI/GPU execution or provide a new HTTP orchestration API.
 
+## Expired lease recovery across Runs (Issue #379)
+
+An expired Work lease is a recovery tombstone: a different owner must
+present the **exact old lease owner token** and rotate the owner. A new
+Run may not inherit an expired lease while the old bound Run is still
+`RUNNING`, even if the previous owner is known and the new Run has
+`PENDING` status.
+
+The supported crash-recovery sequence is:
+
+1. Reacquire the expired lease **for the same Run ID** with the matching
+   old-owner token and a *new* lease-owner token.
+2. Call `recover_interrupted_run` while holding that new lease. The
+   old Run becomes `INTERRUPTED`, in-flight Steps and Attempts become
+   `INTERRUPTED`, and completed historical receipts remain unchanged.
+   Uncertain external side effects require explicit human reconciliation.
+3. Resume the interrupted Run with the approved retry policy, **or**
+   release the recovered lease, then acquire a new lease for another Run.
+
+The cross-Run handover check is in the same `BEGIN IMMEDIATE` transaction
+as the lease replacement. It also refuses handover when an earlier Run is
+already terminal but still contains a `RUNNING` Step or Attempt. A prior
+Run already fully reconciled/terminal with no in-flight receipts, or an
+expired legacy unbound maintenance lease, may be explicitly transferred.
+The incoming and previous attached Runs must both match the Work scope.
+Releasing/recovering leases never silently changes old Run or Attempt
+history.
+
+This is independent of the no-owner mutation fence (#378) and the exact
+`AUTOPILOT` dispatch guard (#375). No real ComfyUI/GPU/browser acceptance
+is implied.
+
 ## Supported, required, and explicitly omitted stages
 
 - **Supported/executed:** a callable hook is provided for a stage in `OrchestratorHooks`. Its result (including a genuine JSON `null`) is serialized with an explicit `execution: "EXECUTED"` provenance marker in the completed RunStep/attempt receipt.

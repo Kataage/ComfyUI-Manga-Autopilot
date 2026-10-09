@@ -548,7 +548,7 @@ class DurableRunRepository:
             self._assert_work(conn, work_id)
             if run_id is not None:
                 run = self._get(conn, "runs", run_id)
-                if run["scope_type"] == "WORK" and run["scope_id"] != work_id:
+                if run["scope_type"] != "WORK" or run["scope_id"] != work_id:
                     raise WorkLeaseConflictError("Run belongs to a different Work")
             if reclaim_expired_owner == lease_owner:
                 raise WorkLeaseConflictError(
@@ -571,6 +571,41 @@ class DurableRunRepository:
                     raise WorkLeaseConflictError(
                         "expired lease requires explicit matching-owner recovery"
                     )
+                # Cross-Run recovery cannot abandon an old RUNNING Run or
+                # any in-flight Step/Attempt. Reclaim the same Run first,
+                # explicitly reconcile it, release its lease, then start the
+                # next Run. This check and the lease transfer are atomic.
+                if old["run_id"] is not None and old["run_id"] != run_id:
+                    previous_id = str(old["run_id"])
+                    previous = self._get(conn, "runs", previous_id)
+                    if (
+                        previous["scope_type"] != "WORK"
+                        or previous["scope_id"] != work_id
+                    ):
+                        raise WorkLeaseConflictError(
+                            "previous lease Run belongs to a different Work"
+                        )
+                    if previous["status"] == "RUNNING":
+                        raise WorkLeaseConflictError(
+                            "previous RUNNING Run requires explicit reconciliation "
+                            "before cross-Run lease transfer"
+                        )
+                    running_step = conn.execute(
+                        "SELECT 1 FROM run_steps "
+                        "WHERE run_id = ? AND status = 'RUNNING' LIMIT 1",
+                        (previous_id,),
+                    ).fetchone()
+                    running_attempt = conn.execute(
+                        "SELECT 1 FROM run_step_attempts "
+                        "WHERE status = 'RUNNING' AND run_step_id IN "
+                        "(SELECT id FROM run_steps WHERE run_id = ?) LIMIT 1",
+                        (previous_id,),
+                    ).fetchone()
+                    if running_step is not None or running_attempt is not None:
+                        raise WorkLeaseConflictError(
+                            "previous Run has unreconciled RUNNING "
+                            "Step or Attempt receipts"
+                        )
                 conn.execute("DELETE FROM work_leases WHERE work_id = ?", (work_id,))
             elif reclaim_expired_owner is not None:
                 raise WorkLeaseConflictError("no matching expired lease to recover")
