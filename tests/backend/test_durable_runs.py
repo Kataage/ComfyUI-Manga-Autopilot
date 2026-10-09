@@ -690,6 +690,7 @@ def test_cross_run_expired_lease_rejects_unreconciled_running_run(
 
 @pytest.mark.parametrize("old_state", [
     "completed_run", "completed_run_with_active_step",
+    "completed_run_with_active_attempt",
 ])
 def test_cross_run_reclaim_requires_reconciled_step_and_attempt_receipts(
     tmp_path: Path, old_state: str,
@@ -713,7 +714,7 @@ def test_cross_run_reclaim_requires_reconciled_step_and_attempt_receipts(
         input_fingerprint="v1", lease_owner="old",
     )["id"]
     repo.start_step(step_id, input_fingerprint="v1", lease_owner="old")
-    if old_state == "completed_run":
+    if old_state != "completed_run_with_active_step":
         repo.finish_step(
             step_id, status="COMPLETED", lease_owner="old",
         )
@@ -721,6 +722,14 @@ def test_cross_run_reclaim_requires_reconciled_step_and_attempt_receipts(
         old_run, expected_status="RUNNING", new_status="COMPLETED",
         lease_owner="old",
     )
+    if old_state == "completed_run_with_active_attempt":
+        # Simulate an independently malformed legacy receipt: the Run
+        # and Step look completed, but its attempt still says RUNNING.
+        with repository_write(db) as conn:
+            conn.execute(
+                "UPDATE run_step_attempts SET status = 'RUNNING' "
+                "WHERE run_step_id = ?", (step_id,),
+            )
     clock.advance(5)
     before_run = repo.get_run(old_run)
     before_step = repo.get_step(step_id)
