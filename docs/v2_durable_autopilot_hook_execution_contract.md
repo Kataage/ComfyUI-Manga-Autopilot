@@ -81,6 +81,45 @@ This is independent of the no-owner mutation fence (#378) and the exact
 `AUTOPILOT` dispatch guard (#375). No real ComfyUI/GPU/browser acceptance
 is implied.
 
+## Repeated crash during lease rotation (Issue #397)
+
+The first expired same-Run A→B lease rotation is durable before B calls
+`recover_interrupted_run`. A second crash at that boundary leaves the
+`RUNNING` Run and its Step/Attempt with **original owner A**, but the
+expired Work lease with **current owner B**. Treating `runs.lease_owner`
+as the token for **every** subsequent rotation would permanently strand the
+Run after B expires: the next owner C must present **B**, not the already
+rotated-away A, to reclaim the current Work lease.
+
+Work migration **W0008** adds a nullable `work_leases.recovery_run_owner`
+receipt. Within `acquire_lease`'s existing `BEGIN IMMEDIATE` transaction:
+
+- The first A→B rotation proves that the expired lease is bound to the
+  same Run and current Run owner A, and that the caller presents A's exact
+  token. The new lease stores `recovery_run_owner=A`.
+- On later expired B→C, C→D, etc. rotations **for the same still-RUNNING
+  Run**, the old lease must still be bound to that Run, carry the **same
+  original Run owner** in its stored recovery receipt, and be reclaimed
+  with the **immediately preceding lease owner** token. The new lease
+  carries forward the attested Run owner, never a newly inferred one.
+- `recover_interrupted_run` requires the active new owner, a non-null
+  distinct original Run owner, and the **matching stored recovery receipt**
+  before atomically interrupting the Run and its active Step/Attempt.
+- A fresh/unbound lease cannot adopt an ownerless RUNNING Run, an orphan
+  Run owner, or an unbound maintenance lease. Wrong, stale, active, and
+  cross-Run tokens stay fenced. Ordinary generic ownerless Run transitions
+  remain available when **no Work lease** exists.
+- On migration, pre-W0008 lease rows get `recovery_run_owner=NULL`.
+  We **do not infer** an undocumented historical recovery chain from
+  an owner mismatch. A legacy partially rotated lease without a receipt
+  requires explicit operator reconciliation rather than invented provenance.
+  After Run reconciliation, a new lease for another Run has no inherited
+  recovery receipt. This is a recovery proof, not an artifact success claim.
+
+This design addresses repeated **process crashes between transactions**.
+It does not declare remote ComfyUI/GPU effects successful or change the
+human approval required for uncertain external work.
+
 ## Live Work lease release safety (Issue #382)
 
 Normal `DurableRunRepository.release_lease` is deliberately **not**
