@@ -22,7 +22,6 @@ from PIL import Image, UnidentifiedImageError
 
 from manga_autopilot.primitives import canonical_json, new_id
 from manga_autopilot.repositories.work_lifecycle import WorkLifecycleRepository
-from manga_autopilot.storage.repository import assert_work_mutation_allowed
 from manga_autopilot.storage import (
     assert_managed_path,
     create_work_commit,
@@ -31,6 +30,7 @@ from manga_autopilot.storage import (
     repository_write,
     validate_work_id,
 )
+from manga_autopilot.storage.repository import assert_work_mutation_allowed
 
 _IMAGE_FORMATS = {
     "image/png": "PNG",
