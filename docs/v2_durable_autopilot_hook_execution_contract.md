@@ -21,6 +21,34 @@ This kind validation does not modify the existing AUTOPILOT stage fingerprint
 or receipt policy. No migration or narrowing of the generic repository API is
 required.
 
+## Durable Run and RunStep ownership fence (Issue #378)
+
+Every v2 Work database has a single logical mutation writer. The generic
+`DurableRunRepository` intentionally allows unleased low-level Run and
+RunStep setup/testing operations when **no Work lease exists**; ordinary
+`AUTOPILOT`, `EXPORT` and `QA` Run kinds remain representable. It
+does **not** interpret an omitted `lease_owner` as authorization to update a
+Run or RunStep while another writer owns a Work mutation lease.
+
+Within the same `BEGIN IMMEDIATE` write transaction as each mutation:
+
+- Creating a new Run without an owner is refused if an active **or expired**
+  Work lease row is present. An expired lease is a blocking tombstone until
+  explicit, matching-owner recovery.
+- All Run state transitions and RunStep create, input-fingerprint update,
+  start/retry, stale-mark and finish/attempt receipt mutations require an
+  owner token matching the live Work lease and current Run. Even a separate
+  Repository instance pointing at the same DB cannot supply a wrong or
+  absent token, forge a successful receipt, or bypass the lease.
+- A Run still marked with a prior `lease_owner` is never silently editable
+  as an unowned Run after its lease is gone.
+- Read-only Run/Step/Attempt inspection does not require a writer token.
+
+This fence is independent of the Autopilot Run-kind guard (#375), hook output
+provenance (#371), Page/Artifact Work-commit lease gate (#374), and the
+separate cross-Run expired-lease recovery issue (#379). It does not certify
+real ComfyUI/GPU execution or provide a new HTTP orchestration API.
+
 ## Supported, required, and explicitly omitted stages
 
 - **Supported/executed:** a callable hook is provided for a stage in `OrchestratorHooks`. Its result (including a genuine JSON `null`) is serialized with an explicit `execution: "EXECUTED"` provenance marker in the completed RunStep/attempt receipt.
