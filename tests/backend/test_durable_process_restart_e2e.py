@@ -448,3 +448,93 @@ def test_fresh_interpreter_cannot_append_step_to_final_work_run(
     assert repo.get_run(run_id)["status"] == "COMPLETED"
     assert repo.list_steps(run_id) == steps_before
     assert repo.inspect_lease("work_247") is None
+
+
+def test_second_hard_crash_during_lease_rotation_recovers_in_third_process(
+    tmp_path: Path,
+) -> None:
+    """A->B->C remains durable if B hard-dies before Run reconciliation.
+
+    Each worker below is a brand-new Python interpreter. The two crashes use
+    os._exit(), so no cleanup, ordinary exception handler, or finally executes.
+    """
+    db, repo, run_id = _prepare_db(tmp_path)
+    events = tmp_path / "double-crash-recovery-events.jsonl"
+
+    crashed_a = _invoke(
+        db=db, events=events, run_id=run_id,
+        mode="crash_generation", owner="first_worker_A",
+    )
+    assert crashed_a.returncode == 83
+    step = next(
+        s for s in repo.list_steps(run_id)
+        if s["step_key"] == "generate_panels"
+    )
+    before_attempts = repo.list_step_attempts(step["id"])
+    assert [a["status"] for a in before_attempts] == ["RUNNING"]
+    assert repo.get_run(run_id)["status"] == "RUNNING"
+
+    # A's lease expired. B rotates to its own owner token, then hard-kills
+    # before recover_interrupted_run() records a durable interruption.
+    crashed_b = _invoke(
+        db=db, events=events, run_id=run_id,
+        mode="crash_after_lease_rotation", owner="recovery_worker_B",
+        offset=20, reclaim_owner="first_worker_A",
+    )
+    assert crashed_b.returncode == 84, crashed_b.stderr
+    assert repo.get_run(run_id)["lease_owner"] == "first_worker_A"
+    assert repo.get_run(run_id)["status"] == "RUNNING"
+    lease = repo.inspect_lease("work_247")
+    assert lease is not None
+    assert lease["lease_owner"] == "recovery_worker_B"
+    assert lease["recovery_run_owner"] == "first_worker_A"
+    assert repo.list_step_attempts(step["id"]) == before_attempts
+
+    # A is not B: the obsolete A token cannot recover B's current lease.
+    stale = _result(_invoke(
+        db=db, events=events, run_id=run_id, mode="normal",
+        owner="stale_worker", offset=40, reclaim_owner="first_worker_A",
+    ))
+    assert stale["outcome"] == "rejected"
+    assert stale["type"] == "WorkLeaseConflictError"
+    assert repo.inspect_lease("work_247")["lease_owner"] == "recovery_worker_B"
+    assert repo.list_step_attempts(step["id"]) == before_attempts
+
+    # C presents *B's* exact, now-expired token. It must mark the uncertain
+    # original live attempt INTERRUPTED but refuse an unapproved replay.
+    inspector = _result(_invoke(
+        db=db, events=events, run_id=run_id, mode="normal",
+        owner="inspection_worker_C", offset=40,
+        reclaim_owner="recovery_worker_B",
+    ))
+    assert inspector["outcome"] == "rejected"
+    assert inspector["type"] == "DurableRunStateError"
+    assert "reconciliation" in inspector["message"]
+    assert repo.get_run(run_id)["status"] == "INTERRUPTED"
+    assert repo.get_step(step["id"])["status"] == "INTERRUPTED"
+    assert [a["status"] for a in repo.list_step_attempts(step["id"])] == [
+        "INTERRUPTED",
+    ]
+    assert repo.inspect_lease("work_247") is None
+
+    # The operator explicitly approves retry in another clean process.
+    resumed = _result(_invoke(
+        db=db, events=events, run_id=run_id, mode="normal",
+        owner="approved_worker_D", offset=40, approve_interrupted=True,
+    ))
+    assert resumed["outcome"] == "finished"
+    assert resumed["durable_status"] == "COMPLETED"
+    assert [a["status"] for a in repo.list_step_attempts(step["id"])] == [
+        "INTERRUPTED", "COMPLETED",
+    ]
+    entries = _events(events)
+    assert Counter(x["stage"] for x in entries) == {
+        "validate_input": 1,
+        "plan_story": 1,
+        "generate_panels": 2,
+        "recovery_lease_rotated": 1,
+        "render_pages": 1,
+        "export": 1,
+    }
+    assert len({x["app_id"] for x in entries}) >= 3
+    assert repo.inspect_lease("work_247") is None

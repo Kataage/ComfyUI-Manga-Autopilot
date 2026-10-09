@@ -646,6 +646,19 @@ Migration(
             """,
         ),
     ),
+
+    Migration(
+        version=8,
+        name="W0008_work_lease_recovery_lineage",
+        statements=(
+            # A legitimate A->B expired-lease rotation and the Run/Step
+            # interruption are separate transactions. Preserve the original
+            # Run owner A when B acquires; if B crashes before reconciliation,
+            # the next owner can prove a continuous same-Run recovery chain
+            # without trusting a fabricated or unbound maintenance lease.
+            "ALTER TABLE work_leases ADD COLUMN recovery_run_owner TEXT",
+        ),
+    ),
 )
 
 
