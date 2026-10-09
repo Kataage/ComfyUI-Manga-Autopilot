@@ -1101,6 +1101,13 @@ def test_durable_finalization_keeps_run_and_lease_running_through_file_copy(
         assert renewed is not None
         assert renewed["heartbeat_at"] > before["heartbeat_at"]
         assert renewed["expired"] is False
+        # A guardian cycle uses separate short transactions for Lease, Run
+        # and Step. A read observing the Lease update can precede the Step
+        # heartbeat transaction; poll for the coordinated cycle to finish.
+        for _ in range(300):
+            if observer.get_step(last["id"])["heartbeat_at"] > last["heartbeat_at"]:
+                break
+            threading.Event().wait(0.05)
         assert observer.get_step(last["id"])["heartbeat_at"] > last["heartbeat_at"]
         assert observer.get_run(run_id)["status"] == "RUNNING"
         with pytest.raises(WorkLeaseConflictError, match="active"):
