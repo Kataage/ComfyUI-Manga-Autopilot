@@ -73,6 +73,29 @@ def runner(repo: DurableRunRepository, hooks: OrchestratorHooks) -> DurableAutop
     )
 
 
+async def _wait_for_thread_signal(
+    event: threading.Event, *, timeout: float,
+    task: asyncio.Task | None = None,
+) -> bool:
+    """Observe a sync worker without consuming its default-executor slots.
+
+    asyncio.to_thread(event.wait, timeout) can starve the actual synchronous
+    finalizer when the event-loop default executor is saturated. Polling the
+    thread-safe Event from the loop preserves the bounded wait, and checking
+    task.done() surfaces upstream early exits without waiting the full deadline.
+    """
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while not event.is_set():
+        if task is not None and task.done():
+            return event.is_set()
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            return event.is_set()
+        await asyncio.sleep(min(0.01, remaining))
+    return True
+
+
 @pytest.mark.asyncio
 async def test_resume_new_python_objects_skips_only_fingerprint_matching_steps(
     tmp_path: Path,
@@ -1258,7 +1281,7 @@ async def test_repeated_cancellation_during_durable_finalization_drains_worker(
     ).execute(run_id, input_payload={}, step_inputs={},
               lease_owner="canceled_finalizer"))
     try:
-        assert await asyncio.to_thread(entered.wait, 15)
+        assert await _wait_for_thread_signal(entered, timeout=15, task=task)
         step = next(s for s in observer.list_steps(run_id)
                     if s["step_key"] == "finalize")
         before = observer.get_step(step["id"])["heartbeat_at"]
@@ -1362,7 +1385,7 @@ async def test_finalization_heartbeat_failure_drains_and_records_interruption(
     try:
         # Issue #388 audit-only instrumentation. Preserve the original
         # deadline and acceptance semantics; collect evidence only on miss.
-        entered_in_time = await asyncio.to_thread(entered.wait, 15)
+        entered_in_time = await _wait_for_thread_signal(entered, timeout=15, task=task)
         if not entered_in_time:
             try:
                 observed_run = observer.get_run(run_id)
@@ -1390,7 +1413,7 @@ async def test_finalization_heartbeat_failure_drains_and_records_interruption(
             except BaseException as probe_error:
                 print("ISSUE388_PROBE_ERROR", repr(probe_error), flush=True)
         assert entered_in_time
-        assert await asyncio.to_thread(lost.wait, 15)
+        assert await _wait_for_thread_signal(lost, timeout=15, task=task)
         await asyncio.sleep(0.05)
         assert not task.done()
         assert not exited.is_set()
@@ -1698,9 +1721,9 @@ async def test_early_orchestration_abort_keeps_lease_until_explicit_recovery(
 def test_issue388_finalizer_start_wait_must_not_starve_single_worker_executor() -> None:
     """An entry observer must not consume the sole worker needed by finalize.
 
-    The original asyncio.to_thread(entered.wait, ...) consumes a worker
+    The old asyncio.to_thread(entered.wait, ...) consumed a worker
     from the same default pool as the synchronous _finalize bridge.
-    This focused test is intentionally RED until the observer is decoupled.
+    This regression passes only if the observer does not take that worker.
     """
     from concurrent.futures import ThreadPoolExecutor
 
@@ -1715,8 +1738,8 @@ def test_issue388_finalizer_start_wait_must_not_starve_single_worker_executor() 
 
             task = asyncio.create_task(finalizer())
             try:
-                # Deliberately demonstrate the original observer pattern.
-                assert await asyncio.to_thread(entered.wait, 2)
+                # The observer must allow the sole worker to enter finalize.
+                assert await _wait_for_thread_signal(entered, timeout=2, task=task)
             finally:
                 # Allow the actual worker to finish before the test exits.
                 await asyncio.wait_for(task, timeout=5)
