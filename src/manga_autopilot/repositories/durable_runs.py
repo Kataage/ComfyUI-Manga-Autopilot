@@ -232,6 +232,34 @@ class DurableRunRepository:
                         "cannot transition RUNNING Run with an active "
                         "Step or Attempt; reconcile durable receipts first"
                     )
+                if new_status == "COMPLETED":
+                    # A successful parent may only attest to registered
+                    # children whose current outcome truly succeeded. Historic
+                    # FAILED_RETRYABLE/INTERRUPTED attempts remain append-only
+                    # evidence when a later attempt completed successfully.
+                    incomplete_step = conn.execute(
+                        "SELECT 1 FROM run_steps "
+                        "WHERE run_id = ? AND status != 'COMPLETED' LIMIT 1",
+                        (run_id,),
+                    ).fetchone()
+                    if incomplete_step is not None:
+                        raise DurableRunStateError(
+                            "cannot complete Run with an unfinished or failed Step"
+                        )
+                    bad_latest_attempt = conn.execute(
+                        "SELECT 1 FROM run_steps AS s "
+                        "LEFT JOIN run_step_attempts AS a "
+                        "ON a.run_step_id = s.id AND a.attempt_no = s.attempt_count "
+                        "WHERE s.run_id = ? AND (s.attempt_count < 1 "
+                        "OR a.id IS NULL OR a.status != 'COMPLETED' "
+                        "OR a.input_fingerprint != s.input_fingerprint) LIMIT 1",
+                        (run_id,),
+                    ).fetchone()
+                    if bad_latest_attempt is not None:
+                        raise DurableRunStateError(
+                            "cannot complete Run without a successful final "
+                            "Step Attempt receipt"
+                        )
             conn.execute(
                 """
                 UPDATE runs SET status = ?,
