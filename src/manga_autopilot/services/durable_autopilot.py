@@ -21,7 +21,6 @@ from typing import Any
 from pydantic import BaseModel
 
 from manga_autopilot.primitives import canonical_json, input_fingerprint
-from manga_autopilot.storage.repository import owned_work_mutation
 from manga_autopilot.repositories.durable_runs import (
     DurableRunRepository,
     DurableRunStateError,
@@ -35,6 +34,7 @@ from manga_autopilot.services.autopilot import (
     Orchestrator,
     OrchestratorHooks,
 )
+from manga_autopilot.storage.repository import owned_work_mutation
 
 
 class RetryableStepError(RuntimeError):
