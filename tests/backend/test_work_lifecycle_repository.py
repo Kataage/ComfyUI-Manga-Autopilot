@@ -2320,3 +2320,46 @@ def test_recovery_refuses_orphan_with_symlinked_critical_database(
     with pytest.raises(WorkRecoveryError, match="invalid orphan"):
         repository.reconcile_orphan_work("work_orphan")
     assert outside.read_bytes() == before
+
+
+def test_phase_c_audit_concurrent_work_open_manifest_refresh_is_atomic(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Two readers refreshing one live Work manifest cannot collide or fail.
+
+    The independently protected schema upgrade does not serialize the later
+    per-Work manifest update. Force both opens to the publication boundary
+    after their private file writes, without changing production code.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    previous = WorkLifecycleRepository(tmp_path, app_version="previous")
+    created = previous.create_work(
+        work_id="work_parallel_refresh", title="Concurrent Manifest Refresh",
+    )
+    current = WorkLifecycleRepository(tmp_path, app_version="current")
+    ready = threading.Barrier(2, timeout=20)
+    original_replace = lifecycle_module.os.replace
+
+    def synchronized_replace(source: object, destination: object) -> None:
+        if (
+            Path(source) == created.manifest_path.with_name("manifest.json.tmp")
+            and Path(destination) == created.manifest_path
+        ):
+            ready.wait()
+        original_replace(source, destination)
+
+    monkeypatch.setattr(lifecycle_module.os, "replace", synchronized_replace)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [
+            pool.submit(current.open_work, "work_parallel_refresh")
+            for _ in range(2)
+        ]
+        opened = [future.result(timeout=30) for future in futures]
+
+    assert len(opened) == 2
+    assert all(handle.work_id == "work_parallel_refresh" for handle in opened)
+    assert json.loads(created.manifest_path.read_text(encoding="utf-8"))[
+        "app_version"
+    ] == "current"
