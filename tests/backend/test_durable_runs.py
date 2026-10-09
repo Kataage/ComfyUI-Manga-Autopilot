@@ -872,3 +872,42 @@ def test_phase_c_audit_live_lease_release_checks_orphan_step_attempts(
         repo.release_lease(work_id="work_test", lease_owner="first")
     assert repo.inspect_lease("work_test") is not None
     assert repo.list_step_attempts(step_id) == attempt_before
+
+
+@pytest.mark.parametrize("transition", [
+    "COMPLETED", "FAILED_RETRYABLE", "INTERRUPTED", "CANCELLED",
+])
+def test_phase_c_audit_run_must_not_exit_running_with_live_step_attempt(
+    tmp_path: Path, transition: str,
+) -> None:
+    """Final Run status cannot conceal a still-RUNNING Step and Attempt."""
+    db = tmp_path / "work.sqlite3"
+    _work(db)
+    repo = DurableRunRepository(db)
+    run_id = _run(repo)
+    repo.acquire_lease(
+        work_id="work_test", lease_owner="active",
+        lease_kind="AUTOPILOT_MUTATION", ttl_seconds=60, run_id=run_id,
+    )
+    repo.transition_run(
+        run_id, expected_status="PENDING", new_status="RUNNING",
+        lease_owner="active",
+    )
+    step = repo.create_step(
+        run_id=run_id, step_key="generate_panels",
+        input_fingerprint="v1", lease_owner="active",
+    )
+    repo.start_step(
+        step["id"], input_fingerprint="v1", lease_owner="active",
+    )
+    before_run = repo.get_run(run_id)
+    before_step = repo.get_step(step["id"])
+    before_attempts = repo.list_step_attempts(step["id"])
+    with pytest.raises(DurableRunStateError):
+        repo.transition_run(
+            run_id, expected_status="RUNNING", new_status=transition,
+            lease_owner="active",
+        )
+    assert repo.get_run(run_id) == before_run
+    assert repo.get_step(step["id"]) == before_step
+    assert repo.list_step_attempts(step["id"]) == before_attempts
