@@ -81,6 +81,35 @@ This is independent of the no-owner mutation fence (#378) and the exact
 `AUTOPILOT` dispatch guard (#375). No real ComfyUI/GPU/browser acceptance
 is implied.
 
+## Live Work lease release safety (Issue #382)
+
+Normal `DurableRunRepository.release_lease` is deliberately **not**
+an interruption or recovery operation. A Work lease bound to a Run may be
+released by its authorized, unexpired owner only when the Run is no longer
+`RUNNING` **and** no attached RunStep or RunStepAttempt remains `RUNNING`.
+The Run, Steps and Attempt receipts are checked inside the very same
+`BEGIN IMMEDIATE` transaction that deletes the Work lease. A missing or
+foreign attached Run is also a release conflict. Unbound maintenance leases
+and fully reconciled non-running Runs can be released normally.
+
+If `DurableAutopilotOrchestrator.execute` exits with an exception or
+cancellation **after** marking a Run `RUNNING`, and it has not durably
+finalized or interrupted that state, its best-effort `finally` block must
+not delete the Work lease. The Repository release guard rejects deletion,
+preserving the old owner and Run ID as explicit recovery evidence. Without
+a running heartbeat the lease eventually expires and remains a blocking
+tombstone. A new owner must use the original owner token to reclaim the
+**same Run**, call `recover_interrupted_run`, and explicitly reconcile
+uncertain external side effects before resuming or releasing the lease.
+An operator should not interpret an early error as successful completion.
+
+The independent Run-transition consistency gap — the ability to mark a
+Run terminal while a child receipt remains `RUNNING` — is separately
+tracked as Issue #383. The release guard prevents such a malformed receipt
+from silently losing its lease but does not fix the creation of that
+inconsistency. The #374/#375/#378/#379 invariants are preserved.
+No real GPU, live ComfyUI, installer or browser signoff is implied.
+
 ## Supported, required, and explicitly omitted stages
 
 - **Supported/executed:** a callable hook is provided for a stage in `OrchestratorHooks`. Its result (including a genuine JSON `null`) is serialized with an explicit `execution: "EXECUTED"` provenance marker in the completed RunStep/attempt receipt.
