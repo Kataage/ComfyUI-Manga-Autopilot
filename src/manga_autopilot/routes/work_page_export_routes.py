@@ -23,6 +23,7 @@ from manga_autopilot.services.work_page_export import (
     WorkPageExportService,
 )
 from manga_autopilot.storage.paths import UnsafeStoragePathError
+from manga_autopilot.storage.repository import WorkMutationLeaseConflictError
 
 ROUTE_PREFIX = "/manga_autopilot/api/v2/works/{work_id}/pages/{page_id}/export/png"
 _ALLOWED_SETTINGS = frozenset({"background", "outer_border", "export_profile"})
@@ -109,6 +110,10 @@ async def export_work_page_png(request: web.Request) -> web.Response:
         return web.json_response(
             {"error": "export_busy", "message": str(exc)}, status=429,
             headers={"Retry-After": "2"},
+        )
+    except WorkMutationLeaseConflictError as exc:
+        return web.json_response(
+            {"error": "work_mutation_busy", "message": str(exc)}, status=409
         )
     except PageExportConflictError as exc:
         return web.json_response(
