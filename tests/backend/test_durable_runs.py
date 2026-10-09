@@ -873,3 +873,94 @@ def test_phase_c_audit_live_lease_release_checks_orphan_step_attempts(
     assert repo.inspect_lease("work_test") is not None
     assert repo.list_step_attempts(step_id) == attempt_before
 
+
+
+def test_release_lease_preserves_explicit_recovery_after_running_owner_exits(
+    tmp_path: Path,
+) -> None:
+    db = tmp_path / "work.sqlite3"
+    _work(db)
+    clock = Clock()
+    old = DurableRunRepository(db, clock=clock)
+    new = DurableRunRepository(db, clock=clock)
+    run_id = _run(old)
+    next_id = _run(old)
+    old.acquire_lease(
+        work_id="work_test", lease_owner="abandoned_owner",
+        lease_kind="AUTOPILOT_MUTATION", ttl_seconds=10, run_id=run_id,
+    )
+    old.transition_run(
+        run_id, expected_status="PENDING", new_status="RUNNING",
+        lease_owner="abandoned_owner",
+    )
+    step_id = old.create_step(
+        run_id=run_id, step_key="generate_panels",
+        input_fingerprint="v1", lease_owner="abandoned_owner",
+    )["id"]
+    old.start_step(
+        step_id, input_fingerprint="v1", lease_owner="abandoned_owner",
+    )
+    with pytest.raises(WorkLeaseConflictError, match="RUNNING"):
+        old.release_lease(work_id="work_test", lease_owner="abandoned_owner")
+    assert new.inspect_lease("work_test")["lease_owner"] == "abandoned_owner"
+    with pytest.raises(WorkLeaseConflictError):
+        new.acquire_lease(
+            work_id="work_test", lease_owner="another",
+            lease_kind="AUTOPILOT_MUTATION", ttl_seconds=10, run_id=next_id,
+        )
+    clock.advance(11)
+    with pytest.raises(WorkLeaseConflictError):
+        old.release_lease(work_id="work_test", lease_owner="abandoned_owner")
+    new.acquire_lease(
+        work_id="work_test", lease_owner="recovered_owner",
+        lease_kind="AUTOPILOT_MUTATION", ttl_seconds=10, run_id=run_id,
+        reclaim_expired_owner="abandoned_owner",
+    )
+    new.recover_interrupted_run(run_id, lease_owner="recovered_owner")
+    assert new.get_run(run_id)["status"] == "INTERRUPTED"
+    assert new.get_step(step_id)["status"] == "INTERRUPTED"
+    assert new.list_step_attempts(step_id)[0]["status"] == "INTERRUPTED"
+    new.release_lease(work_id="work_test", lease_owner="recovered_owner")
+    new.acquire_lease(
+        work_id="work_test", lease_owner="next_owner",
+        lease_kind="AUTOPILOT_MUTATION", ttl_seconds=10, run_id=next_id,
+    )
+    assert new.get_run(next_id)["status"] == "PENDING"
+
+
+def test_release_lease_rejects_running_attempt_even_if_run_and_step_terminal(
+    tmp_path: Path,
+) -> None:
+    db = tmp_path / "work.sqlite3"
+    _work(db)
+    repo = DurableRunRepository(db)
+    run_id = _run(repo)
+    repo.acquire_lease(
+        work_id="work_test", lease_owner="owner",
+        lease_kind="AUTOPILOT_MUTATION", ttl_seconds=60, run_id=run_id,
+    )
+    repo.transition_run(
+        run_id, expected_status="PENDING", new_status="RUNNING",
+        lease_owner="owner",
+    )
+    step_id = repo.create_step(
+        run_id=run_id, step_key="stage", input_fingerprint="v1",
+        lease_owner="owner",
+    )["id"]
+    repo.start_step(step_id, input_fingerprint="v1", lease_owner="owner")
+    repo.finish_step(step_id, status="COMPLETED", lease_owner="owner")
+    repo.transition_run(
+        run_id, expected_status="RUNNING", new_status="COMPLETED",
+        lease_owner="owner",
+    )
+    with repository_write(db) as conn:
+        conn.execute(
+            "UPDATE run_step_attempts SET status = 'RUNNING' "
+            "WHERE run_step_id = ?", (step_id,),
+        )
+    with pytest.raises(WorkLeaseConflictError, match="RUNNING"):
+        repo.release_lease(work_id="work_test", lease_owner="owner")
+    assert repo.inspect_lease("work_test")["lease_owner"] == "owner"
+    assert repo.get_run(run_id)["status"] == "COMPLETED"
+    assert repo.get_step(step_id)["status"] == "COMPLETED"
+    assert repo.list_step_attempts(step_id)[0]["status"] == "RUNNING"
