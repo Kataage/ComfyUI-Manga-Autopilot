@@ -1364,6 +1364,7 @@ class MigrationRunner:
                         )
             else:
                 _fsync_directory(backup.parent)
+            cleanup_temp_best_effort()
             return backup
         except MigrationError:
             cleanup_temp_best_effort()
