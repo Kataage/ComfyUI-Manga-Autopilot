@@ -100,6 +100,20 @@ def _build_application(args: argparse.Namespace) -> web.Application:
 async def _execute(args: argparse.Namespace) -> dict[str, Any]:
     app = _build_application(args)
     orchestrator = app["durable_orchestrator"]
+    if args.mode == "crash_after_lease_rotation":
+        # The lease transfer is durable, but the Run/Step/Attempt interruption
+        # has not yet occurred. Simulate a second process crash exactly
+        # between these two separate transactions.
+        app["durable_repository"].acquire_lease(
+            work_id="work_247", lease_owner=args.owner,
+            lease_kind="AUTOPILOT_MUTATION", ttl_seconds=10,
+            run_id=args.run_id, reclaim_expired_owner=args.reclaim_owner,
+        )
+        _record(
+            args.events, stage="recovery_lease_rotated",
+            app_id=app["worker_identity"], owner=args.owner,
+        )
+        os._exit(84)
     try:
         result = await orchestrator.execute(
             args.run_id,
@@ -132,7 +146,8 @@ def main() -> None:
     parser.add_argument("--events", type=Path, required=True)
     parser.add_argument("--run-id", required=True)
     parser.add_argument("--mode", choices=(
-        "crash_generation", "retryable_render_failure", "normal",
+        "crash_generation", "crash_after_lease_rotation",
+        "retryable_render_failure", "normal",
     ), required=True)
     parser.add_argument("--generation-version", default="v1")
     parser.add_argument("--owner", required=True)
