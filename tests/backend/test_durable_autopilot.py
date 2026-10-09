@@ -73,6 +73,12 @@ def runner(repo: DurableRunRepository, hooks: OrchestratorHooks) -> DurableAutop
     )
 
 
+# Allow slow SQLite stage setup on loaded Windows runners; the full
+# Autopilot pipeline persists 13 preceding stages before Finalization begins.
+# This is strictly the *entry/setup* deadline, not the heartbeat-loss deadline.
+_FINALIZATION_SETUP_TIMEOUT_SECONDS = 90
+
+
 async def _wait_for_thread_signal(
     event: threading.Event, *, timeout: float,
     task: asyncio.Task | None = None,
@@ -1281,7 +1287,9 @@ async def test_repeated_cancellation_during_durable_finalization_drains_worker(
     ).execute(run_id, input_payload={}, step_inputs={},
               lease_owner="canceled_finalizer"))
     try:
-        assert await _wait_for_thread_signal(entered, timeout=15, task=task)
+        assert await _wait_for_thread_signal(
+            entered, timeout=_FINALIZATION_SETUP_TIMEOUT_SECONDS, task=task,
+        )
         step = next(s for s in observer.list_steps(run_id)
                     if s["step_key"] == "finalize")
         before = observer.get_step(step["id"])["heartbeat_at"]
@@ -1391,8 +1399,10 @@ async def test_finalization_heartbeat_failure_drains_and_records_interruption(
     ).execute(run_id, input_payload={}, step_inputs={},
               lease_owner="lost_finalizer"))
     try:
+        # A prior postmerge Windows CI failure showed export still RUNNING,
+        # with a live lease and task when the old 15s setup wait expired.
         entered_in_time = await _wait_for_thread_signal(
-            entered, timeout=15, task=task,
+            entered, timeout=_FINALIZATION_SETUP_TIMEOUT_SECONDS, task=task,
         )
         if not entered_in_time:
             steps = [
