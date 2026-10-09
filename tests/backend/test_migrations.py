@@ -4,7 +4,11 @@ from __future__ import annotations
 
 import errno
 import sqlite3
+import subprocess
+import sys
 import threading
+import time
+from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -1649,8 +1653,8 @@ def test_backup_cleanup_failure_does_not_mask_primary_failure(
     temp = backup.with_name(backup.name + ".tmp")
     original_unlink = Path.unlink
 
-    def fail_replace(_source: object, _destination: object) -> None:
-        raise OSError("primary replace failure")
+    def fail_link(_source: object, _destination: object) -> None:
+        raise OSError("primary no-clobber link failure")
 
     def fail_temp_unlink(
         self: Path,
@@ -1661,7 +1665,7 @@ def test_backup_cleanup_failure_does_not_mask_primary_failure(
             raise OSError("secondary cleanup failure")
         original_unlink(self, *args, **kwargs)
 
-    monkeypatch.setattr(migrations_module.os, "replace", fail_replace)
+    monkeypatch.setattr(migrations_module.os, "link", fail_link)
     monkeypatch.setattr(Path, "unlink", fail_temp_unlink)
 
     with pytest.raises(MigrationBackupError) as exc_info:
@@ -1671,7 +1675,7 @@ def test_backup_cleanup_failure_does_not_mask_primary_failure(
     assert error.pending_versions == (next_version,)
     assert error.target_version == next_version
     assert isinstance(error.cause, OSError)
-    assert str(error.cause) == "primary replace failure"
+    assert str(error.cause) == "primary no-clobber link failure"
     assert temp.exists()
     assert not backup.exists()
 
@@ -1681,10 +1685,10 @@ def test_phase_c_audit_concurrent_existing_work_v7_to_v8_upgrade_is_idempotent(
 ) -> None:
     """A Work opened twice during W0008 upgrade must not fail or lose its v7 backup.
 
-    This deterministically pauses opener A after it has inspected v7 and
-    decided W0008 is pending, but before its backup. Opener B commits W0008.
-    Opener A must recognize B's committed migration without re-applying the
-    ADD COLUMN or replacing B's true v7 pre-upgrade backup with v8 bytes.
+    This deterministically pauses opener A before the new cross-process
+    upgrade lock, while opener B commits W0008. A must re-inspect the
+    applied migrations *after* taking the lock, see v8, and never overwrite
+    B's genuine v7 pre-upgrade backup with a post-upgrade snapshot.
     """
     database = tmp_path / "work.sqlite3"
     work_id = "work_simultaneous_open"
@@ -1703,29 +1707,27 @@ def test_phase_c_audit_concurrent_existing_work_v7_to_v8_upgrade_is_idempotent(
     allow_first = threading.Event()
     lock = threading.Lock()
     calls = 0
-    original = migrations_module.MigrationRunner._prepare_verified_backup
+    original = migrations_module._existing_migration_lock
 
-    def hold_first_upgrader(self, path, *, current_version, pending_migrations):
+    @contextmanager
+    def hold_first_upgrader(path):
         nonlocal calls
-        if (
-            self.database_kind == "work" and current_version == 7
-            and any(migration.version == 8 for migration in pending_migrations)
-        ):
-            with lock:
-                calls += 1
-                first = calls == 1
-            if first:
-                first_ready.set()
-                assert allow_first.wait(timeout=20), (
-                    "second upgrader never committed W0008"
-                )
-        return original(
-            self, path, current_version=current_version,
-            pending_migrations=pending_migrations,
-        )
+        with lock:
+            calls += 1
+            first = calls == 1
+        if first:
+            # Pause before acquiring the new full-protocol OS lock, rather
+            # than holding the backup while asking B to finish. This probes
+            # the fixed lock-order contract without an artificial deadlock.
+            first_ready.set()
+            assert allow_first.wait(timeout=20), (
+                "second upgrader never committed W0008"
+            )
+        with original(path):
+            yield
 
     monkeypatch.setattr(
-        migrations_module.MigrationRunner, "_prepare_verified_backup",
+        migrations_module, "_existing_migration_lock",
         hold_first_upgrader,
     )
 
@@ -1735,14 +1737,13 @@ def test_phase_c_audit_concurrent_existing_work_v7_to_v8_upgrade_is_idempotent(
         )
         try:
             assert first_ready.wait(timeout=20), (
-                "first upgrader did not enter the v7->v8 pending window"
+                "first upgrader did not reach the migration lock boundary"
             )
             second = migrate_work_database(database, work_id=work_id)
             assert second.applied_versions == (8,)
         finally:
             allow_first.set()
-        # A stale migration plan must be refreshed after B commits, not
-        # produce a duplicate-column MigrationApplyError on a valid Work.
+        # No stale v7 plan can be applied after B's committed W0008.
         stale = first.result(timeout=20)
 
     assert stale.current_version == 8
@@ -1764,3 +1765,217 @@ def test_phase_c_audit_concurrent_existing_work_v7_to_v8_upgrade_is_idempotent(
         assert "recovery_run_owner" not in {
             row["name"] for row in conn.execute("PRAGMA table_info(work_leases)")
         }
+
+
+def test_issue399_existing_work_upgrade_serializes_backup_inside_os_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """B cannot even plan/publish a second backup while A is migrating v7."""
+    database = tmp_path / "work.sqlite3"
+    bootstrap_work_database(
+        database, work_id="work_locked", migrations=WORK_MIGRATIONS[:7],
+    )
+    entered = threading.Event()
+    release = threading.Event()
+    original = migrations_module.MigrationRunner._prepare_verified_backup
+
+    def hold_backup(self, path, *, current_version, pending_migrations):
+        if self.database_kind == "work" and current_version == 7:
+            entered.set()
+            assert release.wait(timeout=20), "upgrader A was not released"
+        return original(
+            self, path, current_version=current_version,
+            pending_migrations=pending_migrations,
+        )
+
+    monkeypatch.setattr(
+        migrations_module.MigrationRunner,
+        "_prepare_verified_backup", hold_backup,
+    )
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        first = executor.submit(
+            migrate_work_database, database, work_id="work_locked",
+        )
+        try:
+            assert entered.wait(timeout=20)
+            second_started = threading.Event()
+
+            def migrate_second():
+                second_started.set()
+                return migrate_work_database(
+                    database, work_id="work_locked",
+                )
+
+            second = executor.submit(migrate_second)
+            assert second_started.wait(timeout=20)
+            # B cannot complete while A owns the cross-process lock.
+            assert not second.done()
+        finally:
+            release.set()
+        a = first.result(timeout=20)
+        b = second.result(timeout=20)
+
+    assert a.current_version == b.current_version == 8
+    assert (a.applied_versions, b.applied_versions) == ((8,), ())
+    backup = database.with_name(f"{database.name}.backup-v7-to-v8")
+    with read_connection(backup) as conn:
+        assert conn.execute(
+            "SELECT MAX(version) FROM schema_migrations"
+        ).fetchone()[0] == 7
+    assert not backup.with_name(backup.name + ".tmp").exists()
+
+
+def test_issue399_preserves_first_backup_when_retrying_after_failed_upgrade(
+    tmp_path: Path,
+) -> None:
+    """No-clobber publication preserves earliest verified v7 recovery point."""
+    database = tmp_path / "work.sqlite3"
+    bootstrap_work_database(
+        database, work_id="work_backup", migrations=WORK_MIGRATIONS[:7],
+    )
+    def rejected_validation(_conn: sqlite3.Connection) -> None:
+        raise MigrationIntegrityError("simulated interrupted schema commit")
+
+    with pytest.raises(MigrationValidationError, match="simulated interrupted"):
+        migrate_work_database(
+            database, work_id="work_backup",
+            post_integrity_check=rejected_validation,
+        )
+    backup = database.with_name(f"{database.name}.backup-v7-to-v8")
+    initial = backup.read_bytes()
+    assert initial
+    with read_connection(database) as conn:
+        assert conn.execute(
+            "SELECT MAX(version) FROM schema_migrations"
+        ).fetchone()[0] == 7
+
+    result = migrate_work_database(database, work_id="work_backup")
+    assert result.applied_versions == (8,)
+    assert backup.read_bytes() == initial
+    assert not backup.with_name(backup.name + ".tmp").exists()
+    with read_connection(backup) as conn:
+        assert conn.execute(
+            "SELECT MAX(version) FROM schema_migrations"
+        ).fetchone()[0] == 7
+
+
+def test_issue399_rejects_post_upgrade_file_masquerading_as_original_backup(
+    tmp_path: Path,
+) -> None:
+    """Fail closed: a v8 artifact may not be trusted as the pre-v8 backup."""
+    database = tmp_path / "work.sqlite3"
+    bootstrap_work_database(
+        database, work_id="work_backup", migrations=WORK_MIGRATIONS[:7],
+    )
+    backup = database.with_name(f"{database.name}.backup-v7-to-v8")
+    other = tmp_path / "already_v8.sqlite3"
+    # Bootstrap with the *same* Work ID, so only the schema history can
+    # distinguish a wrong pre-upgrade backup from an authentic v7 image.
+    bootstrap_work_database(other, work_id="work_backup")
+    with read_connection(other) as source, sqlite3.connect(backup) as target:
+        source.backup(target)
+    original_backup = backup.read_bytes()
+    with pytest.raises(MigrationBackupError, match="wrong pre-upgrade"):
+        migrate_work_database(database, work_id="work_backup")
+    assert backup.read_bytes() == original_backup
+    with read_connection(database) as conn:
+        assert conn.execute(
+            "SELECT MAX(version) FROM schema_migrations"
+        ).fetchone()[0] == 7
+
+
+_ISSUE399_UPGRADE_SUBPROCESS = """
+import json
+import os
+import sys
+import time
+from pathlib import Path
+import manga_autopilot.storage.migrations as migrations
+from manga_autopilot.storage import migrate_work_database
+
+database = Path(sys.argv[1])
+ready = Path(sys.argv[2])
+release = Path(sys.argv[3])
+mode = sys.argv[4]
+if mode == "hold":
+    original = migrations.MigrationRunner._prepare_verified_backup
+    def paused(self, path, *, current_version, pending_migrations):
+        ready.write_text("locked", encoding="utf-8")
+        deadline = time.monotonic() + 25
+        while not release.exists():
+            if time.monotonic() > deadline:
+                raise RuntimeError("parent never released migration lock")
+            time.sleep(0.03)
+        return original(
+            self, path, current_version=current_version,
+            pending_migrations=pending_migrations,
+        )
+    migrations.MigrationRunner._prepare_verified_backup = paused
+result = migrate_work_database(database, work_id="work_process_upgrade")
+print(json.dumps({
+    "version": result.current_version,
+    "applied": result.applied_versions,
+}), flush=True)
+"""
+
+
+def test_issue399_two_independent_python_processes_upgrade_existing_work_once(
+    tmp_path: Path,
+) -> None:
+    """Cross-process lock must survive separate interpreter/SQLite instances."""
+    database = tmp_path / "work.sqlite3"
+    bootstrap_work_database(
+        database, work_id="work_process_upgrade",
+        migrations=WORK_MIGRATIONS[:7],
+    )
+    ready = tmp_path / "a-holds-lock"
+    release = tmp_path / "allow-a"
+    first = subprocess.Popen(  # noqa: S603 - fixed interpreter and fixture
+        [sys.executable, "-c", _ISSUE399_UPGRADE_SUBPROCESS,
+         str(database), str(ready), str(release), "hold"],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+    )
+    second = None
+    try:
+        deadline = time.monotonic() + 25
+        while not ready.exists() and time.monotonic() < deadline:
+            assert first.poll() is None, "first migration process died early"
+            time.sleep(0.03)
+        assert ready.exists(), "first process failed to acquire Work lock"
+        second = subprocess.Popen(  # noqa: S603 - fixed interpreter and fixture
+            [sys.executable, "-c", _ISSUE399_UPGRADE_SUBPROCESS,
+             str(database), str(ready), str(release), "normal"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+        assert second.poll() is None
+    finally:
+        release.write_text("go", encoding="utf-8")
+
+    try:
+        first_out, first_err = first.communicate(timeout=30)
+        assert first.returncode == 0, first_err
+        assert second is not None
+        second_out, second_err = second.communicate(timeout=30)
+        assert second.returncode == 0, second_err
+    finally:
+        for worker in (first, second):
+            if worker is not None and worker.poll() is None:
+                worker.kill()
+                worker.communicate(timeout=10)
+
+    import json
+
+    a = json.loads(first_out.strip().splitlines()[-1])
+    b = json.loads(second_out.strip().splitlines()[-1])
+    assert a["version"] == b["version"] == 8
+    assert a["applied"] == [8]
+    assert b["applied"] == []
+    backup = database.with_name(f"{database.name}.backup-v7-to-v8")
+    with read_connection(backup) as conn:
+        assert conn.execute(
+            "SELECT MAX(version) FROM schema_migrations"
+        ).fetchone()[0] == 7
+        assert "recovery_run_owner" not in {
+            row["name"] for row in conn.execute("PRAGMA table_info(work_leases)")
+        }
+    assert not backup.with_name(backup.name + ".tmp").exists()
