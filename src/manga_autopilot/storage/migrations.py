@@ -837,6 +837,8 @@ def _existing_migration_lock(path: Path) -> Iterator[None]:
     The OS releases its lock automatically if a migrator crashes.
     """
     lock_path = path.with_name(f".{path.name}.migration.lock")
+    if lock_path.is_symlink():
+        raise MigrationError(f"migration lock must not be a symlink: {lock_path}")
     flags = os.O_CREAT | os.O_RDWR | getattr(os, "O_BINARY", 0)
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
@@ -1310,6 +1312,7 @@ class MigrationRunner:
             if temp.exists():
                 temp.unlink()
 
+            original_database_id: str | None = None
             with write_connection(path) as source:
                 checkpoint = source.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
                 if checkpoint is not None and int(checkpoint[0]) != 0:
@@ -1325,6 +1328,13 @@ class MigrationRunner:
                 )
                 if self.pre_integrity_check is not None:
                     self.pre_integrity_check(source)
+                if self.identity_table is not None:
+                    identity = source.execute(
+                        f"SELECT value FROM {self.identity_table} "
+                        "WHERE key = 'database_id'"
+                    ).fetchone()
+                    if identity is not None:
+                        original_database_id = str(identity[0])
 
                 destination = sqlite3.connect(temp)
                 try:
@@ -1362,8 +1372,23 @@ class MigrationRunner:
                             "schema version",
                             pending_migrations=pending_migrations,
                         )
-            else:
-                _fsync_directory(backup.parent)
+                    if original_database_id is not None:
+                        saved_id = existing.execute(
+                            f"SELECT value FROM {self.identity_table} "
+                            "WHERE key = 'database_id'"
+                        ).fetchone()
+                        if (
+                            saved_id is None
+                            or str(saved_id[0]) != original_database_id
+                        ):
+                            raise MigrationBackupError(
+                                "existing migration backup belongs to a different "
+                                "database identity",
+                                pending_migrations=pending_migrations,
+                            )
+            # Re-fsync even reused backups: the previous attempt may have
+            # failed exactly after linking but before directory durability.
+            _fsync_directory(backup.parent)
             cleanup_temp_best_effort()
             return backup
         except MigrationError:
