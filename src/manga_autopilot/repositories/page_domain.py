@@ -15,10 +15,10 @@ from typing import Any
 
 from manga_autopilot.primitives import canonical_json, new_id
 from manga_autopilot.repositories.revision_invalidation import record_domain_change
-from manga_autopilot.storage.repository import assert_work_mutation_allowed
 from manga_autopilot.storage.repository import (
     PersistenceError,
     assert_expected_revision,
+    assert_work_mutation_allowed,
     create_work_commit,
     repository_read,
     repository_write,
