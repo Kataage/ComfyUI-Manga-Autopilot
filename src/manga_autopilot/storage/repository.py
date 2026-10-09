@@ -10,6 +10,7 @@ from __future__ import annotations
 import sqlite3
 from collections.abc import Iterator
 from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -21,6 +22,92 @@ from manga_autopilot.storage.sqlite import read_connection, write_connection
 
 class PersistenceError(RuntimeError):
     """Base class for v2 persistence-layer errors."""
+
+
+class WorkMutationLeaseConflictError(PersistenceError):
+    """A Work mutation conflicts with its exclusive durable writer lease."""
+
+
+# Bound only by trusted Work-scoped orchestrator invocations, never by
+# request-controlled HTTP parameters. asyncio task creation and to_thread()
+# copy this context, while independent HTTP tasks do not inherit the token.
+_WORK_MUTATION_OWNER: ContextVar[tuple[str, str] | None] = ContextVar(
+    "work_mutation_lease_owner", default=None,
+)
+
+
+@contextmanager
+def owned_work_mutation(work_id: str, lease_owner: str) -> Iterator[None]:
+    """Allow a live durable Work owner to make Work commits in its hook.
+
+    Merely presenting a token is insufficient: the same write transaction
+    revalidates the Work lease expiry and the RUNNING Run ownership.
+    """
+    if not work_id or not lease_owner:
+        raise ValueError("work_id and lease_owner are required")
+    token = _WORK_MUTATION_OWNER.set((work_id, lease_owner))
+    try:
+        yield
+    finally:
+        _WORK_MUTATION_OWNER.reset(token)
+
+
+def assert_work_mutation_allowed(connection: sqlite3.Connection) -> None:
+    """Fence all Work commit and Artifact publication paths under one lease.
+
+    Must be called again INSIDE the final BEGIN IMMEDIATE Work transaction.
+    Expired lease rows remain blocking tombstones until explicit recovery.
+    A scoped old worker cannot write after its token has been released.
+    """
+    scope = _WORK_MUTATION_OWNER.get()
+    # Initial pre-W0006 Work migration/bootstrap has no lease schema.
+    schema = connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'work_leases'"
+    ).fetchone()
+    if schema is None:
+        if scope is not None:
+            raise WorkMutationLeaseConflictError(
+                "Work mutation lease schema is missing for scoped owner"
+            )
+        return
+    lease = connection.execute(
+        "SELECT work_id, lease_owner, run_id, expires_at FROM work_leases LIMIT 1"
+    ).fetchone()
+    if lease is None:
+        if scope is not None:
+            raise WorkMutationLeaseConflictError(
+                "Work mutation lease was released or lost"
+            )
+        return
+    if scope is None or tuple(scope) != (lease["work_id"], lease["lease_owner"]):
+        raise WorkMutationLeaseConflictError(
+            "Work mutation blocked by another or unreconciled lease"
+        )
+    try:
+        expiry = datetime.fromisoformat(lease["expires_at"])
+        valid_expiry = (
+            expiry.tzinfo is not None
+            and expiry.astimezone(timezone.utc) > datetime.now(timezone.utc)
+        )
+    except (TypeError, ValueError):
+        valid_expiry = False
+    if not valid_expiry:
+        raise WorkMutationLeaseConflictError(
+            "Work mutation lease expired; explicit recovery required"
+        )
+    if lease["run_id"] is not None:
+        run = connection.execute(
+            "SELECT status, lease_owner, scope_type, scope_id FROM runs WHERE id = ?",
+            (lease["run_id"],),
+        ).fetchone()
+        if (
+            run is None or run["status"] != "RUNNING"
+            or run["lease_owner"] != scope[1] or run["scope_type"] != "WORK"
+            or run["scope_id"] != scope[0]
+        ):
+            raise WorkMutationLeaseConflictError(
+                "Work mutation lease is not attached to a live owned Run"
+            )
 
 
 class RevisionConflictError(PersistenceError):
@@ -152,6 +239,7 @@ def create_work_commit(
 ) -> WorkCommit:
     """Insert one Work commit inside the caller's active transaction."""
     _require_transaction(connection)
+    assert_work_mutation_allowed(connection)
     if not commit_id.strip():
         raise ValueError("commit_id must be non-empty")
     if not actor_type.strip():
