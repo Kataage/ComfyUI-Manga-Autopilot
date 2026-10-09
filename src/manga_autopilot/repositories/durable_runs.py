@@ -364,6 +364,7 @@ class DurableRunRepository:
                 or _utc(datetime.fromisoformat(lease["expires_at"])) <= self._now()
                 or run["lease_owner"] is None
                 or run["lease_owner"] == lease_owner
+                or lease["recovery_run_owner"] != run["lease_owner"]
             ):
                 # A fresh lease attached to an ownerless generic RUNNING Run
                 # is not proof of a crashed, previously leased Run worker.
@@ -637,16 +638,17 @@ class DurableRunRepository:
                 "SELECT * FROM work_leases WHERE work_id = ?",
                 (work_id,),
             ).fetchone()
-            # A non-null Run owner is a durable crashed-worker marker, but
-            # it must not become a recovery capability on its own. Verify
-            # that the *previous* lease truly belonged to this Run/owner and
-            # was explicitly presented for rotation before replacing it.
-            # This also fences legacy orphan Run-owner snapshots.
+            # A valid recovery preserves the *original* RUNNING Run owner
+            # until recover_interrupted_run writes Step/Attempt interruption.
+            # Lease rotation may commit before that separate reconciliation
+            # transaction, so the recovery worker may itself crash. W0008
+            # records the attested original Run owner through every expired
+            # same-Run rotation; no unrelated/ownerless lease can forge it.
+            recovery_run_owner: str | None = None
             if run_id is not None and run["status"] == "RUNNING":
-                # Never attach a brand-new lease to a generic ownerless
-                # RUNNING Run: privileged recovery would be unauthorized,
-                # and ordinary lease release would then be forbidden while
-                # that Run remains RUNNING (#382), stranding its receipts.
+                # An ownerless generic RUNNING Run has no crashed leased
+                # worker. Attaching a lease would also strand normal generic
+                # reconciliation under #382's release guard.
                 if run["lease_owner"] is None:
                     raise WorkLeaseConflictError(
                         "RUNNING Run requires a prior Run-bound lease owner"
@@ -654,13 +656,17 @@ class DurableRunRepository:
                 if (
                     old is None
                     or old["run_id"] != run_id
-                    or old["lease_owner"] != run["lease_owner"]
-                    or reclaim_expired_owner != run["lease_owner"]
+                    or reclaim_expired_owner != old["lease_owner"]
+                    or (
+                        old["lease_owner"] != run["lease_owner"]
+                        and old["recovery_run_owner"] != run["lease_owner"]
+                    )
                 ):
                     raise WorkLeaseConflictError(
                         "RUNNING Run requires explicit recovery of its "
-                        "prior Run-bound lease owner"
+                        "prior Run-bound lease owner or attested recovery chain"
                     )
+                recovery_run_owner = str(run["lease_owner"])
             if old is not None:
                 expiry = _utc(datetime.fromisoformat(old["expires_at"]))
                 if expiry > now:
@@ -716,11 +722,12 @@ class DurableRunRepository:
                 """
                 INSERT INTO work_leases (
                     work_id, lease_owner, lease_kind, run_id,
-                    heartbeat_at, expires_at
-                ) VALUES (?, ?, ?, ?, ?, ?)
+                    heartbeat_at, expires_at, recovery_run_owner
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
                 (work_id, lease_owner, lease_kind, run_id, now.isoformat(),
-                 (now + timedelta(seconds=ttl_seconds)).isoformat()),
+                 (now + timedelta(seconds=ttl_seconds)).isoformat(),
+                 recovery_run_owner),
             )
             return dict(conn.execute(
                 "SELECT * FROM work_leases WHERE work_id = ?", (work_id,)
