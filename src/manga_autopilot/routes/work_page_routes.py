@@ -24,7 +24,10 @@ from manga_autopilot.repositories.work_lifecycle import (
 )
 from manga_autopilot.services.page_application import PageApplicationService
 from manga_autopilot.storage.paths import UnsafeStoragePathError
-from manga_autopilot.storage.repository import RevisionConflictError
+from manga_autopilot.storage.repository import (
+    RevisionConflictError,
+    WorkMutationLeaseConflictError,
+)
 
 ROUTE_PREFIX = "/manga_autopilot/api/v2/works/{work_id}/pages"
 _LAYOUT_FIELDS = frozenset({
@@ -47,6 +50,8 @@ def _problem(status: int, error: str, message: str, **details: Any) -> web.Respo
 
 
 def _translate(exc: Exception) -> web.Response:
+    if isinstance(exc, WorkMutationLeaseConflictError):
+        return _problem(409, "work_mutation_busy", str(exc))
     if isinstance(exc, RevisionConflictError):
         return _problem(
             409, "revision_conflict", str(exc),

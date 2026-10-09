@@ -18,6 +18,7 @@ from manga_autopilot.repositories.revision_invalidation import record_domain_cha
 from manga_autopilot.storage.repository import (
     PersistenceError,
     assert_expected_revision,
+    assert_work_mutation_allowed,
     create_work_commit,
     repository_read,
     repository_write,
@@ -295,6 +296,8 @@ class PageRepository:
             "status": status,
         }, _PAGE_FIELDS)
         with repository_write(self.database_path) as conn:
+            # Reject even no-op editor requests during exclusive Work mutation.
+            assert_work_mutation_allowed(conn)
             seq, at = _commit(conn, "create_page")
             return _insert(
                 conn, "pages", _id(page_id, "page_id"),
@@ -319,6 +322,8 @@ class PageRepository:
     ) -> dict[str, Any]:
         attrs = _values(changes, _PAGE_FIELDS)
         with repository_write(self.database_path) as conn:
+            # Reject even no-op editor requests during exclusive Work mutation.
+            assert_work_mutation_allowed(conn)
             record, _ = _patch(
                 conn, "pages", _id(page_id, "page_id"),
                 expected_revision=expected_revision, attrs=attrs,
@@ -357,6 +362,8 @@ class LayoutRepository:
             "constraints_json": {} if constraints is None else constraints,
         }, _LAYOUT_FIELDS)
         with repository_write(self.database_path) as conn:
+            # Reject even no-op editor requests during exclusive Work mutation.
+            assert_work_mutation_allowed(conn)
             page = _read_row(conn, "pages", page_id)
             if page["layout_instance_id"] is not None:
                 raise PageDomainOwnershipError(
@@ -430,6 +437,8 @@ class LayoutRepository:
             ),
         }, _SLOT_FIELDS)
         with repository_write(self.database_path) as conn:
+            # Reject even no-op editor requests during exclusive Work mutation.
+            assert_work_mutation_allowed(conn)
             _read_row(conn, "layout_instances", _id(layout_id, "layout_id"))
             seq, at = _commit(conn, "create_layout_slot")
             return _insert(
@@ -447,6 +456,8 @@ class LayoutRepository:
     ) -> dict[str, Any]:
         attrs = _values(changes, _SLOT_FIELDS)
         with repository_write(self.database_path) as conn:
+            # Reject even no-op editor requests during exclusive Work mutation.
+            assert_work_mutation_allowed(conn)
             record, _ = _patch(
                 conn, "layout_slots", _id(slot_id, "slot_id"),
                 expected_revision=expected_revision, attrs=attrs,
@@ -475,6 +486,8 @@ class LayoutRepository:
         """
         attrs = _values(changes, _LAYOUT_FIELDS)
         with repository_write(self.database_path) as conn:
+            # Reject even no-op editor requests during exclusive Work mutation.
+            assert_work_mutation_allowed(conn)
             layout = _read_row(conn, "layout_instances", _id(layout_id, "layout_id"))
             owning_page = _read_row(conn, "pages", layout["page_id"])
             if owning_page["archived_at"] is not None:
@@ -637,6 +650,8 @@ class PanelRepository:
             "status": status,
         }, _PANEL_FIELDS)
         with repository_write(self.database_path) as conn:
+            # Reject even no-op editor requests during exclusive Work mutation.
+            assert_work_mutation_allowed(conn)
             _check_page(conn, _id(page_id, "page_id"))
             if layout_slot_id is not None:
                 _check_slot_page(conn, _id(layout_slot_id, "layout_slot_id"), page_id)
@@ -666,6 +681,8 @@ class PanelRepository:
     ) -> dict[str, Any]:
         attrs = _values(changes, _PANEL_FIELDS)
         with repository_write(self.database_path) as conn:
+            # Reject even no-op editor requests during exclusive Work mutation.
+            assert_work_mutation_allowed(conn)
             existing = _read_row(conn, "panels", _id(panel_id, "panel_id"))
             # Preserve 409-style optimistic concurrency semantics even when
             # the caller also supplies an invalid candidate. Both checks and

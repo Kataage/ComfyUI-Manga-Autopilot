@@ -1105,3 +1105,46 @@ async def test_candidate_snapshot_byte_budget_rejects_oversized_record_before_co
     assert "encoded Candidate input budget" in payload["message"]
     assert seen == []
     assert artifacts.list_for_scope("page", "page_main") == []
+
+
+@pytest.mark.asyncio
+async def test_page_png_http_publication_conflicts_with_live_autopilot_lease(api):
+    """Do not persist a READY PNG from a second writer during generation."""
+    import asyncio
+
+    from manga_autopilot.repositories.durable_runs import DurableRunRepository
+    from manga_autopilot.services.autopilot import OrchestratorHooks
+    from manga_autopilot.services.durable_autopilot import DurableAutopilotOrchestrator
+
+    client, base, root, handle, _, _, _, artifacts = api
+    repo = DurableRunRepository(handle.database_path)
+    run_id = repo.create_run(
+        run_kind="AUTOPILOT", scope_type="WORK", scope_id=handle.work_id,
+        requested_by="lease-png-test", input_fingerprint="lease-png",
+    )["id"]
+    started = asyncio.Event()
+    finish = asyncio.Event()
+
+    async def long_generation(_):
+        started.set()
+        await finish.wait()
+        return {"ok": True}
+
+    execution = asyncio.create_task(DurableAutopilotOrchestrator(
+        repository=repo, work_id=handle.work_id,
+        hooks=OrchestratorHooks(validate_input=long_generation),
+        allow_omitted_hooks=True, lease_ttl_seconds=6,
+    ).execute(run_id, input_payload={}, step_inputs={},
+              lease_owner="active_png_autopilot"))
+    try:
+        await asyncio.wait_for(started.wait(), timeout=10)
+        previous = artifacts.list_for_scope("page", "page_main")
+        response, payload = await _export(client, base)
+        assert response.status == 409, payload
+        assert payload["error"] == "work_mutation_busy"
+        assert artifacts.list_for_scope("page", "page_main") == previous
+        assert repo.inspect_lease(handle.work_id)["lease_owner"] == "active_png_autopilot"
+    finally:
+        finish.set()
+        await asyncio.wait_for(execution, timeout=20)
+    assert repo.inspect_lease(handle.work_id) is None

@@ -668,3 +668,56 @@ async def test_layout_patch_ack_excludes_later_layout_slot_and_panel_commit(
             )
         }
     assert {"page_render", "page_export"} <= affected
+
+
+@pytest.mark.asyncio
+async def test_page_http_mutation_conflicts_with_live_autopilot_work_lease(api):
+    """Two independent clients of one Work cannot silently write concurrently."""
+    client, prefix, root, handle = api
+    import asyncio
+
+    from manga_autopilot.repositories.durable_runs import DurableRunRepository
+    from manga_autopilot.services.autopilot import OrchestratorHooks
+    from manga_autopilot.services.durable_autopilot import DurableAutopilotOrchestrator
+
+    repo = DurableRunRepository(handle.database_path)
+    run_id = repo.create_run(
+        run_kind="AUTOPILOT", scope_type="WORK", scope_id=handle.work_id,
+        requested_by="lease-conflict-test", input_fingerprint="lease-test",
+    )["id"]
+    started = asyncio.Event()
+    finish = asyncio.Event()
+
+    async def long_generation(_):
+        started.set()
+        await finish.wait()
+        return {"ok": True}
+
+    execution = asyncio.create_task(DurableAutopilotOrchestrator(
+        repository=repo, work_id=handle.work_id,
+        hooks=OrchestratorHooks(validate_input=long_generation),
+        allow_omitted_hooks=True, lease_ttl_seconds=6,
+    ).execute(run_id, input_payload={}, step_inputs={},
+              lease_owner="active_autopilot"))
+    try:
+        await asyncio.wait_for(started.wait(), timeout=10)
+        current_response, original = await _state(client, prefix)
+        assert current_response.status == 200
+        revision = original["layout"]["revision"]
+        response = await client.patch(
+            prefix + "/page_001/layout",
+            json={"expected_revision": revision,
+                  "geometry_json": {"width": 1301, "height": 1600}},
+        )
+        payload = await response.json()
+        assert response.status == 409, payload
+        assert payload["error"] == "work_mutation_busy"
+        after_response, after = await _state(client, prefix)
+        assert after_response.status == 200
+        assert after["layout"]["revision"] == revision
+        assert after["layout"]["geometry_json"] == original["layout"]["geometry_json"]
+        assert repo.inspect_lease(handle.work_id)["lease_owner"] == "active_autopilot"
+    finally:
+        finish.set()
+        await asyncio.wait_for(execution, timeout=20)
+    assert repo.inspect_lease(handle.work_id) is None

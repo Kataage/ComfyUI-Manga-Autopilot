@@ -34,6 +34,7 @@ from manga_autopilot.services.autopilot import (
     Orchestrator,
     OrchestratorHooks,
 )
+from manga_autopilot.storage.repository import owned_work_mutation
 
 
 class RetryableStepError(RuntimeError):
@@ -404,9 +405,14 @@ class DurableAutopilotOrchestrator:
                 memory_step = run.record_step(hook_name, target_state)
                 run.log_event("step_started", {"step": hook_name})
                 try:
-                    result = await _invoke_guarded_hook(
-                        hook, run, heartbeat_task,
-                    )
+                    # Hooks may commit Work Page/Panel/Artifacts. Bind only
+                    # this task's trusted durable owner; asyncio.to_thread
+                    # copies the context, and the final DB transaction still
+                    # fences expired/stale leases. HTTP tasks inherit none.
+                    with owned_work_mutation(self.work_id, owner):
+                        result = await _invoke_guarded_hook(
+                            hook, run, heartbeat_task,
+                        )
                     _check_heartbeat(heartbeat_task)
                     replayable = _json_value(result)
                     if hook_name == "finalize":
@@ -417,9 +423,10 @@ class DurableAutopilotOrchestrator:
                         # sync worker runs and drain it on cancellation/loss.
                         # A process crash or lost lease leaves this attempt
                         # RUNNING/INTERRUPTED for explicit reconciliation.
-                        await _invoke_guarded_hook(
-                            legacy._finalize, run, heartbeat_task,
-                        )
+                        with owned_work_mutation(self.work_id, owner):
+                            await _invoke_guarded_hook(
+                                legacy._finalize, run, heartbeat_task,
+                            )
                         _check_heartbeat(heartbeat_task)
                     self.repository.finish_step(
                         step["id"], status="COMPLETED",
