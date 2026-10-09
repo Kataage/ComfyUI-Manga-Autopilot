@@ -642,9 +642,15 @@ class DurableRunRepository:
             # that the *previous* lease truly belonged to this Run/owner and
             # was explicitly presented for rotation before replacing it.
             # This also fences legacy orphan Run-owner snapshots.
-            if run_id is not None and run["status"] == "RUNNING" and (
-                run["lease_owner"] is not None
-            ):
+            if run_id is not None and run["status"] == "RUNNING":
+                # Never attach a brand-new lease to a generic ownerless
+                # RUNNING Run: privileged recovery would be unauthorized,
+                # and ordinary lease release would then be forbidden while
+                # that Run remains RUNNING (#382), stranding its receipts.
+                if run["lease_owner"] is None:
+                    raise WorkLeaseConflictError(
+                        "RUNNING Run requires a prior Run-bound lease owner"
+                    )
                 if (
                     old is None
                     or old["run_id"] != run_id
