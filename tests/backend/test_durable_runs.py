@@ -1174,3 +1174,57 @@ def test_historical_attempt_only_conflict_keeps_previous_completed_attempts(
     assert repo.get_run(run_id)["status"] == "RUNNING"
     assert repo.get_step(step_id)["status"] == "COMPLETED"
     assert repo.list_step_attempts(step_id) == old_attempts
+
+
+# Issue #386: independent Phase C audit-derived test-first RED matrix.
+@pytest.mark.parametrize("unresolved_step", [
+    "PENDING", "STALE", "FAILED_RETRYABLE", "FAILED_TERMINAL",
+    "INTERRUPTED", "NEEDS_ATTENTION", "CANCELLED",
+])
+def test_phase_c_audit_completed_run_requires_reconciled_successful_steps(
+    tmp_path: Path, unresolved_step: str,
+) -> None:
+    """A SUCCESS parent must not advertise unfinished/failed child work."""
+    db = tmp_path / "work.sqlite3"
+    _work(db)
+    repo = DurableRunRepository(db)
+    run_id = _run(repo)
+    repo.acquire_lease(
+        work_id="work_test", lease_owner="original",
+        lease_kind="AUTOPILOT_MUTATION", ttl_seconds=90, run_id=run_id,
+    )
+    repo.transition_run(
+        run_id, expected_status="PENDING", new_status="RUNNING",
+        lease_owner="original",
+    )
+    step = repo.create_step(
+        run_id=run_id, step_key="generate_panels",
+        input_fingerprint="v1", lease_owner="original",
+    )
+    if unresolved_step != "PENDING":
+        repo.start_step(
+            step["id"], input_fingerprint="v1", lease_owner="original",
+        )
+        repo.finish_step(
+            step["id"],
+            status="COMPLETED" if unresolved_step == "STALE" else unresolved_step,
+            lease_owner="original",
+        )
+        if unresolved_step == "STALE":
+            repo.mark_step_stale(
+                step["id"], new_fingerprint="v2", lease_owner="original",
+            )
+    assert repo.get_step(step["id"])["status"] == unresolved_step
+    old_run = repo.get_run(run_id)
+    old_step = repo.get_step(step["id"])
+    old_attempts = repo.list_step_attempts(step["id"])
+    old_lease = repo.inspect_lease("work_test")
+    with pytest.raises(DurableRunStateError):
+        repo.transition_run(
+            run_id, expected_status="RUNNING", new_status="COMPLETED",
+            lease_owner="original",
+        )
+    assert repo.get_run(run_id) == old_run
+    assert repo.get_step(step["id"]) == old_step
+    assert repo.list_step_attempts(step["id"]) == old_attempts
+    assert repo.inspect_lease("work_test") == old_lease
