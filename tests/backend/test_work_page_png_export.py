@@ -1110,10 +1110,11 @@ async def test_candidate_snapshot_byte_budget_rejects_oversized_record_before_co
 @pytest.mark.asyncio
 async def test_page_png_http_publication_conflicts_with_live_autopilot_lease(api):
     """Do not persist a READY PNG from a second writer during generation."""
+    import asyncio
+
     from manga_autopilot.repositories.durable_runs import DurableRunRepository
     from manga_autopilot.services.autopilot import OrchestratorHooks
     from manga_autopilot.services.durable_autopilot import DurableAutopilotOrchestrator
-    import asyncio
 
     client, base, root, handle, _, _, _, artifacts = api
     repo = DurableRunRepository(handle.database_path)
