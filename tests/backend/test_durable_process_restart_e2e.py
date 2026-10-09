@@ -395,3 +395,56 @@ def test_fresh_interpreter_cannot_release_live_running_run_lease(
     assert repo.get_run(run_id)["status"] == "RUNNING"
     assert repo.get_step(step_id)["status"] == "RUNNING"
     assert repo.list_step_attempts(step_id)[0]["status"] == "RUNNING"
+
+
+def test_fresh_interpreter_cannot_append_step_to_final_work_run(
+    tmp_path: Path,
+) -> None:
+    """A different Python process cannot rewrite final, released receipts."""
+    db, repo, run_id = _prepare_db(tmp_path)
+    repo.acquire_lease(
+        work_id="work_247", lease_owner="initial_owner",
+        lease_kind="AUTOPILOT_MUTATION", ttl_seconds=60, run_id=run_id,
+    )
+    repo.transition_run(
+        run_id, expected_status="PENDING", new_status="RUNNING",
+        lease_owner="initial_owner",
+    )
+    step = repo.create_step(
+        run_id=run_id, step_key="generate_panels",
+        input_fingerprint="v1", lease_owner="initial_owner",
+    )
+    repo.start_step(
+        step["id"], input_fingerprint="v1", lease_owner="initial_owner",
+    )
+    repo.finish_step(
+        step["id"], status="COMPLETED", lease_owner="initial_owner",
+    )
+    repo.transition_run(
+        run_id, expected_status="RUNNING", new_status="COMPLETED",
+        lease_owner="initial_owner",
+    )
+    repo.release_lease(work_id="work_247", lease_owner="initial_owner")
+    steps_before = repo.list_steps(run_id)
+    code = (
+        "import sys\n"
+        "from manga_autopilot.repositories.durable_runs import "
+        "DurableRunRepository, DurableRunStateError\n"
+        "repo = DurableRunRepository(sys.argv[1])\n"
+        "try:\n"
+        "    repo.create_step(run_id=sys.argv[2], "
+        "step_key='late', input_fingerprint='changed')\n"
+        "except DurableRunStateError:\n"
+        "    print('terminal_history_rejected')\n"
+        "else:\n"
+        "    raise AssertionError('final Run admitted late Step')\n"
+    )
+    process = subprocess.run(  # noqa: S603 - fixed interpreter/local fixture
+        [sys.executable, "-c", code, str(db), run_id],
+        cwd=_ROOT, capture_output=True, text=True, timeout=30, check=False,
+    )
+    assert process.returncode == 0, process.stderr
+    assert "terminal_history_rejected" in process.stdout
+    assert repo.get_run(run_id)["status"] == "COMPLETED"
+    assert repo.list_steps(run_id) == steps_before
+    assert repo.inspect_lease("work_247") is None
