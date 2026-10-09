@@ -172,6 +172,34 @@ effect awaiting reconciliation. No SQLite migration is required.
 Real ComfyUI, GPU, browser, installer and manga-quality testing
 remain separate from these GPU-free repository tests.
 
+## Terminal RunStep history immutability (#387)
+
+`DurableRunRepository` must not let a terminal parent Run (`COMPLETED`,
+`FAILED_TERMINAL`, or `CANCELLED`) gain new RunSteps or rewrite any
+recorded Step state, input fingerprint, output/attempt receipt, or Step
+heartbeat. A finished Run remains final even after its Work lease is
+normally released and the generic ownerless Repository API becomes
+available. A current, valid Work mutation owner token does **not**
+authorize reopening the final Run. Step creation, pending fingerprint
+updates, completed-Step `STALE` invalidation, finishing a historically
+inconsistent in-flight Step, and heartbeating that Step all check the
+parent Run's terminal status **inside their existing `BEGIN IMMEDIATE`
+write transaction**, in addition to the existing owner fence.
+
+The existing `start_step` method separately requires parent `RUNNING`,
+so it already denies starts against a terminal parent. Nonterminal
+`PENDING`, `RUNNING`, `PAUSED`, `FAILED_RETRYABLE`, `INTERRUPTED`
+and `NEEDS_ATTENTION` state handling retains its existing owner and
+step-status contracts. A step may be invalidated while its parent Run
+remains `RUNNING`; a later successful Attempt can legitimately
+complete that parent (Issue #386), but a final Run can never be edited
+retroactively. Historical corrupted terminal-parent/RUNNING-Step test
+snapshots are fixture-only; do not manufacture those via production
+`transition_run` (Issue #383).
+
+This applies to GPU-free durable receipt and lease invariants, not a
+sign-off of actual ComfyUI/GPU/browser output or rendering quality.
+
 ## Supported, required, and explicitly omitted stages
 
 - **Supported/executed:** a callable hook is provided for a stage in `OrchestratorHooks`. Its result (including a genuine JSON `null`) is serialized with an explicit `execution: "EXECUTED"` provenance marker in the completed RunStep/attempt receipt.
