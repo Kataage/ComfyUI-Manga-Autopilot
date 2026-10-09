@@ -121,6 +121,33 @@ def _events(path: Path) -> list[dict[str, Any]]:
     ]
 
 
+def test_foreign_run_kind_stays_pending_across_fresh_processes(
+    tmp_path: Path,
+) -> None:
+    """New Python interpreters must not dispatch EXPORT as an Autopilot."""
+    db, repo, _ = _prepare_db(tmp_path)
+    run_id = repo.create_run(
+        run_kind="EXPORT", scope_type="WORK", scope_id="work_247",
+        requested_by="process_restart_e2e", input_fingerprint="export:v1",
+    )["id"]
+    initial = repo.get_run(run_id)
+    events = tmp_path / "wrong-kind-events.jsonl"
+
+    for owner in ("first_foreign_process", "second_foreign_process"):
+        denied = _result(_invoke(
+            db=db, events=events, run_id=run_id, mode="normal",
+            owner=owner,
+        ))
+        assert denied["outcome"] == "rejected"
+        assert denied["type"] == "DurableRunStateError"
+        assert "AUTOPILOT" in denied["message"]
+        assert repo.get_run(run_id) == initial
+        assert repo.list_steps(run_id) == []
+        assert repo.inspect_lease("work_247") is None
+        assert not events.exists()
+
+
+
 def test_hard_kill_and_fresh_application_resume_only_missing_step(
     tmp_path: Path,
 ) -> None:
