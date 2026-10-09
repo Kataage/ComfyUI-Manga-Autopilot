@@ -118,12 +118,17 @@ def test_run_and_step_survive_reinstantiation_and_keep_fingerprint(tmp_path: Pat
                         new_status="RUNNING", lease_owner="worker_a")
     step = repo.create_step(
         run_id=run_id, step_key="PREFLIGHT", input_fingerprint="preflight:v1",
+        lease_owner="worker_a",
     )
     step_id = str(step["id"])
-    started = repo.start_step(step_id, input_fingerprint="preflight:v1")
+    started = repo.start_step(
+        step_id, input_fingerprint="preflight:v1", lease_owner="worker_a",
+    )
     assert started["attempt_count"] == 1
-    finished = repo.finish_step(step_id, status="COMPLETED",
-                                output={"passed": True})
+    finished = repo.finish_step(
+        step_id, status="COMPLETED", output={"passed": True},
+        lease_owner="worker_a",
+    )
     assert finished["input_fingerprint"] == "preflight:v1"
     assert finished["finished_at"]
     fresh = DurableRunRepository(db, clock=clock)
@@ -132,9 +137,15 @@ def test_run_and_step_survive_reinstantiation_and_keep_fingerprint(tmp_path: Pat
     assert fresh.get_step(step_id)["output_json"] == '{"passed":true}'
     assert len(fresh.list_steps(run_id)) == 1
     with pytest.raises(DurableRunStateError):
-        fresh.start_step(step_id, input_fingerprint="preflight:v1")
-    fresh.mark_step_stale(step_id, new_fingerprint="preflight:v2")
-    restarted = fresh.start_step(step_id, input_fingerprint="preflight:v2")
+        fresh.start_step(
+            step_id, input_fingerprint="preflight:v1", lease_owner="worker_a",
+        )
+    fresh.mark_step_stale(
+        step_id, new_fingerprint="preflight:v2", lease_owner="worker_a",
+    )
+    restarted = fresh.start_step(
+        step_id, input_fingerprint="preflight:v2", lease_owner="worker_a",
+    )
     assert restarted["attempt_count"] == 2
     assert restarted["output_json"] == "{}"
     assert restarted["input_fingerprint"] == "preflight:v2"
@@ -402,3 +413,190 @@ def test_step_heartbeat_fences_stale_owner_after_explicit_reclaim(
     assert [a["status"] for a in fresh.list_step_attempts(step_id)] == [
         "INTERRUPTED", "COMPLETED",
     ]
+
+
+@pytest.mark.parametrize("mutation", ["step_receipt", "run_terminal"])
+def test_leased_durable_run_rejects_ownerless_receipt_mutation(
+    tmp_path: Path, mutation: str,
+) -> None:
+    """Issue #378: a second Repository cannot forge the active owner's receipt."""
+    db = tmp_path / "work.sqlite3"
+    _work(db)
+    owner = DurableRunRepository(db)
+    intruder = DurableRunRepository(db)
+    run_id = _run(owner)
+    owner.acquire_lease(
+        work_id="work_test", lease_owner="active_owner",
+        lease_kind="AUTOPILOT_MUTATION", ttl_seconds=90, run_id=run_id,
+    )
+    owner.transition_run(
+        run_id, expected_status="PENDING", new_status="RUNNING",
+        lease_owner="active_owner",
+    )
+    step = owner.create_step(
+        run_id=run_id, step_key="generate_panels",
+        input_fingerprint="good", lease_owner="active_owner",
+    )
+    owner.start_step(
+        step["id"], input_fingerprint="good", lease_owner="active_owner",
+    )
+    before_run = owner.get_run(run_id)
+    before_step = owner.get_step(step["id"])
+    before_attempts = owner.list_step_attempts(step["id"])
+    if mutation == "step_receipt":
+        with pytest.raises(WorkLeaseConflictError):
+            intruder.finish_step(
+                step["id"], status="COMPLETED",
+                output={"value": "forged"},
+            )
+    else:
+        with pytest.raises(WorkLeaseConflictError):
+            intruder.transition_run(
+                run_id, expected_status="RUNNING", new_status="COMPLETED",
+            )
+    assert owner.get_run(run_id) == before_run
+    assert owner.get_step(step["id"]) == before_step
+    assert owner.list_step_attempts(step["id"]) == before_attempts
+    assert owner.inspect_lease("work_test")["lease_owner"] == "active_owner"
+    owner.finish_step(
+        step["id"], status="COMPLETED", output={"value": "owned"},
+        lease_owner="active_owner",
+    )
+    owner.transition_run(
+        run_id, expected_status="RUNNING", new_status="COMPLETED",
+        lease_owner="active_owner",
+    )
+
+
+@pytest.mark.parametrize("step_action", [
+    "create_step", "set_fingerprint", "start_step", "finish_step",
+    "mark_stale",
+])
+@pytest.mark.parametrize("untrusted_owner", [None, "wrong_owner"])
+def test_leased_step_mutations_all_require_current_owner(
+    tmp_path: Path, step_action: str, untrusted_owner: str | None,
+) -> None:
+    """Fence every mutating durable RunStep operation, not just finish_step."""
+    db = tmp_path / "work.sqlite3"
+    _work(db)
+    owner = DurableRunRepository(db)
+    intruder = DurableRunRepository(db)
+    run_id = _run(owner)
+    owner.acquire_lease(
+        work_id="work_test", lease_owner="active_owner",
+        lease_kind="AUTOPILOT_MUTATION", ttl_seconds=90, run_id=run_id,
+    )
+    owner.transition_run(
+        run_id, expected_status="PENDING", new_status="RUNNING",
+        lease_owner="active_owner",
+    )
+    step = owner.create_step(
+        run_id=run_id, step_key="original",
+        input_fingerprint="v1", lease_owner="active_owner",
+    )
+    if step_action in {"finish_step", "mark_stale"}:
+        owner.start_step(
+            step["id"], input_fingerprint="v1", lease_owner="active_owner",
+        )
+    if step_action == "mark_stale":
+        owner.finish_step(
+            step["id"], status="COMPLETED", lease_owner="active_owner",
+        )
+    before_run = owner.get_run(run_id)
+    before_step = owner.get_step(step["id"])
+    before_attempts = owner.list_step_attempts(step["id"])
+    before_steps = owner.list_steps(run_id)
+    with pytest.raises(WorkLeaseConflictError):
+        if step_action == "create_step":
+            intruder.create_step(
+                run_id=run_id, step_key="forged", input_fingerprint="v1",
+                lease_owner=untrusted_owner,
+            )
+        elif step_action == "set_fingerprint":
+            intruder.set_pending_fingerprint(
+                step["id"], input_fingerprint="forged",
+                lease_owner=untrusted_owner,
+            )
+        elif step_action == "start_step":
+            intruder.start_step(
+                step["id"], input_fingerprint="v1",
+                lease_owner=untrusted_owner,
+            )
+        elif step_action == "finish_step":
+            intruder.finish_step(
+                step["id"], status="COMPLETED",
+                output={"value": "forged"}, lease_owner=untrusted_owner,
+            )
+        else:
+            intruder.mark_step_stale(
+                step["id"], new_fingerprint="v2",
+                lease_owner=untrusted_owner,
+            )
+    assert owner.get_run(run_id) == before_run
+    assert owner.get_step(step["id"]) == before_step
+    assert owner.list_step_attempts(step["id"]) == before_attempts
+    assert owner.list_steps(run_id) == before_steps
+
+
+@pytest.mark.parametrize("owner_token", [None, "foreign_owner"])
+def test_leased_run_rejects_foreign_state_change_and_run_creation(
+    tmp_path: Path, owner_token: str | None,
+) -> None:
+    db = tmp_path / "work.sqlite3"
+    _work(db)
+    repo = DurableRunRepository(db)
+    run_id = _run(repo)
+    pending_id = _run(repo)
+    repo.acquire_lease(
+        work_id="work_test", lease_owner="active_owner",
+        lease_kind="AUTOPILOT_MUTATION", ttl_seconds=90, run_id=run_id,
+    )
+    original_pending = repo.get_run(pending_id)
+    with pytest.raises(WorkLeaseConflictError):
+        repo.transition_run(
+            pending_id, expected_status="PENDING", new_status="CANCELLED",
+            lease_owner=owner_token,
+        )
+    assert repo.get_run(pending_id) == original_pending
+    with pytest.raises(WorkLeaseConflictError):
+        repo.create_run(
+            run_kind="EXPORT", scope_type="WORK", scope_id="work_test",
+            requested_by="foreign", input_fingerprint="v1",
+        )
+    repo.release_lease(work_id="work_test", lease_owner="active_owner")
+    assert repo.get_run(pending_id) == original_pending
+    # Outside an active Work lease, generic non-AUTOPILOT run creation is valid.
+    assert repo.create_run(
+        run_kind="EXPORT", scope_type="WORK", scope_id="work_test",
+        requested_by="user", input_fingerprint="v1",
+    )["run_kind"] == "EXPORT"
+
+
+def test_ownerless_durable_mutations_refuse_expired_lease_tombstone(
+    tmp_path: Path,
+) -> None:
+    db = tmp_path / "work.sqlite3"
+    _work(db)
+    clock = Clock()
+    repo = DurableRunRepository(db, clock=clock)
+    run_id = _run(repo)
+    step = repo.create_step(
+        run_id=run_id, step_key="preflight", input_fingerprint="v1",
+    )
+    repo.acquire_lease(
+        work_id="work_test", lease_owner="expired_owner",
+        lease_kind="AUTOPILOT_MUTATION", ttl_seconds=3, run_id=run_id,
+    )
+    clock.advance(4)
+    with pytest.raises(WorkLeaseConflictError):
+        repo.set_pending_fingerprint(
+            step["id"], input_fingerprint="new",
+        )
+    with pytest.raises(WorkLeaseConflictError):
+        repo.transition_run(
+            run_id, expected_status="PENDING", new_status="RUNNING",
+        )
+    assert repo.get_run(run_id)["status"] == "PENDING"
+    assert repo.get_step(step["id"])["input_fingerprint"] == "v1"
+    assert repo.inspect_lease("work_test")["expired"] is True
+

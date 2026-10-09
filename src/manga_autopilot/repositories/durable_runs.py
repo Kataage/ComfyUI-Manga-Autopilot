@@ -109,6 +109,19 @@ class DurableRunRepository:
             raise DurableRunNotFoundError(f"{table} {identifier!r} not found")
         return row
 
+    @staticmethod
+    def _assert_unowned_mutation_allowed(conn: sqlite3.Connection) -> None:
+        """Unleased generic Run operations cannot bypass any Work lease.
+
+        This check must run inside the same BEGIN IMMEDIATE transaction as
+        the mutation. An expired lease row is a blocking recovery tombstone,
+        not permission for a new anonymous writer.
+        """
+        if conn.execute("SELECT 1 FROM work_leases LIMIT 1").fetchone() is not None:
+            raise WorkLeaseConflictError(
+                "durable mutation requires the current Work lease owner"
+            )
+
     def create_run(
         self,
         *,
@@ -132,6 +145,7 @@ class DurableRunRepository:
         timestamp = self._now().isoformat()
         encoded = canonical_json(dict(metadata or {}))
         with repository_write(self.database_path) as conn:
+            self._assert_unowned_mutation_allowed(conn)
             conn.execute(
                 """
                 INSERT INTO runs (
@@ -173,13 +187,17 @@ class DurableRunRepository:
                 raise DurableRunStateError(
                     f"Run {run_id!r} is {old['status']}, expected {expected_status}"
                 )
-            if lease_owner is not None:
+            if lease_owner is None:
+                self._assert_owner(conn, run_id, None)
+            else:
                 _required(lease_owner, "lease_owner")
                 if old["lease_owner"] not in (None, lease_owner):
                     raise DurableRunStateError("Run lease owner mismatch")
                 if expected_status == "RUNNING":
                     self._assert_owner(conn, run_id, lease_owner)
-                elif new_status == "RUNNING":
+                else:
+                    # A supplied token is never a wildcard for PENDING,
+                    # PAUSED or other transitions. It must own this Run.
                     lease = conn.execute(
                         """SELECT expires_at FROM work_leases
                            WHERE run_id = ? AND lease_owner = ?""",
@@ -228,11 +246,21 @@ class DurableRunRepository:
     def _assert_owner(
         self, conn: sqlite3.Connection, run_id: str, owner: str | None,
     ) -> None:
-        """Fence stale orchestration owners within the write transaction."""
-        if owner is None:
-            return  # Trusted low-level repository APIs remain compatible.
-        _required(owner, "lease_owner")
+        """Fence *all* durable Run/Step mutations within the write transaction.
+
+        Ownerless mutations are supported only for unleased generic low-level
+        operations, never while any Work lease/tombstone exists. A Run still
+        marked as owned also cannot be silently edited after its lease vanished.
+        """
         run = self._get(conn, "runs", run_id)
+        if owner is None:
+            self._assert_unowned_mutation_allowed(conn)
+            if run["lease_owner"] is not None:
+                raise WorkLeaseConflictError(
+                    "owned durable Run cannot be mutated without its owner"
+                )
+            return
+        _required(owner, "lease_owner")
         lease = conn.execute(
             "SELECT * FROM work_leases WHERE run_id = ? AND lease_owner = ?",
             (run_id, owner),
