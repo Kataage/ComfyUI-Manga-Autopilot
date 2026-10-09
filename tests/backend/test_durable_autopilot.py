@@ -1361,8 +1361,16 @@ async def test_finalization_heartbeat_failure_drains_and_records_interruption(
                 raise OSError("injected finalization heartbeat failure")
             return super().heartbeat_step(step_id, lease_owner=lease_owner)
 
-    owner = FailDuringFinalize(db)
-    observer = DurableRunRepository(db)
+    # The test isolates a deliberately injected step heartbeat error, not
+    # an unrelated wall-clock Work-lease expiry under slow Windows scheduling.
+    # Real lease-expiry and takeover behavior has separate repository tests.
+    class FrozenClock:
+        def __call__(self) -> datetime:
+            return datetime(2026, 10, 9, tzinfo=timezone.utc)
+
+    clock = FrozenClock()
+    owner = FailDuringFinalize(db, clock=clock)
+    observer = DurableRunRepository(db, clock=clock)
     run_id = start(owner)
     original_finalize = Orchestrator._finalize
 
@@ -1421,7 +1429,9 @@ async def test_finalization_heartbeat_failure_drains_and_records_interruption(
                     if s["step_key"] == "finalize")
         assert last["status"] == "RUNNING"
         assert observer.get_run(run_id)["status"] == "RUNNING"
-        assert observer.inspect_lease("work_246")["lease_owner"] == "lost_finalizer"
+        current_lease = observer.inspect_lease("work_246")
+        assert current_lease["lease_owner"] == "lost_finalizer"
+        assert current_lease["expired"] is False
     finally:
         release.set()
 
