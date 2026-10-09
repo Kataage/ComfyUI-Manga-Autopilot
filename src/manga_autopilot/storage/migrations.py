@@ -1355,7 +1355,7 @@ class MigrationRunner:
             # an existing backup was left after a failed schema transaction.
             try:
                 os.link(temp, backup)
-            except FileExistsError:
+            except FileExistsError as collision:
                 # Preserve the earliest backup, but never silently trust a
                 # mismatched, corrupt or post-upgrade replacement.
                 with read_connection(backup) as existing:
@@ -1371,7 +1371,7 @@ class MigrationRunner:
                             "existing migration backup has the wrong pre-upgrade "
                             "schema version",
                             pending_migrations=pending_migrations,
-                        )
+                        ) from collision
                     if original_database_id is not None:
                         saved_id = existing.execute(
                             f"SELECT value FROM {self.identity_table} "
@@ -1385,7 +1385,7 @@ class MigrationRunner:
                                 "existing migration backup belongs to a different "
                                 "database identity",
                                 pending_migrations=pending_migrations,
-                            )
+                            ) from collision
             # Re-fsync even reused backups: the previous attempt may have
             # failed exactly after linking but before directory durability.
             _fsync_directory(backup.parent)
