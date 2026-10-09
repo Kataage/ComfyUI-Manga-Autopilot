@@ -402,3 +402,87 @@ def test_step_heartbeat_fences_stale_owner_after_explicit_reclaim(
     assert [a["status"] for a in fresh.list_step_attempts(step_id)] == [
         "INTERRUPTED", "COMPLETED",
     ]
+
+
+# Phase C independent audit-only regressions. These deliberately assert the
+# cross-owner contract against the current develop baseline and are NOT a fix.
+@pytest.mark.parametrize("mutation", ["step_receipt", "run_terminal"])
+def test_phase_c_audit_anonymous_repository_cannot_mutate_leased_run(
+    tmp_path: Path, mutation: str,
+) -> None:
+    db = tmp_path / "work.sqlite3"
+    _work(db)
+    owner = DurableRunRepository(db)
+    intruder = DurableRunRepository(db)
+    run_id = _run(owner)
+    owner.acquire_lease(
+        work_id="work_test", lease_owner="active_owner",
+        lease_kind="AUTOPILOT_MUTATION", ttl_seconds=90, run_id=run_id,
+    )
+    owner.transition_run(
+        run_id, expected_status="PENDING", new_status="RUNNING",
+        lease_owner="active_owner",
+    )
+    step = owner.create_step(
+        run_id=run_id, step_key="generate_panels",
+        input_fingerprint="good", lease_owner="active_owner",
+    )
+    owner.start_step(
+        step["id"], input_fingerprint="good", lease_owner="active_owner",
+    )
+    if mutation == "step_receipt":
+        with pytest.raises(WorkLeaseConflictError):
+            intruder.finish_step(
+                step["id"], status="COMPLETED",
+                output={"value": "foreign-completion"},
+            )
+    else:
+        with pytest.raises(WorkLeaseConflictError):
+            intruder.transition_run(
+                run_id, expected_status="RUNNING", new_status="COMPLETED",
+            )
+    assert owner.get_run(run_id)["status"] == "RUNNING"
+    assert owner.get_step(step["id"])["status"] == "RUNNING"
+    assert owner.inspect_lease("work_test")["lease_owner"] == "active_owner"
+
+
+def test_phase_c_audit_cross_run_reclaim_cannot_orphan_running_receipts(
+    tmp_path: Path,
+) -> None:
+    db = tmp_path / "work.sqlite3"
+    _work(db)
+    clock = Clock()
+    repo = DurableRunRepository(db, clock=clock)
+    old_run = _run(repo)
+    new_run = _run(repo)
+    repo.acquire_lease(
+        work_id="work_test", lease_owner="crashed_owner",
+        lease_kind="AUTOPILOT_MUTATION", ttl_seconds=10, run_id=old_run,
+    )
+    repo.transition_run(
+        old_run, expected_status="PENDING", new_status="RUNNING",
+        lease_owner="crashed_owner",
+    )
+    step = repo.create_step(
+        run_id=old_run, step_key="generate_panels",
+        input_fingerprint="old-v1", lease_owner="crashed_owner",
+    )
+    repo.start_step(
+        step["id"], input_fingerprint="old-v1",
+        lease_owner="crashed_owner",
+    )
+    clock.advance(11)
+    try:
+        repo.acquire_lease(
+            work_id="work_test", lease_owner="new_owner",
+            lease_kind="AUTOPILOT_MUTATION", ttl_seconds=10,
+            run_id=new_run, reclaim_expired_owner="crashed_owner",
+        )
+    except WorkLeaseConflictError:
+        # Explicit reconciliation before starting a different Run is safe.
+        pass
+    else:
+        # Or an atomic handover may explicitly interrupt old durable receipts.
+        assert repo.get_run(old_run)["status"] == "INTERRUPTED"
+        assert repo.get_step(step["id"])["status"] == "INTERRUPTED"
+        assert repo.list_step_attempts(step["id"])[0]["status"] == "INTERRUPTED"
