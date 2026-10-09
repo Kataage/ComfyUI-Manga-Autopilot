@@ -714,14 +714,22 @@ def test_cross_run_reclaim_requires_reconciled_step_and_attempt_receipts(
         input_fingerprint="v1", lease_owner="old",
     )["id"]
     repo.start_step(step_id, input_fingerprint="v1", lease_owner="old")
-    if old_state != "completed_run_with_active_step":
+    if old_state == "completed_run_with_active_step":
+        # Simulate a legacy inconsistent snapshot directly. Production
+        # transition_run now correctly rejects this malformed Run/Step pair.
+        with repository_write(db) as conn:
+            conn.execute(
+                "UPDATE runs SET status = 'COMPLETED', lease_owner = NULL "
+                "WHERE id = ?", (old_run,),
+            )
+    else:
         repo.finish_step(
             step_id, status="COMPLETED", lease_owner="old",
         )
-    repo.transition_run(
-        old_run, expected_status="RUNNING", new_status="COMPLETED",
-        lease_owner="old",
-    )
+        repo.transition_run(
+            old_run, expected_status="RUNNING", new_status="COMPLETED",
+            lease_owner="old",
+        )
     if old_state == "completed_run_with_active_attempt":
         # Simulate an independently malformed legacy receipt: the Run
         # and Step look completed, but its attempt still says RUNNING.
@@ -861,10 +869,13 @@ def test_phase_c_audit_live_lease_release_checks_orphan_step_attempts(
         input_fingerprint="v1", lease_owner="first",
     )["id"]
     repo.start_step(step_id, input_fingerprint="v1", lease_owner="first")
-    repo.transition_run(
-        run_id, expected_status="RUNNING", new_status="COMPLETED",
-        lease_owner="first",
-    )
+    # A historical corrupt parent Run can be created by direct fixture SQL;
+    # the public transition_run must not permit creating this state.
+    with repository_write(db) as conn:
+        conn.execute(
+            "UPDATE runs SET status = 'COMPLETED', lease_owner = NULL "
+            "WHERE id = ?", (run_id,),
+        )
     assert repo.get_run(run_id)["status"] == "COMPLETED"
     assert repo.get_step(step_id)["status"] == "RUNNING"
     attempt_before = repo.list_step_attempts(step_id)
