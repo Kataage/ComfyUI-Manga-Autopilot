@@ -17,8 +17,11 @@ import hashlib
 import json
 import os
 import sqlite3
+import stat
+import time
 import uuid
-from collections.abc import Callable, Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -823,6 +826,64 @@ def _existing_nonempty_database(path: Path) -> bool:
     return path.exists() and path.is_file() and path.stat().st_size > 0
 
 
+@contextmanager
+def _existing_migration_lock(path: Path) -> Iterator[None]:
+    """Serialize existing-DB migration planning, backup and schema commits.
+
+    SQLite's BEGIN IMMEDIATE is not held across sqlite3.backup(), so it
+    cannot protect the earlier applied-version decision and backup snapshot.
+    A persistent sibling lock inode is shared by threads and independent
+    processes; never unlink it (a process could still hold the old inode).
+    The OS releases its lock automatically if a migrator crashes.
+    """
+    lock_path = path.with_name(f".{path.name}.migration.lock")
+    if lock_path.is_symlink():
+        raise MigrationError(f"migration lock must not be a symlink: {lock_path}")
+    flags = os.O_CREAT | os.O_RDWR | getattr(os, "O_BINARY", 0)
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    fd = os.open(lock_path, flags, 0o600)
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise MigrationError(
+                f"migration lock is not a regular file: {lock_path}"
+            )
+        with os.fdopen(fd, "r+b", closefd=False) as lock_file:
+            if os.fstat(fd).st_size == 0:
+                lock_file.write(b"0")
+                lock_file.flush()
+            lock_file.seek(0)
+            if os.name == "nt":
+                import msvcrt
+
+                deadline = time.monotonic() + 60
+                while True:
+                    try:
+                        msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+                        break
+                    except OSError as exc:
+                        if exc.errno not in {errno.EACCES, errno.EAGAIN}:
+                            raise
+                        if time.monotonic() >= deadline:
+                            raise MigrationError(
+                                f"timed out acquiring migration lock: {lock_path}"
+                            ) from exc
+                        time.sleep(0.05)
+            else:
+                import fcntl
+
+                fcntl.flock(fd, fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                if os.name == "nt":
+                    msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+                else:
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
+
+
 def _cleanup_owned_staged_database(path: Path) -> None:
     """Best-effort cleanup for a uniquely named staged database we own."""
     for candidate in (
@@ -990,6 +1051,16 @@ class MigrationRunner:
             _cleanup_owned_staged_database(staged)
 
     def _migrate_in_place(self, path: Path) -> MigrationResult:
+        # Unique freshly staged DBs need no shared lock. Existing recognized
+        # databases must serialize from BEFORE version inspection through
+        # backup publication and commit. Re-inspect only after taking the
+        # lock so another process's completed upgrade is seen as idempotent.
+        if _existing_nonempty_database(path):
+            with _existing_migration_lock(path):
+                return self._migrate_in_place_locked(path)
+        return self._migrate_in_place_locked(path)
+
+    def _migrate_in_place_locked(self, path: Path) -> MigrationResult:
         existed = _existing_nonempty_database(path)
 
         applied = self._inspect_existing_database(path) if existed else {}
@@ -1241,6 +1312,7 @@ class MigrationRunner:
             if temp.exists():
                 temp.unlink()
 
+            original_database_id: str | None = None
             with write_connection(path) as source:
                 checkpoint = source.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
                 if checkpoint is not None and int(checkpoint[0]) != 0:
@@ -1256,6 +1328,13 @@ class MigrationRunner:
                 )
                 if self.pre_integrity_check is not None:
                     self.pre_integrity_check(source)
+                if self.identity_table is not None:
+                    identity = source.execute(
+                        f"SELECT value FROM {self.identity_table} "
+                        "WHERE key = 'database_id'"
+                    ).fetchone()
+                    if identity is not None:
+                        original_database_id = str(identity[0])
 
                 destination = sqlite3.connect(temp)
                 try:
@@ -1271,8 +1350,46 @@ class MigrationRunner:
                     _read_applied_migrations(verification),
                 )
 
-            os.replace(temp, backup)
+            # Atomic no-clobber publication: never turn a pre-upgrade
+            # recovery point into a post-upgrade snapshot on retry, even if
+            # an existing backup was left after a failed schema transaction.
+            try:
+                os.link(temp, backup)
+            except FileExistsError as collision:
+                # Preserve the earliest backup, but never silently trust a
+                # mismatched, corrupt or post-upgrade replacement.
+                with read_connection(backup) as existing:
+                    sqlite_integrity_check(existing)
+                    self._validate_identity(
+                        existing, _table_names(existing),
+                        _read_applied_migrations(existing),
+                    )
+                    previous = _read_applied_migrations(existing)
+                    _validate_applied_migrations(self.migrations, previous)
+                    if max(previous, default=0) != current_version:
+                        raise MigrationBackupError(
+                            "existing migration backup has the wrong pre-upgrade "
+                            "schema version",
+                            pending_migrations=pending_migrations,
+                        ) from collision
+                    if original_database_id is not None:
+                        saved_id = existing.execute(
+                            f"SELECT value FROM {self.identity_table} "
+                            "WHERE key = 'database_id'"
+                        ).fetchone()
+                        if (
+                            saved_id is None
+                            or str(saved_id[0]) != original_database_id
+                        ):
+                            raise MigrationBackupError(
+                                "existing migration backup belongs to a different "
+                                "database identity",
+                                pending_migrations=pending_migrations,
+                            ) from collision
+            # Re-fsync even reused backups: the previous attempt may have
+            # failed exactly after linking but before directory durability.
             _fsync_directory(backup.parent)
+            cleanup_temp_best_effort()
             return backup
         except MigrationError:
             cleanup_temp_best_effort()
