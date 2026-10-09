@@ -214,6 +214,10 @@ class DurableAutopilotOrchestrator:
         durable = self.repository.get_run(run_id)
         if durable["scope_type"] != "WORK" or durable["scope_id"] != self.work_id:
             raise DurableRunStateError("Run is not owned by this Work")
+        if durable["run_kind"] != "AUTOPILOT":
+            raise DurableRunStateError(
+                "Durable Autopilot requires run_kind='AUTOPILOT'"
+            )
         if durable["status"] in {"COMPLETED", "FAILED_TERMINAL", "CANCELLED"}:
             raise DurableRunStateError("terminal Run cannot resume; create a new Run")
         if durable["status"] == "NEEDS_ATTENTION" and not approve_needs_attention_retry:
