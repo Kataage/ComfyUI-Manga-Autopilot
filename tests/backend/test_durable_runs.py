@@ -1635,3 +1635,193 @@ def test_legacy_terminal_parent_cannot_rewrite_running_step_attempt(
     assert repo.get_step(step_id) == before
     assert repo.list_step_attempts(step_id) == attempts
     assert repo.inspect_lease("work_test") == lease
+
+
+def test_phase_c_audit_heartbeat_must_not_revive_expired_lease_during_lock_wait(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Snapshotting time before BEGIN IMMEDIATE must not extend expired ownership."""
+    from contextlib import contextmanager
+
+    import manga_autopilot.repositories.durable_runs as durable_module
+
+    db = tmp_path / "work.sqlite3"
+    _work(db)
+    clock = Clock()
+    repo = DurableRunRepository(db, clock=clock)
+    old = repo.acquire_lease(
+        work_id="work_test", lease_owner="prior_owner",
+        lease_kind="MUTATION", ttl_seconds=3,
+    )
+
+    # At method entry the lease is live, but the BEGIN IMMEDIATE writer
+    # cannot enter until *after* the prior lease has expired. This injection
+    # models a contended SQLite writer deterministically without real sleeps.
+    clock.advance(2)
+    original_write = durable_module.repository_write
+
+    @contextmanager
+    def delayed_write(database_path):
+        clock.advance(2)
+        with original_write(database_path) as connection:
+            yield connection
+
+    monkeypatch.setattr(durable_module, "repository_write", delayed_write)
+    with pytest.raises(WorkLeaseConflictError, match="expired"):
+        repo.heartbeat_lease(
+            work_id="work_test", lease_owner="prior_owner", ttl_seconds=3,
+        )
+    after = repo.inspect_lease("work_test")
+    assert after is not None
+    assert after["expires_at"] == old["expires_at"]
+    assert after["heartbeat_at"] == old["heartbeat_at"]
+    assert after["expired"] is True
+
+
+def test_phase_c_audit_expired_lease_recovery_uses_transaction_time(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A matching-token recovery must observe expiration after writer wait."""
+    from contextlib import contextmanager
+
+    import manga_autopilot.repositories.durable_runs as durable_module
+
+    db = tmp_path / "work.sqlite3"
+    _work(db)
+    clock = Clock()
+    repo = DurableRunRepository(db, clock=clock)
+    original = repo.acquire_lease(
+        work_id="work_test", lease_owner="prior_owner",
+        lease_kind="MUTATION", ttl_seconds=3,
+    )
+    clock.advance(2)
+    original_write = durable_module.repository_write
+
+    @contextmanager
+    def delayed_write(database_path):
+        clock.advance(2)
+        with original_write(database_path) as connection:
+            yield connection
+
+    monkeypatch.setattr(durable_module, "repository_write", delayed_write)
+    recovered = repo.acquire_lease(
+        work_id="work_test", lease_owner="fresh_owner", lease_kind="MUTATION",
+        ttl_seconds=10, reclaim_expired_owner="prior_owner",
+    )
+    assert recovered["lease_owner"] == "fresh_owner"
+    assert recovered["heartbeat_at"] > original["expires_at"]
+    assert repo.inspect_lease("work_test")["expired"] is False
+
+
+def test_phase_c_audit_lease_heartbeat_live_without_writer_delay(
+    tmp_path: Path,
+) -> None:
+    """Control: normal renewal still extends a genuinely live lease."""
+    db = tmp_path / "work.sqlite3"
+    _work(db)
+    clock = Clock()
+    repo = DurableRunRepository(db, clock=clock)
+    first = repo.acquire_lease(
+        work_id="work_test", lease_owner="prior_owner",
+        lease_kind="MUTATION", ttl_seconds=3,
+    )
+    clock.advance(2)
+    renewed = repo.heartbeat_lease(
+        work_id="work_test", lease_owner="prior_owner", ttl_seconds=3,
+    )
+    assert renewed["expires_at"] > first["expires_at"]
+    assert repo.inspect_lease("work_test")["expired"] is False
+
+
+def test_phase_c_audit_expired_lease_after_writer_wait_fences_run_step_and_work(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Rejected late renewal must retain a recoverable owner fence."""
+    from contextlib import contextmanager
+
+    import manga_autopilot.repositories.durable_runs as durable_module
+    from manga_autopilot.repositories.page_domain import PageRepository
+    from manga_autopilot.storage.repository import (
+        WorkMutationLeaseConflictError,
+        owned_work_mutation,
+    )
+
+    db = tmp_path / "work.sqlite3"
+    _work(db)
+    pages = PageRepository(db)
+    page = pages.create_page(
+        page_id="p0", page_number=1, order_key="1",
+        page_purpose="before lease",
+    )
+    clock = Clock()
+    old_owner = DurableRunRepository(db, clock=clock)
+    run_id = _run(old_owner)
+    old_owner.acquire_lease(
+        work_id="work_test", lease_owner="prior_owner",
+        lease_kind="AUTOPILOT_MUTATION", ttl_seconds=3, run_id=run_id,
+    )
+    old_owner.transition_run(
+        run_id, expected_status="PENDING",
+        new_status="RUNNING", lease_owner="prior_owner",
+    )
+    step = old_owner.create_step(
+        run_id=run_id, step_key="render", input_fingerprint="v1",
+        lease_owner="prior_owner",
+    )
+    old_owner.start_step(
+        step["id"], input_fingerprint="v1", lease_owner="prior_owner",
+    )
+    before_run = old_owner.get_run(run_id)
+    before_step = old_owner.get_step(step["id"])
+    before_attempt = old_owner.list_step_attempts(step["id"])
+    before_lease = old_owner.inspect_lease("work_test")
+
+    clock.advance(2)
+    original_write = durable_module.repository_write
+
+    @contextmanager
+    def delayed_write(path):
+        # Simulate SQLite BEGIN IMMEDIATE acquiring its lock only at T0+4.
+        clock.advance(2)
+        with original_write(path) as connection:
+            yield connection
+
+    with monkeypatch.context() as patch:
+        patch.setattr(durable_module, "repository_write", delayed_write)
+        with pytest.raises(WorkLeaseConflictError, match="expired"):
+            old_owner.heartbeat_lease(
+                work_id="work_test", lease_owner="prior_owner", ttl_seconds=3,
+            )
+    assert old_owner.get_run(run_id) == before_run
+    assert old_owner.get_step(step["id"]) == before_step
+    assert old_owner.list_step_attempts(step["id"]) == before_attempt
+    assert old_owner.inspect_lease("work_test")["expires_at"] == before_lease["expires_at"]
+    assert old_owner.inspect_lease("work_test")["expired"] is True
+    with pytest.raises(WorkLeaseConflictError):
+        old_owner.heartbeat_run(run_id, lease_owner="prior_owner")
+    with pytest.raises(WorkLeaseConflictError):
+        old_owner.heartbeat_step(step["id"], lease_owner="prior_owner")
+    with owned_work_mutation("work_test", "prior_owner"):
+        with pytest.raises(WorkMutationLeaseConflictError):
+            pages.update_page(
+                page["id"], expected_revision=page["revision"],
+                page_purpose="stale writer",
+            )
+    assert pages.get_page(page["id"]) == page
+
+    replacement = DurableRunRepository(db, clock=clock)
+    rotated = replacement.acquire_lease(
+        work_id="work_test", lease_owner="rotated_owner",
+        lease_kind="AUTOPILOT_MUTATION", ttl_seconds=10,
+        run_id=run_id, reclaim_expired_owner="prior_owner",
+    )
+    assert rotated["lease_owner"] == "rotated_owner"
+    replacement.recover_interrupted_run(run_id, lease_owner="rotated_owner")
+    assert replacement.get_run(run_id)["status"] == "INTERRUPTED"
+    assert replacement.get_step(step["id"])["status"] == "INTERRUPTED"
+    assert replacement.list_step_attempts(step["id"])[0]["status"] == "INTERRUPTED"
+    with pytest.raises(WorkLeaseConflictError):
+        old_owner.heartbeat_lease(
+            work_id="work_test", lease_owner="prior_owner", ttl_seconds=3,
+        )
+    replacement.release_lease(work_id="work_test", lease_owner="rotated_owner")
