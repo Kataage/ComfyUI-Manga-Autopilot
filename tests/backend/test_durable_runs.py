@@ -1358,3 +1358,110 @@ def test_completed_run_with_no_registered_steps_still_allowed(
     assert repo.transition_run(
         run_id, expected_status="RUNNING", new_status="COMPLETED",
     )["status"] == "COMPLETED"
+
+
+# #387: independent audit RED cases; intended to turn GREEN after fix.
+@pytest.mark.parametrize("terminal_status", [
+    "COMPLETED", "FAILED_TERMINAL", "CANCELLED",
+])
+def test_phase_c_audit_terminal_run_cannot_gain_step_after_lease_release(
+    tmp_path: Path, terminal_status: str,
+) -> None:
+    db = tmp_path / "work.sqlite3"
+    _work(db)
+    repo = DurableRunRepository(db)
+    run_id = _run(repo)
+    repo.acquire_lease(
+        work_id="work_test", lease_owner="original",
+        lease_kind="AUTOPILOT_MUTATION", ttl_seconds=60, run_id=run_id,
+    )
+    repo.transition_run(
+        run_id, expected_status="PENDING", new_status="RUNNING",
+        lease_owner="original",
+    )
+    original_step = repo.create_step(
+        run_id=run_id, step_key="generate_panels",
+        input_fingerprint="v1", lease_owner="original",
+    )
+    repo.start_step(
+        original_step["id"], input_fingerprint="v1",
+        lease_owner="original",
+    )
+    repo.finish_step(
+        original_step["id"], status=terminal_status,
+        lease_owner="original",
+    )
+    repo.transition_run(
+        run_id, expected_status="RUNNING", new_status=terminal_status,
+        lease_owner="original",
+    )
+    repo.release_lease(work_id="work_test", lease_owner="original")
+    frozen_run = repo.get_run(run_id)
+    frozen_steps = repo.list_steps(run_id)
+    with pytest.raises(DurableRunStateError):
+        repo.create_step(
+            run_id=run_id, step_key="new_unrecorded_work",
+            input_fingerprint="v2",
+        )
+    assert repo.get_run(run_id) == frozen_run
+    assert repo.list_steps(run_id) == frozen_steps
+    assert repo.inspect_lease("work_test") is None
+
+
+def test_phase_c_audit_completed_run_step_cannot_be_staled_after_release(
+    tmp_path: Path,
+) -> None:
+    db = tmp_path / "work.sqlite3"
+    _work(db)
+    repo = DurableRunRepository(db)
+    run_id = _run(repo)
+    repo.acquire_lease(
+        work_id="work_test", lease_owner="original",
+        lease_kind="AUTOPILOT_MUTATION", ttl_seconds=60, run_id=run_id,
+    )
+    repo.transition_run(
+        run_id, expected_status="PENDING", new_status="RUNNING",
+        lease_owner="original",
+    )
+    step = repo.create_step(
+        run_id=run_id, step_key="plan_story",
+        input_fingerprint="v1", lease_owner="original",
+    )
+    repo.start_step(step["id"], input_fingerprint="v1", lease_owner="original")
+    repo.finish_step(
+        step["id"], status="COMPLETED",
+        output={"value": "verified"}, lease_owner="original",
+    )
+    repo.transition_run(
+        run_id, expected_status="RUNNING", new_status="COMPLETED",
+        lease_owner="original",
+    )
+    repo.release_lease(work_id="work_test", lease_owner="original")
+    frozen = repo.get_step(step["id"])
+    before_attempts = repo.list_step_attempts(step["id"])
+    with pytest.raises(DurableRunStateError):
+        repo.mark_step_stale(step["id"], new_fingerprint="v2")
+    assert repo.get_run(run_id)["status"] == "COMPLETED"
+    assert repo.get_step(step["id"]) == frozen
+    assert repo.list_step_attempts(step["id"]) == before_attempts
+
+
+def test_phase_c_audit_cancelled_pending_run_step_cannot_change_fingerprint(
+    tmp_path: Path,
+) -> None:
+    db = tmp_path / "work.sqlite3"
+    _work(db)
+    repo = DurableRunRepository(db)
+    run_id = _run(repo)
+    step = repo.create_step(
+        run_id=run_id, step_key="generate_panels",
+        input_fingerprint="v1",
+    )
+    repo.transition_run(
+        run_id, expected_status="PENDING", new_status="CANCELLED",
+    )
+    before = repo.get_step(step["id"])
+    with pytest.raises(DurableRunStateError):
+        repo.set_pending_fingerprint(step["id"], input_fingerprint="v2")
+    assert repo.get_run(run_id)["status"] == "CANCELLED"
+    assert repo.get_step(step["id"]) == before
