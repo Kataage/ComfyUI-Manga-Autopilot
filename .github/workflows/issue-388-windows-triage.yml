@@ -1,0 +1,33 @@
+name: issue-388-windows-triage
+on:
+  push:
+    branches: ["388-test"]
+
+jobs:
+  isolated-windows:
+    name: isolated Windows replay (shard ${{ matrix.shard }})
+    runs-on: windows-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+      - name: Install package and dev dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev]"
+      - name: Repeat original focused regression at immutable SHA
+        shell: pwsh
+        run: |
+          1..10 | ForEach-Object {
+            Write-Host "ISSUE388 focused iteration $_ on shard ${{ matrix.shard }}"
+            python -m pytest tests/backend/test_durable_autopilot.py::test_finalization_heartbeat_failure_drains_and_records_interruption -q -s
+            if ($LASTEXITCODE -ne 0) { throw "ISSUE388 focused iteration $_ failed" }
+          }

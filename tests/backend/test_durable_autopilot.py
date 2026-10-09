@@ -1360,7 +1360,36 @@ async def test_finalization_heartbeat_failure_drains_and_records_interruption(
     ).execute(run_id, input_payload={}, step_inputs={},
               lease_owner="lost_finalizer"))
     try:
-        assert await asyncio.to_thread(entered.wait, 15)
+        # Issue #388 audit-only instrumentation. Preserve the original
+        # deadline and acceptance semantics; collect evidence only on miss.
+        entered_in_time = await asyncio.to_thread(entered.wait, 15)
+        if not entered_in_time:
+            try:
+                observed_run = observer.get_run(run_id)
+                observed_steps = [
+                    (s["step_key"], s["status"], s["heartbeat_at"])
+                    for s in observer.list_steps(run_id)
+                ]
+                observed_lease = observer.inspect_lease("work_246")
+                print("ISSUE388_DIAGNOSTIC", {
+                    "run_status": observed_run["status"],
+                    "steps": observed_steps,
+                    "lease": observed_lease,
+                    "task_done": task.done(),
+                    "entered": entered.is_set(),
+                    "lost": lost.is_set(),
+                    "exited": exited.is_set(),
+                }, flush=True)
+                if task.done():
+                    try:
+                        task.result()
+                    except BaseException as error:
+                        print("ISSUE388_TASK_EXCEPTION", repr(error), flush=True)
+                await asyncio.sleep(1)
+                print("ISSUE388_LATE_ENTRY", entered.is_set(), flush=True)
+            except BaseException as probe_error:
+                print("ISSUE388_PROBE_ERROR", repr(probe_error), flush=True)
+        assert entered_in_time
         assert await asyncio.to_thread(lost.wait, 15)
         await asyncio.sleep(0.05)
         assert not task.done()
