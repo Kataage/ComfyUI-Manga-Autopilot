@@ -1623,3 +1623,44 @@ async def test_phase_c_audit_preflight_step_error_cannot_abandon_running_run(
     latest = resumed.get_run(run_id)
     lease = resumed.inspect_lease("work_246")
     assert latest["status"] != "RUNNING" or lease is not None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("outside_stage_failure", ["cancel", "exception"])
+async def test_early_orchestration_abort_keeps_lease_until_explicit_recovery(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, outside_stage_failure: str,
+) -> None:
+    """Pre-Step failures must not orphan RUNNING Runs or unblock new writers."""
+    db = work(tmp_path)
+    repo = DurableRunRepository(db)
+    run_id = start(repo)
+    calls = repo.list_steps
+
+    def fail_after_run_started(requested_run_id: str):
+        if repo.get_run(requested_run_id)["status"] == "RUNNING":
+            if outside_stage_failure == "cancel":
+                raise asyncio.CancelledError()
+            raise RuntimeError("pre-step validation crashed")
+        return calls(requested_run_id)
+
+    monkeypatch.setattr(repo, "list_steps", fail_after_run_started)
+    error = (
+        asyncio.CancelledError if outside_stage_failure == "cancel"
+        else RuntimeError
+    )
+    with pytest.raises(error):
+        await runner(repo, OrchestratorHooks()).execute(
+            run_id, input_payload={}, step_inputs={},
+            lease_owner="aborted_owner",
+        )
+    assert repo.get_run(run_id)["status"] == "RUNNING"
+    lease = repo.inspect_lease("work_246")
+    assert lease is not None
+    assert lease["lease_owner"] == "aborted_owner"
+    assert lease["run_id"] == run_id
+    another = DurableRunRepository(db)
+    with pytest.raises(WorkLeaseConflictError):
+        another.acquire_lease(
+            work_id="work_246", lease_owner="other_owner",
+            lease_kind="AUTOPILOT_MUTATION", ttl_seconds=60,
+        )
