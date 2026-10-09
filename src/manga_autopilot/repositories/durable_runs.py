@@ -47,6 +47,7 @@ _RUN_TRANSITIONS = {
     "FAILED_TERMINAL": frozenset(),
     "CANCELLED": frozenset(),
 }
+_RUN_TERMINAL = frozenset({"COMPLETED", "FAILED_TERMINAL", "CANCELLED"})
 _STEP_STARTABLE = frozenset({
     "PENDING", "INTERRUPTED", "FAILED_RETRYABLE", "STALE",
     "NEEDS_ATTENTION",
@@ -108,6 +109,21 @@ class DurableRunRepository:
         if row is None:
             raise DurableRunNotFoundError(f"{table} {identifier!r} not found")
         return row
+
+    @staticmethod
+    def _assert_run_step_history_mutable(
+        conn: sqlite3.Connection, run_id: str,
+    ) -> None:
+        """Keep terminal parent Run receipts immutable in this write transaction.
+
+        Owner authorization alone is insufficient: a successfully released
+        lease leaves a final Run available for generic unleased writes.
+        """
+        run = DurableRunRepository._get(conn, "runs", run_id)
+        if run["status"] in _RUN_TERMINAL:
+            raise DurableRunStateError(
+                "cannot mutate Step history belonging to a terminal Run"
+            )
 
     @staticmethod
     def _assert_unowned_mutation_allowed(conn: sqlite3.Connection) -> None:
@@ -379,6 +395,7 @@ class DurableRunRepository:
         with repository_write(self.database_path) as conn:
             step = self._get(conn, "run_steps", step_id)
             self._assert_owner(conn, str(step["run_id"]), lease_owner)
+            self._assert_run_step_history_mutable(conn, str(step["run_id"]))
             if step["status"] != "PENDING":
                 raise DurableRunStateError("only pending step can update its input")
             conn.execute(
@@ -408,6 +425,7 @@ class DurableRunRepository:
         with repository_write(self.database_path) as conn:
             self._get(conn, "runs", run_id)
             self._assert_owner(conn, run_id, lease_owner)
+            self._assert_run_step_history_mutable(conn, run_id)
             conn.execute(
                 """
                 INSERT INTO run_steps (
@@ -444,6 +462,7 @@ class DurableRunRepository:
         with repository_write(self.database_path) as conn:
             old = self._get(conn, "run_steps", step_id)
             self._assert_owner(conn, str(old["run_id"]), lease_owner)
+            self._assert_run_step_history_mutable(conn, str(old["run_id"]))
             if old["status"] != "COMPLETED":
                 raise DurableRunStateError("only a completed step can become STALE")
             if old["input_fingerprint"] == new_fingerprint:
@@ -513,6 +532,7 @@ class DurableRunRepository:
         with repository_write(self.database_path) as conn:
             step = self._get(conn, "run_steps", step_id)
             self._assert_owner(conn, str(step["run_id"]), lease_owner)
+            self._assert_run_step_history_mutable(conn, str(step["run_id"]))
             cursor = conn.execute(
                 """UPDATE run_steps SET heartbeat_at = ?
                    WHERE id = ? AND status = 'RUNNING'""",
@@ -537,6 +557,7 @@ class DurableRunRepository:
         with repository_write(self.database_path) as conn:
             old = self._get(conn, "run_steps", step_id)
             self._assert_owner(conn, str(old["run_id"]), lease_owner)
+            self._assert_run_step_history_mutable(conn, str(old["run_id"]))
             if old["status"] != "RUNNING":
                 raise DurableRunStateError("only a RUNNING step may finish")
             finished = self._now().isoformat()

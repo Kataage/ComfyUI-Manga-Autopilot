@@ -1358,3 +1358,280 @@ def test_completed_run_with_no_registered_steps_still_allowed(
     assert repo.transition_run(
         run_id, expected_status="RUNNING", new_status="COMPLETED",
     )["status"] == "COMPLETED"
+
+
+# #387: independent audit RED cases; intended to turn GREEN after fix.
+@pytest.mark.parametrize("terminal_status", [
+    "COMPLETED", "FAILED_TERMINAL", "CANCELLED",
+])
+def test_phase_c_audit_terminal_run_cannot_gain_step_after_lease_release(
+    tmp_path: Path, terminal_status: str,
+) -> None:
+    db = tmp_path / "work.sqlite3"
+    _work(db)
+    repo = DurableRunRepository(db)
+    run_id = _run(repo)
+    repo.acquire_lease(
+        work_id="work_test", lease_owner="original",
+        lease_kind="AUTOPILOT_MUTATION", ttl_seconds=60, run_id=run_id,
+    )
+    repo.transition_run(
+        run_id, expected_status="PENDING", new_status="RUNNING",
+        lease_owner="original",
+    )
+    original_step = repo.create_step(
+        run_id=run_id, step_key="generate_panels",
+        input_fingerprint="v1", lease_owner="original",
+    )
+    repo.start_step(
+        original_step["id"], input_fingerprint="v1",
+        lease_owner="original",
+    )
+    repo.finish_step(
+        original_step["id"], status=terminal_status,
+        lease_owner="original",
+    )
+    repo.transition_run(
+        run_id, expected_status="RUNNING", new_status=terminal_status,
+        lease_owner="original",
+    )
+    repo.release_lease(work_id="work_test", lease_owner="original")
+    frozen_run = repo.get_run(run_id)
+    frozen_steps = repo.list_steps(run_id)
+    with pytest.raises(DurableRunStateError):
+        repo.create_step(
+            run_id=run_id, step_key="new_unrecorded_work",
+            input_fingerprint="v2",
+        )
+    assert repo.get_run(run_id) == frozen_run
+    assert repo.list_steps(run_id) == frozen_steps
+    assert repo.inspect_lease("work_test") is None
+
+
+def test_phase_c_audit_completed_run_step_cannot_be_staled_after_release(
+    tmp_path: Path,
+) -> None:
+    db = tmp_path / "work.sqlite3"
+    _work(db)
+    repo = DurableRunRepository(db)
+    run_id = _run(repo)
+    repo.acquire_lease(
+        work_id="work_test", lease_owner="original",
+        lease_kind="AUTOPILOT_MUTATION", ttl_seconds=60, run_id=run_id,
+    )
+    repo.transition_run(
+        run_id, expected_status="PENDING", new_status="RUNNING",
+        lease_owner="original",
+    )
+    step = repo.create_step(
+        run_id=run_id, step_key="plan_story",
+        input_fingerprint="v1", lease_owner="original",
+    )
+    repo.start_step(step["id"], input_fingerprint="v1", lease_owner="original")
+    repo.finish_step(
+        step["id"], status="COMPLETED",
+        output={"value": "verified"}, lease_owner="original",
+    )
+    repo.transition_run(
+        run_id, expected_status="RUNNING", new_status="COMPLETED",
+        lease_owner="original",
+    )
+    repo.release_lease(work_id="work_test", lease_owner="original")
+    frozen = repo.get_step(step["id"])
+    before_attempts = repo.list_step_attempts(step["id"])
+    with pytest.raises(DurableRunStateError):
+        repo.mark_step_stale(step["id"], new_fingerprint="v2")
+    assert repo.get_run(run_id)["status"] == "COMPLETED"
+    assert repo.get_step(step["id"]) == frozen
+    assert repo.list_step_attempts(step["id"]) == before_attempts
+
+
+def test_phase_c_audit_cancelled_pending_run_step_cannot_change_fingerprint(
+    tmp_path: Path,
+) -> None:
+    db = tmp_path / "work.sqlite3"
+    _work(db)
+    repo = DurableRunRepository(db)
+    run_id = _run(repo)
+    step = repo.create_step(
+        run_id=run_id, step_key="generate_panels",
+        input_fingerprint="v1",
+    )
+    repo.transition_run(
+        run_id, expected_status="PENDING", new_status="CANCELLED",
+    )
+    before = repo.get_step(step["id"])
+    with pytest.raises(DurableRunStateError):
+        repo.set_pending_fingerprint(step["id"], input_fingerprint="v2")
+    assert repo.get_run(run_id)["status"] == "CANCELLED"
+    assert repo.get_step(step["id"]) == before
+
+
+@pytest.mark.parametrize("terminal_status", [
+    "COMPLETED", "FAILED_TERMINAL", "CANCELLED",
+])
+def test_terminal_run_rejects_all_step_edits_before_work_lease_release(
+    tmp_path: Path, terminal_status: str,
+) -> None:
+    db = tmp_path / "work.sqlite3"
+    _work(db)
+    repo = DurableRunRepository(db)
+    run_id = _run(repo)
+    repo.acquire_lease(
+        work_id="work_test", lease_owner="live_owner",
+        lease_kind="AUTOPILOT_MUTATION", ttl_seconds=90, run_id=run_id,
+    )
+    repo.transition_run(
+        run_id, expected_status="PENDING", new_status="RUNNING",
+        lease_owner="live_owner",
+    )
+    finished = repo.create_step(
+        run_id=run_id, step_key="generation",
+        input_fingerprint="v1", lease_owner="live_owner",
+    )["id"]
+    pending = None
+    if terminal_status != "COMPLETED":
+        pending = repo.create_step(
+            run_id=run_id, step_key="downstream",
+            input_fingerprint="v1", lease_owner="live_owner",
+        )["id"]
+    repo.start_step(finished, input_fingerprint="v1", lease_owner="live_owner")
+    repo.finish_step(
+        finished, status=terminal_status, lease_owner="live_owner",
+    )
+    repo.transition_run(
+        run_id, expected_status="RUNNING", new_status=terminal_status,
+        lease_owner="live_owner",
+    )
+    before_run = repo.get_run(run_id)
+    before_steps = repo.list_steps(run_id)
+    before_attempts = repo.list_step_attempts(finished)
+    before_lease = repo.inspect_lease("work_test")
+    with pytest.raises(WorkLeaseConflictError, match="stale or expired"):
+        repo.create_step(
+            run_id=run_id, step_key="appended", input_fingerprint="v2",
+            lease_owner="live_owner",
+        )
+    if terminal_status == "COMPLETED":
+        with pytest.raises(WorkLeaseConflictError, match="stale or expired"):
+            repo.mark_step_stale(
+                finished, new_fingerprint="v2", lease_owner="live_owner",
+            )
+    else:
+        assert pending is not None
+        with pytest.raises(WorkLeaseConflictError, match="stale or expired"):
+            repo.set_pending_fingerprint(
+                pending, input_fingerprint="v2", lease_owner="live_owner",
+            )
+    assert repo.get_run(run_id) == before_run
+    assert repo.list_steps(run_id) == before_steps
+    assert repo.list_step_attempts(finished) == before_attempts
+    assert repo.inspect_lease("work_test") == before_lease
+    repo.release_lease(work_id="work_test", lease_owner="live_owner")
+
+
+@pytest.mark.parametrize("nonterminal", [
+    "PENDING", "RUNNING", "PAUSED", "FAILED_RETRYABLE",
+    "INTERRUPTED", "NEEDS_ATTENTION",
+])
+def test_nonterminal_run_preserves_generic_pending_fingerprint_mutations(
+    tmp_path: Path, nonterminal: str,
+) -> None:
+    db = tmp_path / "work.sqlite3"
+    _work(db)
+    repo = DurableRunRepository(db)
+    run_id = _run(repo)
+    if nonterminal != "PENDING":
+        repo.transition_run(
+            run_id, expected_status="PENDING", new_status="RUNNING",
+        )
+        if nonterminal != "RUNNING":
+            repo.transition_run(
+                run_id, expected_status="RUNNING", new_status=nonterminal,
+            )
+    step = repo.create_step(
+        run_id=run_id, step_key="late_pending", input_fingerprint="v1",
+    )["id"]
+    repo.set_pending_fingerprint(step, input_fingerprint="v2")
+    assert repo.get_step(step)["status"] == "PENDING"
+    assert repo.get_step(step)["input_fingerprint"] == "v2"
+
+
+def test_completed_step_can_be_staled_during_running_parent_but_not_after(
+    tmp_path: Path,
+) -> None:
+    db = tmp_path / "work.sqlite3"
+    _work(db)
+    repo = DurableRunRepository(db)
+    run_id = _run(repo)
+    repo.acquire_lease(
+        work_id="work_test", lease_owner="owner",
+        lease_kind="AUTOPILOT_MUTATION", ttl_seconds=90, run_id=run_id,
+    )
+    repo.transition_run(
+        run_id, expected_status="PENDING", new_status="RUNNING",
+        lease_owner="owner",
+    )
+    step_id = repo.create_step(
+        run_id=run_id, step_key="plan_story",
+        input_fingerprint="v1", lease_owner="owner",
+    )["id"]
+    repo.start_step(step_id, input_fingerprint="v1", lease_owner="owner")
+    repo.finish_step(step_id, status="COMPLETED", lease_owner="owner")
+    repo.mark_step_stale(step_id, new_fingerprint="v2", lease_owner="owner")
+    assert repo.get_step(step_id)["status"] == "STALE"
+    repo.start_step(step_id, input_fingerprint="v2", lease_owner="owner")
+    repo.finish_step(step_id, status="COMPLETED", lease_owner="owner")
+    assert repo.transition_run(
+        run_id, expected_status="RUNNING", new_status="COMPLETED",
+        lease_owner="owner",
+    )["status"] == "COMPLETED"
+    with pytest.raises(WorkLeaseConflictError, match="stale or expired"):
+        repo.mark_step_stale(
+            step_id, new_fingerprint="v3", lease_owner="owner",
+        )
+    assert [a["status"] for a in repo.list_step_attempts(step_id)] == [
+        "COMPLETED", "COMPLETED",
+    ]
+
+
+@pytest.mark.parametrize("late_op", ["finish", "heartbeat"])
+def test_legacy_terminal_parent_cannot_rewrite_running_step_attempt(
+    tmp_path: Path, late_op: str,
+) -> None:
+    db = tmp_path / "work.sqlite3"
+    _work(db)
+    repo = DurableRunRepository(db)
+    run_id = _run(repo)
+    repo.acquire_lease(
+        work_id="work_test", lease_owner="owner",
+        lease_kind="AUTOPILOT_MUTATION", ttl_seconds=60, run_id=run_id,
+    )
+    repo.transition_run(
+        run_id, expected_status="PENDING", new_status="RUNNING",
+        lease_owner="owner",
+    )
+    step_id = repo.create_step(
+        run_id=run_id, step_key="generation",
+        input_fingerprint="v1", lease_owner="owner",
+    )["id"]
+    repo.start_step(step_id, input_fingerprint="v1", lease_owner="owner")
+    # Historical inconsistent terminal snapshot, not a production transition.
+    with repository_write(db) as conn:
+        conn.execute(
+            "UPDATE runs SET status = 'CANCELLED', lease_owner = NULL "
+            "WHERE id = ?", (run_id,),
+        )
+    before = repo.get_step(step_id)
+    attempts = repo.list_step_attempts(step_id)
+    lease = repo.inspect_lease("work_test")
+    with pytest.raises(WorkLeaseConflictError, match="stale or expired"):
+        if late_op == "heartbeat":
+            repo.heartbeat_step(step_id, lease_owner="owner")
+        else:
+            repo.finish_step(
+                step_id, status="CANCELLED", lease_owner="owner",
+            )
+    assert repo.get_step(step_id) == before
+    assert repo.list_step_attempts(step_id) == attempts
+    assert repo.inspect_lease("work_test") == lease
