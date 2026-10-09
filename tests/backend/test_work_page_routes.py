@@ -674,10 +674,11 @@ async def test_layout_patch_ack_excludes_later_layout_slot_and_panel_commit(
 async def test_page_http_mutation_conflicts_with_live_autopilot_work_lease(api):
     """Two independent clients of one Work cannot silently write concurrently."""
     client, prefix, root, handle = api
+    import asyncio
+
     from manga_autopilot.repositories.durable_runs import DurableRunRepository
     from manga_autopilot.services.autopilot import OrchestratorHooks
     from manga_autopilot.services.durable_autopilot import DurableAutopilotOrchestrator
-    import asyncio
 
     repo = DurableRunRepository(handle.database_path)
     run_id = repo.create_run(
