@@ -140,6 +140,38 @@ second layer. The #379 expired cross-Run transfer guard remains unchanged.
 Neither layer is a substitute for the #378 matching-owner Write fence.
 No real GPU/ComfyUI/browser/installer or manga-quality acceptance is implied.
 
+## Successful Run status requires successful registered child receipts (#386)
+
+`DurableRunRepository.transition_run` treats `RUNNING -> COMPLETED` as
+an assertion about every RunStep **already registered** for that parent:
+each Step must be `COMPLETED`, and its latest durable RunStepAttempt
+(`attempt_no == attempt_count`) must exist, be `COMPLETED`, and carry
+the same input fingerprint as the current Step. The check is atomic with
+the parent status UPDATE under the same `BEGIN IMMEDIATE` transaction;
+a violation raises `DurableRunStateError` and does not rewrite Run,
+Step, Attempt, or Work lease rows. A Run with no registered Steps can
+still complete through the generic Repository contract; the opt-in
+Autopilot orchestrator separately enforces required hooks and explicit
+skeleton-mode omissions.
+
+Older `FAILED_RETRYABLE` or `INTERRUPTED` attempts are **durable
+history**, not current execution failures: a successful later attempt
+makes the Step eligible for its parent's `COMPLETED` status. The
+existing #383 check continues to deny *any* `RUNNING` Attempt,
+including an erroneously active old attempt. A non-successful Run exit,
+such as `FAILED_RETRYABLE`, `FAILED_TERMINAL`, `CANCELLED`, `PAUSED`,
+`INTERRUPTED` or `NEEDS_ATTENTION`, is allowed to preserve registered
+`PENDING` downstream Steps while obeying the existing no-running-child
+rule, so interrupted flows remain explicitly recoverable.
+
+This status reconciliation concerns **successful parent transition
+semantics** and does not address the separate #387 contract for
+post-terminal Step mutation; it is not authorization to edit completed
+Run history, run hooks outside their leases, or suppress an external
+effect awaiting reconciliation. No SQLite migration is required.
+Real ComfyUI, GPU, browser, installer and manga-quality testing
+remain separate from these GPU-free repository tests.
+
 ## Supported, required, and explicitly omitted stages
 
 - **Supported/executed:** a callable hook is provided for a stage in `OrchestratorHooks`. Its result (including a genuine JSON `null`) is serialized with an explicit `execution: "EXECUTED"` provenance marker in the completed RunStep/attempt receipt.
