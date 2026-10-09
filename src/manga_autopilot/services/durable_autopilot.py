@@ -220,31 +220,37 @@ class DurableAutopilotOrchestrator:
         if durable["status"] == "INTERRUPTED" and not approve_interrupted_retry:
             raise DurableRunStateError("interrupted Run requires explicit reconciliation")
 
-        # Check historical stage provenance BEFORE mutating Run/Lease. Old
-        # completed-null receipts cannot prove that the old worker actually
-        # had a hook, and explicitly omitted stages must not silently become
-        # successful executions (or re-run completed stochastic descendants).
-        for old_step in self.repository.list_steps(run_id):
-            if old_step["status"] != "COMPLETED":
-                continue
-            old_output = json.loads(old_step["output_json"])
-            old_mode = old_output.get("execution")
-            available = getattr(self.hooks, str(old_step["step_key"]), None) is not None
-            if old_mode == "OMITTED" and available:
-                raise DurableRunStateError(
-                    f"previously omitted stage {old_step['step_key']} "
-                    "gained a real hook; create a new Run"
+        def assert_completed_stage_provenance() -> None:
+            # Never infer that old completed-null receipts executed a hook.
+            # A changed hook set requires a fresh Run rather than silently
+            # replaying already-completed stochastic descendants.
+            for old_step in self.repository.list_steps(run_id):
+                if old_step["status"] != "COMPLETED":
+                    continue
+                old_output = json.loads(old_step["output_json"])
+                old_mode = old_output.get("execution")
+                available = (
+                    getattr(self.hooks, str(old_step["step_key"]), None) is not None
                 )
-            if old_mode == "EXECUTED" and not available:
-                raise DurableRunStateError(
-                    f"previously executed stage {old_step['step_key']} "
-                    "lost its hook; create a new Run"
-                )
-            if old_mode is None and old_output.get("value") is None:
-                raise DurableRunStateError(
-                    f"ambiguous legacy null receipt at {old_step['step_key']}; "
-                    "create a new Run rather than assuming a hook executed"
-                )
+                if old_mode == "OMITTED" and available:
+                    raise DurableRunStateError(
+                        f"previously omitted stage {old_step['step_key']} "
+                        "gained a real hook; create a new Run"
+                    )
+                if old_mode == "EXECUTED" and not available:
+                    raise DurableRunStateError(
+                        f"previously executed stage {old_step['step_key']} "
+                        "lost its hook; create a new Run"
+                    )
+                if old_mode is None and old_output.get("value") is None:
+                    raise DurableRunStateError(
+                        f"ambiguous legacy null receipt at {old_step['step_key']}; "
+                        "create a new Run rather than assuming a hook executed"
+                    )
+
+        # Preflight before acquiring a lease, then recheck after ownership is
+        # acquired: a former owner may finish a stage between those moments.
+        assert_completed_stage_provenance()
 
         base_inputs = _json_value(dict(input_payload))
         stage_inputs = _json_value(dict(step_inputs))
@@ -293,6 +299,7 @@ class DurableAutopilotOrchestrator:
                     ) from exc
 
         try:
+            assert_completed_stage_provenance()
             durable = self.repository.get_run(run_id)
             if durable["status"] == "RUNNING":
                 self.repository.recover_interrupted_run(
