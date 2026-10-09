@@ -351,3 +351,47 @@ def test_changed_stage_input_after_reopen_reexecutes_only_downstream(
     )
     assert repo.get_run(run_id)["status"] == "COMPLETED"
     assert repo.inspect_lease("work_247") is None
+
+
+def test_fresh_interpreter_cannot_release_live_running_run_lease(
+    tmp_path: Path,
+) -> None:
+    """Cross-process owner token alone must not erase recovery evidence."""
+    db, repo, run_id = _prepare_db(tmp_path)
+    repo.acquire_lease(
+        work_id="work_247", lease_owner="still_working",
+        lease_kind="AUTOPILOT_MUTATION", ttl_seconds=90, run_id=run_id,
+    )
+    repo.transition_run(
+        run_id, expected_status="PENDING", new_status="RUNNING",
+        lease_owner="still_working",
+    )
+    step_id = repo.create_step(
+        run_id=run_id, step_key="generate_panels",
+        input_fingerprint="v1", lease_owner="still_working",
+    )["id"]
+    repo.start_step(
+        step_id, input_fingerprint="v1", lease_owner="still_working",
+    )
+    script = (
+        "import sys\n"
+        "from manga_autopilot.repositories.durable_runs import "
+        "DurableRunRepository, WorkLeaseConflictError\n"
+        "repo = DurableRunRepository(sys.argv[1])\n"
+        "try:\n"
+        "    repo.release_lease(work_id='work_247', lease_owner='still_working')\n"
+        "except WorkLeaseConflictError:\n"
+        "    print('release_rejected')\n"
+        "else:\n"
+        "    raise AssertionError('live Run lease was improperly deleted')\n"
+    )
+    process = subprocess.run(  # noqa: S603 - explicit local Python fixture
+        [sys.executable, "-c", script, str(db)],
+        cwd=_ROOT, capture_output=True, text=True, timeout=30, check=False,
+    )
+    assert process.returncode == 0, process.stderr
+    assert "release_rejected" in process.stdout
+    assert repo.inspect_lease("work_247")["lease_owner"] == "still_working"
+    assert repo.get_run(run_id)["status"] == "RUNNING"
+    assert repo.get_step(step_id)["status"] == "RUNNING"
+    assert repo.list_step_attempts(step_id)[0]["status"] == "RUNNING"

@@ -655,7 +655,7 @@ class DurableRunRepository:
         _required(lease_owner, "lease_owner")
         with repository_write(self.database_path) as conn:
             lease = conn.execute(
-                "SELECT expires_at FROM work_leases "
+                "SELECT expires_at, run_id FROM work_leases "
                 "WHERE work_id = ? AND lease_owner = ?",
                 (work_id, lease_owner),
             ).fetchone()
@@ -669,6 +669,43 @@ class DurableRunRepository:
                 raise WorkLeaseConflictError(
                     "mutation lease missing, expired or owner mismatch"
                 )
+            # A normal release is not a recovery operation. Never erase the
+            # only explicit old-owner recovery token while the associated
+            # durable Run or any child receipt still reports live execution.
+            # Validate and delete under this same BEGIN IMMEDIATE transaction,
+            # including a terminal Run with an inconsistent RUNNING Attempt.
+            if lease["run_id"] is not None:
+                attached_run = conn.execute(
+                    "SELECT status, scope_type, scope_id FROM runs WHERE id = ?",
+                    (lease["run_id"],),
+                ).fetchone()
+                if (
+                    attached_run is None
+                    or attached_run["scope_type"] != "WORK"
+                    or attached_run["scope_id"] != work_id
+                ):
+                    raise WorkLeaseConflictError(
+                        "lease is attached to a missing or foreign Work Run"
+                    )
+                if attached_run["status"] == "RUNNING":
+                    raise WorkLeaseConflictError(
+                        "cannot release Work lease while its Run is RUNNING"
+                    )
+                active_step = conn.execute(
+                    "SELECT 1 FROM run_steps "
+                    "WHERE run_id = ? AND status = 'RUNNING' LIMIT 1",
+                    (lease["run_id"],),
+                ).fetchone()
+                active_attempt = conn.execute(
+                    "SELECT 1 FROM run_step_attempts "
+                    "WHERE status = 'RUNNING' AND run_step_id IN "
+                    "(SELECT id FROM run_steps WHERE run_id = ?) LIMIT 1",
+                    (lease["run_id"],),
+                ).fetchone()
+                if active_step is not None or active_attempt is not None:
+                    raise WorkLeaseConflictError(
+                        "cannot release Work lease with RUNNING Step or Attempt"
+                    )
             conn.execute(
                 "DELETE FROM work_leases WHERE work_id = ? AND lease_owner = ?",
                 (work_id, lease_owner),
