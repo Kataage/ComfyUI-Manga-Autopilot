@@ -83,12 +83,13 @@ def test_work_domain_mutations_require_live_lease_owner_and_explicit_recovery(
         )
 
     # Trusted internal write paths can act only with the matching live token.
+    current_page_revision = pages.get_page("p0")["revision"]
     with owned_work_mutation(first.work_id, "old"):
         own_page = pages.update_page(
-            "p0", expected_revision=page["revision"],
+            "p0", expected_revision=current_page_revision,
             page_purpose="writer owned",
         )
-    assert own_page["revision"] == page["revision"] + 1
+    assert own_page["revision"] == current_page_revision + 1
     with owned_work_mutation(first.work_id, "not-old"):
         with pytest.raises(WorkMutationLeaseConflictError):
             pages.create_page(page_id="bad", page_number=2, order_key="2",
