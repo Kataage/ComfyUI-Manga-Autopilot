@@ -1674,3 +1674,93 @@ def test_backup_cleanup_failure_does_not_mask_primary_failure(
     assert str(error.cause) == "primary replace failure"
     assert temp.exists()
     assert not backup.exists()
+
+
+def test_phase_c_audit_concurrent_existing_work_v7_to_v8_upgrade_is_idempotent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A Work opened twice during W0008 upgrade must not fail or lose its v7 backup.
+
+    This deterministically pauses opener A after it has inspected v7 and
+    decided W0008 is pending, but before its backup. Opener B commits W0008.
+    Opener A must recognize B's committed migration without re-applying the
+    ADD COLUMN or replacing B's true v7 pre-upgrade backup with v8 bytes.
+    """
+    database = tmp_path / "work.sqlite3"
+    work_id = "work_simultaneous_open"
+    bootstrap_work_database(
+        database, work_id=work_id, migrations=WORK_MIGRATIONS[:7],
+    )
+    with write_connection(database) as conn:
+        assert conn.execute(
+            "SELECT MAX(version) FROM schema_migrations",
+        ).fetchone()[0] == 7
+        assert "recovery_run_owner" not in {
+            row["name"] for row in conn.execute("PRAGMA table_info(work_leases)")
+        }
+
+    first_ready = threading.Event()
+    allow_first = threading.Event()
+    lock = threading.Lock()
+    calls = 0
+    original = migrations_module.MigrationRunner._prepare_verified_backup
+
+    def hold_first_upgrader(self, path, *, current_version, pending_migrations):
+        nonlocal calls
+        if (
+            self.database_kind == "work" and current_version == 7
+            and any(migration.version == 8 for migration in pending_migrations)
+        ):
+            with lock:
+                calls += 1
+                first = calls == 1
+            if first:
+                first_ready.set()
+                assert allow_first.wait(timeout=20), (
+                    "second upgrader never committed W0008"
+                )
+        return original(
+            self, path, current_version=current_version,
+            pending_migrations=pending_migrations,
+        )
+
+    monkeypatch.setattr(
+        migrations_module.MigrationRunner, "_prepare_verified_backup",
+        hold_first_upgrader,
+    )
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        first = executor.submit(
+            migrate_work_database, database, work_id=work_id,
+        )
+        try:
+            assert first_ready.wait(timeout=20), (
+                "first upgrader did not enter the v7->v8 pending window"
+            )
+            second = migrate_work_database(database, work_id=work_id)
+            assert second.applied_versions == (8,)
+        finally:
+            allow_first.set()
+        # A stale migration plan must be refreshed after B commits, not
+        # produce a duplicate-column MigrationApplyError on a valid Work.
+        stale = first.result(timeout=20)
+
+    assert stale.current_version == 8
+    assert stale.applied_versions == ()
+    with write_connection(database) as conn:
+        cols = [row["name"] for row in conn.execute(
+            "PRAGMA table_info(work_leases)"
+        )]
+        assert cols.count("recovery_run_owner") == 1
+        assert conn.execute(
+            "SELECT version FROM schema_migrations ORDER BY version DESC LIMIT 1"
+        ).fetchone()[0] == 8
+    backup = database.with_name(f"{database.name}.backup-v7-to-v8")
+    assert backup.is_file()
+    with read_connection(backup) as conn:
+        assert conn.execute(
+            "SELECT MAX(version) FROM schema_migrations"
+        ).fetchone()[0] == 7
+        assert "recovery_run_owner" not in {
+            row["name"] for row in conn.execute("PRAGMA table_info(work_leases)")
+        }
