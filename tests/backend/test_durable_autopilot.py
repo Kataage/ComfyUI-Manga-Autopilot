@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import threading
 from collections import Counter
 from datetime import datetime, timedelta, timezone
@@ -1321,3 +1322,169 @@ async def test_unexpected_finalization_error_has_no_success_receipt(
         "FAILED_TERMINAL",
     ]
     assert repo.inspect_lease("work_246") is None
+
+
+
+@pytest.mark.asyncio
+async def test_missing_required_durable_hooks_fail_closed_before_mutation(
+    tmp_path: Path,
+) -> None:
+    """The default adapter must never claim to have generated a manga."""
+    db = work(tmp_path)
+    repo = DurableRunRepository(db)
+    run_id = start(repo)
+    with pytest.raises(DurableRunStateError, match="required.*hook"):
+        await DurableAutopilotOrchestrator(
+            repository=repo, work_id="work_246",
+            hooks=OrchestratorHooks(validate_input=lambda _: {"ok": True}),
+        ).execute(run_id, input_payload={}, step_inputs={},
+                  lease_owner="required_owner")
+    assert repo.get_run(run_id)["status"] == "PENDING"
+    assert repo.list_steps(run_id) == []
+    assert repo.inspect_lease("work_246") is None
+
+
+@pytest.mark.asyncio
+async def test_skeletal_mode_explicitly_records_omitted_vs_executed_none(
+    tmp_path: Path,
+) -> None:
+    """Explicit omission is an audit receipt, never proof of GPU generation."""
+    db = work(tmp_path)
+    repo = DurableRunRepository(db)
+    run_id = start(repo)
+
+    async def validate(_):
+        return None  # An actually invoked hook can legitimately return None.
+
+    result = await DurableAutopilotOrchestrator(
+        repository=repo, work_id="work_246",
+        hooks=OrchestratorHooks(validate_input=validate),
+        allow_omitted_hooks=True,
+    ).execute(run_id, input_payload={}, step_inputs={},
+              lease_owner="explicit_skeleton")
+    assert result.machine.state.value == "COMPLETED"
+    assert repo.get_run(run_id)["status"] == "COMPLETED"
+    steps = {s["step_key"]: s for s in repo.list_steps(run_id)}
+    assert json.loads(steps["validate_input"]["output_json"]) == {
+        "value": None, "execution": "EXECUTED",
+    }
+    assert json.loads(steps["generate_panels"]["output_json"]) == {
+        "value": None, "execution": "OMITTED",
+    }
+    assert json.loads(steps["export"]["output_json"]) == {
+        "value": None, "execution": "OMITTED",
+    }
+    assert [a["status"] for a in repo.list_step_attempts(
+        steps["generate_panels"]["id"],
+    )] == ["COMPLETED"]
+    assert any(e["kind"] == "step_omitted" for e in result.log)
+    assert repo.inspect_lease("work_246") is None
+
+
+@pytest.mark.asyncio
+async def test_attaching_hook_after_omitted_stage_requires_new_run(
+    tmp_path: Path,
+) -> None:
+    """Do not skip omitted output or auto-repeat downstream stochastic work."""
+    db = work(tmp_path)
+    repo = DurableRunRepository(db)
+    run_id = start(repo)
+    calls: Counter[str] = Counter()
+
+    def generation(_):
+        calls["generate"] += 1
+        raise RetryableStepError("after omitted story")
+
+    original = DurableAutopilotOrchestrator(
+        repository=repo, work_id="work_246",
+        hooks=OrchestratorHooks(generate_panels=generation),
+        allow_omitted_hooks=True,
+    )
+    failed = await original.execute(
+        run_id, input_payload={}, step_inputs={}, lease_owner="old_skeleton",
+    )
+    assert failed.machine.state.value.startswith("FAILED")
+    assert repo.get_run(run_id)["status"] == "FAILED_RETRYABLE"
+    story = next(s for s in repo.list_steps(run_id)
+                 if s["step_key"] == "plan_story")
+    before = repo.list_step_attempts(story["id"])
+    assert json.loads(story["output_json"])["execution"] == "OMITTED"
+
+    async def new_story(_):
+        calls["story"] += 1
+        return {"pages": 12}
+
+    fresh = DurableAutopilotOrchestrator(
+        repository=DurableRunRepository(db), work_id="work_246",
+        hooks=OrchestratorHooks(
+            plan_story=new_story, generate_panels=generation,
+        ),
+        allow_omitted_hooks=True,
+    )
+    with pytest.raises(DurableRunStateError, match="omitted.*new Run"):
+        await fresh.execute(
+            run_id, input_payload={}, step_inputs={},
+            lease_owner="new_capability",
+        )
+    assert repo.get_run(run_id)["status"] == "FAILED_RETRYABLE"
+    assert repo.inspect_lease("work_246") is None
+    assert repo.list_step_attempts(story["id"]) == before
+    assert calls == {"generate": 1}
+
+    new_run = start(repo)
+    fresh_ok = DurableAutopilotOrchestrator(
+        repository=DurableRunRepository(db), work_id="work_246",
+        hooks=OrchestratorHooks(plan_story=new_story),
+        allow_omitted_hooks=True,
+    )
+    completed = await fresh_ok.execute(
+        new_run, input_payload={}, step_inputs={},
+        lease_owner="new_run",
+    )
+    assert completed.machine.state.value == "COMPLETED"
+    assert calls["story"] == 1
+    new_story_step = next(s for s in repo.list_steps(new_run)
+                          if s["step_key"] == "plan_story")
+    assert json.loads(new_story_step["output_json"]) == {
+        "value": {"pages": 12}, "execution": "EXECUTED",
+    }
+
+
+@pytest.mark.asyncio
+async def test_ambiguous_legacy_null_receipt_fails_closed_on_new_hook(
+    tmp_path: Path,
+) -> None:
+    """Older completed-null receipts never prove a real hook ran."""
+    db = work(tmp_path)
+    repo = DurableRunRepository(db)
+    run_id = start(repo)
+
+    def stop(_):
+        raise RetryableStepError("keep Run resumable")
+
+    await DurableAutopilotOrchestrator(
+        repository=repo, work_id="work_246",
+        hooks=OrchestratorHooks(generate_panels=stop),
+        allow_omitted_hooks=True,
+    ).execute(run_id, input_payload={}, step_inputs={}, lease_owner="legacy")
+    story = next(s for s in repo.list_steps(run_id)
+                 if s["step_key"] == "plan_story")
+    with repository_write(db) as conn:
+        conn.execute(
+            "UPDATE run_steps SET output_json = ? WHERE id = ?",
+            ('{"value":null}', story["id"]),
+        )
+    old = repo.list_step_attempts(story["id"])
+    with pytest.raises(DurableRunStateError, match="legacy.*new Run"):
+        await DurableAutopilotOrchestrator(
+            repository=DurableRunRepository(db), work_id="work_246",
+            hooks=OrchestratorHooks(
+                plan_story=lambda _: {"real": True},
+                generate_panels=stop,
+            ),
+            allow_omitted_hooks=True,
+        ).execute(run_id, input_payload={}, step_inputs={},
+                  lease_owner="new_after_upgrade")
+    assert repo.inspect_lease("work_246") is None
+    assert repo.get_run(run_id)["status"] == "FAILED_RETRYABLE"
+    assert repo.list_step_attempts(story["id"]) == old
