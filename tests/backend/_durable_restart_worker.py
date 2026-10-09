@@ -91,6 +91,7 @@ def _build_application(args: argparse.Namespace) -> web.Application:
     app["durable_repository"] = repository
     app["durable_orchestrator"] = DurableAutopilotOrchestrator(
         repository=repository, work_id="work_247", hooks=hooks,
+        allow_omitted_hooks=True,  # explicit skeletal process-restart fixture
         lease_ttl_seconds=10,
     )
     return app
