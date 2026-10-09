@@ -22,6 +22,7 @@ from PIL import Image, UnidentifiedImageError
 
 from manga_autopilot.primitives import canonical_json, new_id
 from manga_autopilot.repositories.work_lifecycle import WorkLifecycleRepository
+from manga_autopilot.storage.repository import assert_work_mutation_allowed
 from manga_autopilot.storage import (
     assert_managed_path,
     create_work_commit,
@@ -458,6 +459,11 @@ class ArtifactRepository:
             _nonempty(generation_attempt_id, "generation_attempt_id")
 
         work = self._open()
+        # Early refusal avoids avoidable immutable orphan files. The same
+        # gate MUST run again under BEGIN IMMEDIATE at the Work commit, since
+        # a lease can be acquired between this check and publication.
+        with repository_read(work.database_path) as conn:
+            assert_work_mutation_allowed(conn)
         target = assert_managed_path(
             work.root.joinpath(*relative.parts),
             containment_root=work.root,
@@ -502,6 +508,7 @@ class ArtifactRepository:
         # The committed DB row always follows the completed final file.
         # A constraint error leaves the published orphan for maintenance.
         with repository_write(work.database_path) as conn:
+            assert_work_mutation_allowed(conn)
             if not target.is_file():
                 raise ArtifactIntegrityError("published artifact disappeared before registration")
             # The caller's DB-only guard checks all source revisions under
