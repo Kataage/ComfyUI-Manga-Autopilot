@@ -1298,12 +1298,26 @@ class MigrationRunner:
                 # Never mask the primary backup/migration failure.
                 pass
 
+        def reject_live_database_backup_alias() -> None:
+            # An existing versioned backup must be an independent file, not
+            # another hardlink to this live SQLite database. A same-inode
+            # "backup" can pass history/identity checks but will also be
+            # upgraded when the live DB is modified, losing the v7 recovery
+            # point. os.path.samefile compares file identity on POSIX/Windows.
+            if backup.exists() and os.path.samefile(backup, path):
+                raise MigrationBackupError(
+                    "existing migration backup aliases the live database file; "
+                    "cannot preserve an independent pre-upgrade recovery point",
+                    pending_migrations=pending_migrations,
+                )
+
         try:
             if backup.is_symlink():
                 raise MigrationBackupError(
                     f"migration backup path must not be a symlink: {backup}",
                     pending_migrations=pending_migrations,
                 )
+            reject_live_database_backup_alias()
             if temp.is_symlink():
                 raise MigrationBackupError(
                     f"migration backup temp path must not be a symlink: {temp}",
@@ -1356,6 +1370,9 @@ class MigrationRunner:
             try:
                 os.link(temp, backup)
             except FileExistsError as collision:
+                # Recheck identity at publication: an alias could have
+                # appeared after the pre-check but before os.link().
+                reject_live_database_backup_alias()
                 # Preserve the earliest backup, but never silently trust a
                 # mismatched, corrupt or post-upgrade replacement.
                 with read_connection(backup) as existing:
