@@ -2072,3 +2072,123 @@ def test_issue395_privileged_recovery_fences_legacy_ownerless_run_with_lease(
     assert repo.get_step(step["id"]) == before_step
     assert repo.list_step_attempts(step["id"]) == before_attempts
     assert repo.inspect_lease("work_test") == before_lease
+
+
+# Independent Phase C post-#395 audit: two crashes around lease transfer
+# must not permanently strand the original RUNNING Run.
+@pytest.mark.parametrize("with_active_step", [False, True])
+def test_phase_c_audit_second_crash_after_lease_rotation_remains_recoverable(
+    tmp_path: Path, with_active_step: bool,
+) -> None:
+    """Crash A -> rotate to B -> crash B pre-reconciliation -> rotate to C.
+
+    This uses only repository-supported operations, never fixture-only SQL.
+    B acquires legitimately after A expires. It stops before calling
+    recover_interrupted_run(), preserving the live Run and optional Attempt.
+    Once B itself expires, an authorized new owner with B's exact token must
+    be able to reestablish exclusive ownership and reconcile safely.
+    """
+    db = tmp_path / "work.sqlite3"
+    _work(db)
+    clock = Clock()
+    crashed = DurableRunRepository(db, clock=clock)
+    first_restart = DurableRunRepository(db, clock=clock)
+    second_restart = DurableRunRepository(db, clock=clock)
+    run_id = _run(crashed)
+    crashed.acquire_lease(
+        work_id="work_test", lease_owner="crashed_A",
+        lease_kind="AUTOPILOT_MUTATION", ttl_seconds=3, run_id=run_id,
+    )
+    crashed.transition_run(
+        run_id, expected_status="PENDING", new_status="RUNNING",
+        lease_owner="crashed_A",
+    )
+    step_id = None
+    if with_active_step:
+        step_id = crashed.create_step(
+            run_id=run_id, step_key="generate_panels",
+            input_fingerprint="v1", lease_owner="crashed_A",
+        )["id"]
+        crashed.start_step(
+            step_id, input_fingerprint="v1", lease_owner="crashed_A",
+        )
+    clock.advance(4)
+    first_restart.acquire_lease(
+        work_id="work_test", lease_owner="crashed_B",
+        lease_kind="AUTOPILOT_MUTATION", ttl_seconds=3,
+        run_id=run_id, reclaim_expired_owner="crashed_A",
+    )
+    # The first recovery process dies after its durable lease commit,
+    # but *before* recovery can rewrite any old Run or child receipts.
+    previous_run = second_restart.get_run(run_id)
+    previous_steps = second_restart.list_steps(run_id)
+    previous_attempts = (
+        second_restart.list_step_attempts(step_id) if step_id else []
+    )
+    assert previous_run["status"] == "RUNNING"
+    assert previous_run["lease_owner"] == "crashed_A"
+    assert second_restart.inspect_lease("work_test")["lease_owner"] == "crashed_B"
+
+    clock.advance(4)
+    before_reclaim = second_restart.inspect_lease("work_test")
+    assert before_reclaim is not None and before_reclaim["expired"] is True
+    with pytest.raises(WorkLeaseConflictError, match="explicit"):
+        second_restart.acquire_lease(
+            work_id="work_test", lease_owner="recovered_C",
+            lease_kind="AUTOPILOT_MUTATION", ttl_seconds=10,
+            run_id=run_id, reclaim_expired_owner="crashed_A",
+        )
+    assert second_restart.inspect_lease("work_test") == before_reclaim
+    assert second_restart.get_run(run_id) == previous_run
+    assert second_restart.list_steps(run_id) == previous_steps
+    if step_id:
+        assert second_restart.list_step_attempts(step_id) == previous_attempts
+
+    fresh_lease = second_restart.acquire_lease(
+        work_id="work_test", lease_owner="recovered_C",
+        lease_kind="AUTOPILOT_MUTATION", ttl_seconds=10,
+        run_id=run_id, reclaim_expired_owner="crashed_B",
+    )
+    assert fresh_lease["lease_owner"] == "recovered_C"
+    second_restart.recover_interrupted_run(
+        run_id, lease_owner="recovered_C",
+    )
+    assert second_restart.get_run(run_id)["status"] == "INTERRUPTED"
+    if step_id:
+        assert second_restart.get_step(step_id)["status"] == "INTERRUPTED"
+        assert second_restart.list_step_attempts(step_id)[0]["status"] == "INTERRUPTED"
+    with pytest.raises(WorkLeaseConflictError):
+        first_restart.heartbeat_lease(
+            work_id="work_test", lease_owner="crashed_B", ttl_seconds=3,
+        )
+    second_restart.release_lease(
+        work_id="work_test", lease_owner="recovered_C",
+    )
+
+
+def test_phase_c_audit_single_crash_expired_bound_owner_control(
+    tmp_path: Path,
+) -> None:
+    """Positive control: a single exact-owner expired recovery still works."""
+    db = tmp_path / "work.sqlite3"
+    _work(db)
+    clock = Clock()
+    repo = DurableRunRepository(db, clock=clock)
+    run_id = _run(repo)
+    repo.acquire_lease(
+        work_id="work_test", lease_owner="crashed_A",
+        lease_kind="AUTOPILOT_MUTATION", ttl_seconds=3, run_id=run_id,
+    )
+    repo.transition_run(
+        run_id, expected_status="PENDING", new_status="RUNNING",
+        lease_owner="crashed_A",
+    )
+    clock.advance(4)
+    repo.acquire_lease(
+        work_id="work_test", lease_owner="recovered_B",
+        lease_kind="AUTOPILOT_MUTATION", ttl_seconds=10,
+        run_id=run_id, reclaim_expired_owner="crashed_A",
+    )
+    repo.recover_interrupted_run(run_id, lease_owner="recovered_B")
+    assert repo.get_run(run_id)["status"] == "INTERRUPTED"
+    repo.release_lease(work_id="work_test", lease_owner="recovered_B")
