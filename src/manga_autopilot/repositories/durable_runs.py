@@ -614,8 +614,11 @@ class DurableRunRepository:
         _required(lease_kind, "lease_kind")
         if ttl_seconds <= 0:
             raise ValueError("ttl_seconds must be > 0")
-        now = self._now()
         with repository_write(self.database_path) as conn:
+            # This transaction may wait on another SQLite writer. Sample now
+            # only after BEGIN IMMEDIATE has acquired the lock, so a lease
+            # that expires while waiting cannot be classified as still live.
+            now = self._now()
             self._assert_work(conn, work_id)
             if run_id is not None:
                 run = self._get(conn, "runs", run_id)
@@ -700,8 +703,10 @@ class DurableRunRepository:
         _required(lease_owner, "lease_owner")
         if ttl_seconds <= 0:
             raise ValueError("ttl_seconds must be > 0")
-        now = self._now()
         with repository_write(self.database_path) as conn:
+            # An expired owner must not renew just because this call started
+            # before another SQLite writer released BEGIN IMMEDIATE.
+            now = self._now()
             old = conn.execute(
                 "SELECT * FROM work_leases WHERE work_id = ?", (work_id,),
             ).fetchone()
