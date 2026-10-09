@@ -1015,3 +1015,162 @@ def test_phase_c_audit_run_must_not_exit_running_with_live_step_attempt(
     assert repo.get_run(run_id) == before_run
     assert repo.get_step(step["id"]) == before_step
     assert repo.list_step_attempts(step["id"]) == before_attempts
+
+
+@pytest.mark.parametrize("transition", [
+    "PAUSED", "COMPLETED", "FAILED_RETRYABLE", "FAILED_TERMINAL",
+    "INTERRUPTED", "NEEDS_ATTENTION", "CANCELLED",
+])
+@pytest.mark.parametrize("malformed_receipt", ["active_step", "attempt_only"])
+def test_all_run_exits_reject_in_flight_step_or_attempt_without_changes(
+    tmp_path: Path, transition: str, malformed_receipt: str,
+) -> None:
+    db = tmp_path / "work.sqlite3"
+    _work(db)
+    repo = DurableRunRepository(db)
+    run_id = _run(repo)
+    repo.acquire_lease(
+        work_id="work_test", lease_owner="owner",
+        lease_kind="AUTOPILOT_MUTATION", ttl_seconds=90, run_id=run_id,
+    )
+    repo.transition_run(
+        run_id, expected_status="PENDING", new_status="RUNNING",
+        lease_owner="owner",
+    )
+    step = repo.create_step(
+        run_id=run_id, step_key="generation", input_fingerprint="v1",
+        lease_owner="owner",
+    )
+    repo.start_step(step["id"], input_fingerprint="v1", lease_owner="owner")
+    if malformed_receipt == "attempt_only":
+        repo.finish_step(step["id"], status="COMPLETED", lease_owner="owner")
+        # Legacy corruption: current Step already says COMPLETED,
+        # but the durable Attempt remains RUNNING.
+        with repository_write(db) as conn:
+            conn.execute(
+                "UPDATE run_step_attempts SET status = 'RUNNING' "
+                "WHERE run_step_id = ?", (step["id"],),
+            )
+    pre_run = repo.get_run(run_id)
+    pre_step = repo.get_step(step["id"])
+    pre_attempts = repo.list_step_attempts(step["id"])
+    pre_lease = repo.inspect_lease("work_test")
+    with pytest.raises(DurableRunStateError, match="reconcile"):
+        repo.transition_run(
+            run_id, expected_status="RUNNING", new_status=transition,
+            lease_owner="owner",
+        )
+    assert repo.get_run(run_id) == pre_run
+    assert repo.get_step(step["id"]) == pre_step
+    assert repo.list_step_attempts(step["id"]) == pre_attempts
+    assert repo.inspect_lease("work_test") == pre_lease
+
+
+@pytest.mark.parametrize("step_status,run_status", [
+    ("COMPLETED", "COMPLETED"),
+    ("FAILED_RETRYABLE", "FAILED_RETRYABLE"),
+    ("FAILED_TERMINAL", "FAILED_TERMINAL"),
+    ("INTERRUPTED", "INTERRUPTED"),
+    ("NEEDS_ATTENTION", "NEEDS_ATTENTION"),
+    ("CANCELLED", "CANCELLED"),
+    ("COMPLETED", "PAUSED"),
+])
+def test_reconciled_step_attempt_allows_legitimate_run_exit(
+    tmp_path: Path, step_status: str, run_status: str,
+) -> None:
+    db = tmp_path / "work.sqlite3"
+    _work(db)
+    repo = DurableRunRepository(db)
+    run_id = _run(repo)
+    repo.acquire_lease(
+        work_id="work_test", lease_owner="active",
+        lease_kind="AUTOPILOT_MUTATION", ttl_seconds=60, run_id=run_id,
+    )
+    repo.transition_run(
+        run_id, expected_status="PENDING", new_status="RUNNING",
+        lease_owner="active",
+    )
+    step_id = repo.create_step(
+        run_id=run_id, step_key="generate_panels",
+        input_fingerprint="v1", lease_owner="active",
+    )["id"]
+    repo.start_step(step_id, input_fingerprint="v1", lease_owner="active")
+    repo.finish_step(step_id, status=step_status, lease_owner="active")
+    changed = repo.transition_run(
+        run_id, expected_status="RUNNING",
+        new_status=run_status, lease_owner="active",
+    )
+    assert changed["status"] == run_status
+    assert repo.get_step(step_id)["status"] == step_status
+    assert repo.list_step_attempts(step_id)[0]["status"] == step_status
+    repo.release_lease(work_id="work_test", lease_owner="active")
+    assert repo.inspect_lease("work_test") is None
+
+
+def test_unleased_generic_run_exit_rejects_in_flight_receipts(
+    tmp_path: Path,
+) -> None:
+    db = tmp_path / "work.sqlite3"
+    _work(db)
+    repo = DurableRunRepository(db)
+    run_id = _run(repo)
+    repo.transition_run(
+        run_id, expected_status="PENDING", new_status="RUNNING",
+    )
+    step_id = repo.create_step(
+        run_id=run_id, step_key="unleased", input_fingerprint="v1",
+    )["id"]
+    repo.start_step(step_id, input_fingerprint="v1")
+    before = repo.get_run(run_id)
+    with pytest.raises(DurableRunStateError, match="reconcile"):
+        repo.transition_run(
+            run_id, expected_status="RUNNING", new_status="COMPLETED",
+        )
+    assert repo.get_run(run_id) == before
+    assert repo.get_step(step_id)["status"] == "RUNNING"
+    repo.finish_step(step_id, status="COMPLETED")
+    assert repo.transition_run(
+        run_id, expected_status="RUNNING", new_status="COMPLETED",
+    )["status"] == "COMPLETED"
+
+
+def test_historical_attempt_only_conflict_keeps_previous_completed_attempts(
+    tmp_path: Path,
+) -> None:
+    db = tmp_path / "work.sqlite3"
+    _work(db)
+    repo = DurableRunRepository(db)
+    run_id = _run(repo)
+    repo.acquire_lease(
+        work_id="work_test", lease_owner="owner",
+        lease_kind="AUTOPILOT_MUTATION", ttl_seconds=90, run_id=run_id,
+    )
+    repo.transition_run(
+        run_id, expected_status="PENDING", new_status="RUNNING",
+        lease_owner="owner",
+    )
+    step_id = repo.create_step(
+        run_id=run_id, step_key="render",
+        input_fingerprint="v1", lease_owner="owner",
+    )["id"]
+    repo.start_step(step_id, input_fingerprint="v1", lease_owner="owner")
+    repo.finish_step(
+        step_id, status="FAILED_RETRYABLE", lease_owner="owner",
+    )
+    repo.start_step(step_id, input_fingerprint="v2", lease_owner="owner")
+    repo.finish_step(step_id, status="COMPLETED", lease_owner="owner")
+    with repository_write(db) as conn:
+        conn.execute(
+            "UPDATE run_step_attempts SET status = 'RUNNING' "
+            "WHERE run_step_id = ? AND attempt_no = 1", (step_id,),
+        )
+    old_attempts = repo.list_step_attempts(step_id)
+    assert [a["status"] for a in old_attempts] == ["RUNNING", "COMPLETED"]
+    with pytest.raises(DurableRunStateError):
+        repo.transition_run(
+            run_id, expected_status="RUNNING", new_status="COMPLETED",
+            lease_owner="owner",
+        )
+    assert repo.get_run(run_id)["status"] == "RUNNING"
+    assert repo.get_step(step_id)["status"] == "COMPLETED"
+    assert repo.list_step_attempts(step_id) == old_attempts
