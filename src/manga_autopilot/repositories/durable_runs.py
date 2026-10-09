@@ -210,6 +210,28 @@ class DurableRunRepository:
                         )) <= self._now()
                     ):
                         raise WorkLeaseConflictError("no current lease to start Run")
+            # A parent Run cannot leave RUNNING while any in-flight child
+            # Step or Attempt is still RUNNING. Historical malformed rows
+            # may have a terminal Step with a RUNNING attempt, so both
+            # receipt tables must be checked. Preserve all rows on conflict
+            # within this same BEGIN IMMEDIATE transaction.
+            if expected_status == "RUNNING":
+                active_step = conn.execute(
+                    "SELECT 1 FROM run_steps "
+                    "WHERE run_id = ? AND status = 'RUNNING' LIMIT 1",
+                    (run_id,),
+                ).fetchone()
+                active_attempt = conn.execute(
+                    "SELECT 1 FROM run_step_attempts "
+                    "WHERE status = 'RUNNING' AND run_step_id IN "
+                    "(SELECT id FROM run_steps WHERE run_id = ?) LIMIT 1",
+                    (run_id,),
+                ).fetchone()
+                if active_step is not None or active_attempt is not None:
+                    raise DurableRunStateError(
+                        "cannot transition RUNNING Run with an active "
+                        "Step or Attempt; reconcile durable receipts first"
+                    )
             conn.execute(
                 """
                 UPDATE runs SET status = ?,
