@@ -8,8 +8,8 @@ import subprocess
 import sys
 import threading
 import time
-from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
@@ -1872,8 +1872,12 @@ def test_issue399_rejects_post_upgrade_file_masquerading_as_original_backup(
     # Bootstrap with the *same* Work ID, so only the schema history can
     # distinguish a wrong pre-upgrade backup from an authentic v7 image.
     bootstrap_work_database(other, work_id="work_backup")
-    with read_connection(other) as source, sqlite3.connect(backup) as target:
-        source.backup(target)
+    target = sqlite3.connect(backup)
+    try:
+        with read_connection(other) as source:
+            source.backup(target)
+    finally:
+        target.close()
     original_backup = backup.read_bytes()
     with pytest.raises(MigrationBackupError, match="wrong pre-upgrade"):
         migrate_work_database(database, work_id="work_backup")
