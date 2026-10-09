@@ -15,7 +15,7 @@ from manga_autopilot.repositories.durable_runs import (
     DurableRunStateError,
     WorkLeaseConflictError,
 )
-from manga_autopilot.services.autopilot import OrchestratorHooks
+from manga_autopilot.services.autopilot import Orchestrator, OrchestratorHooks
 from manga_autopilot.services.durable_autopilot import (
     DurableAutopilotOrchestrator,
     DurableHeartbeatLostError,
@@ -1022,3 +1022,302 @@ async def test_failed_step_heartbeat_stops_guardian_and_does_not_claim_success(
     assert [r["status"] for r in observer.list_step_attempts(current["id"])] == [
         "INTERRUPTED",
     ]
+
+
+
+def test_durable_finalization_keeps_run_and_lease_running_through_file_copy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Observe a blocked real project-root mirroring from another DB owner.
+
+    The orchestrator has its own event loop on an OS thread; the test owner
+    observes DB state independently even when the old implementation blocks
+    its own event loop with legacy._finalize().
+    """
+    db = work(tmp_path)
+    root = tmp_path / "project"
+    (root / "assets").mkdir(parents=True)
+    (root / "assets" / "panel.png").write_bytes(b"rendered-panel")
+    (root / "manifest.json").write_text('{"pages":[]}', encoding="utf-8")
+
+    class Clock:
+        moment = datetime(2026, 10, 9, tzinfo=timezone.utc)
+
+        def __call__(self):
+            return self.moment
+
+    clock = Clock()
+    owner = DurableRunRepository(db, clock=clock)
+    observer = DurableRunRepository(db, clock=clock)
+    run_id = start(owner)
+    entered = threading.Event()
+    release = threading.Event()
+    result: dict[str, object] = {}
+    original_finalize = Orchestrator._finalize
+    caller_thread = "durable-finalize-orchestrator"
+
+    def blocking_finalize(self, run):
+        entered.set()
+        assert threading.current_thread().name != caller_thread, (
+            "filesystem finalization must not block the heartbeat event loop"
+        )
+        assert release.wait(timeout=30), "finalize worker never released"
+        return original_finalize(self, run)
+
+    monkeypatch.setattr(Orchestrator, "_finalize", blocking_finalize)
+
+    def execute_in_isolated_loop():
+        try:
+            result["run"] = asyncio.run(DurableAutopilotOrchestrator(
+                repository=owner, work_id="work_246",
+                hooks=OrchestratorHooks(),
+                project_root=root, lease_ttl_seconds=3,
+            ).execute(run_id, input_payload={}, step_inputs={},
+                      lease_owner="finalizing_owner"))
+        except BaseException as exc:
+            result["error"] = exc
+
+    thread = threading.Thread(target=execute_in_isolated_loop, name=caller_thread)
+    thread.start()
+    try:
+        assert entered.wait(timeout=15), "legacy mirror never entered"
+        last = next(
+            step for step in observer.list_steps(run_id)
+            if step["step_key"] == "finalize"
+        )
+        # No durable COMPLETED before the filesystem publication finishes.
+        assert observer.get_run(run_id)["status"] == "RUNNING"
+        assert last["status"] == "RUNNING"
+        assert observer.list_step_attempts(last["id"])[0]["status"] == "RUNNING"
+        before = observer.inspect_lease("work_246")
+        assert before is not None and before["lease_owner"] == "finalizing_owner"
+        clock.moment += timedelta(seconds=1)
+        renewed = None
+        for _ in range(300):
+            renewed = observer.inspect_lease("work_246")
+            if renewed and renewed["heartbeat_at"] > before["heartbeat_at"]:
+                break
+            threading.Event().wait(0.05)
+        assert renewed is not None
+        assert renewed["heartbeat_at"] > before["heartbeat_at"]
+        assert renewed["expired"] is False
+        # A guardian cycle uses separate short transactions for Lease, Run
+        # and Step. A read observing the Lease update can precede the Step
+        # heartbeat transaction; poll for the coordinated cycle to finish.
+        for _ in range(300):
+            if observer.get_step(last["id"])["heartbeat_at"] > last["heartbeat_at"]:
+                break
+            threading.Event().wait(0.05)
+        assert observer.get_step(last["id"])["heartbeat_at"] > last["heartbeat_at"]
+        assert observer.get_run(run_id)["status"] == "RUNNING"
+        with pytest.raises(WorkLeaseConflictError, match="active"):
+            observer.acquire_lease(
+                work_id="work_246", lease_owner="competing_owner",
+                lease_kind="AUTOPILOT_MUTATION", ttl_seconds=10,
+                run_id=run_id, reclaim_expired_owner="finalizing_owner",
+            )
+    finally:
+        release.set()
+        thread.join(timeout=30)
+
+    assert not thread.is_alive(), "orchestrator retained a detached finalizer"
+    assert "error" not in result, repr(result.get("error"))
+    assert observer.get_run(run_id)["status"] == "COMPLETED"
+    assert observer.get_step(last["id"])["status"] == "COMPLETED"
+    assert [x["status"] for x in observer.list_step_attempts(last["id"])] == [
+        "COMPLETED",
+    ]
+    assert observer.inspect_lease("work_246") is None
+    assert (root / "runs" / run_id / "assets" / "panel.png").read_bytes() == (
+        b"rendered-panel"
+    )
+
+
+@pytest.mark.asyncio
+async def test_repeated_cancellation_during_durable_finalization_drains_worker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db = work(tmp_path)
+    root = tmp_path / "project"
+    (root / "assets").mkdir(parents=True)
+    (root / "assets" / "panel.png").write_bytes(b"late-finalize")
+    entered = threading.Event()
+    release = threading.Event()
+    finished = threading.Event()
+
+    class Clock:
+        moment = datetime(2026, 10, 9, tzinfo=timezone.utc)
+
+        def __call__(self):
+            return self.moment
+
+    clock = Clock()
+    owner = DurableRunRepository(db, clock=clock)
+    observer = DurableRunRepository(db, clock=clock)
+    run_id = start(owner)
+    original_finalize = Orchestrator._finalize
+
+    def delayed_finalize(self, run):
+        entered.set()
+        try:
+            assert release.wait(timeout=30)
+            return original_finalize(self, run)
+        finally:
+            finished.set()
+
+    monkeypatch.setattr(Orchestrator, "_finalize", delayed_finalize)
+    task = asyncio.create_task(DurableAutopilotOrchestrator(
+        repository=owner, work_id="work_246",
+        project_root=root, lease_ttl_seconds=3,
+    ).execute(run_id, input_payload={}, step_inputs={},
+              lease_owner="canceled_finalizer"))
+    try:
+        assert await asyncio.to_thread(entered.wait, 15)
+        step = next(s for s in observer.list_steps(run_id)
+                    if s["step_key"] == "finalize")
+        before = observer.get_step(step["id"])["heartbeat_at"]
+        task.cancel()
+        await asyncio.sleep(0)
+        task.cancel()
+        await asyncio.sleep(0)
+        assert not task.done()
+        assert not finished.is_set()
+        assert observer.get_run(run_id)["status"] == "RUNNING"
+        assert observer.get_step(step["id"])["status"] == "RUNNING"
+        clock.moment += timedelta(seconds=1)
+        for _ in range(160):
+            if observer.get_step(step["id"])["heartbeat_at"] > before:
+                break
+            await asyncio.sleep(0.05)
+        assert observer.get_step(step["id"])["heartbeat_at"] > before
+        assert observer.inspect_lease("work_246")["expired"] is False
+        with pytest.raises(WorkLeaseConflictError):
+            observer.acquire_lease(
+                work_id="work_246", lease_owner="takeover",
+                lease_kind="AUTOPILOT_MUTATION", ttl_seconds=10,
+                run_id=run_id, reclaim_expired_owner="canceled_finalizer",
+            )
+    finally:
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, timeout=30)
+
+    assert finished.is_set()
+    assert observer.inspect_lease("work_246") is None
+    assert observer.get_run(run_id)["status"] == "INTERRUPTED"
+    assert observer.get_step(step["id"])["status"] == "INTERRUPTED"
+    assert [x["status"] for x in observer.list_step_attempts(step["id"])] == [
+        "INTERRUPTED",
+    ]
+    assert (root / "runs" / run_id / "assets" / "panel.png").is_file()
+    # Publication could already have happened before cancellation; a second
+    # attempt requires human reconciliation rather than automatic repetition.
+    monkeypatch.setattr(Orchestrator, "_finalize", original_finalize)
+    with pytest.raises(DurableRunStateError, match="reconciliation"):
+        await DurableAutopilotOrchestrator(
+            repository=observer, work_id="work_246", project_root=root,
+        ).execute(run_id, input_payload={}, step_inputs={},
+                  lease_owner="fresh_owner")
+    done = await DurableAutopilotOrchestrator(
+        repository=observer, work_id="work_246", project_root=root,
+    ).execute(run_id, input_payload={}, step_inputs={},
+              lease_owner="fresh_owner", approve_interrupted_retry=True)
+    assert done.machine.state.value == "COMPLETED"
+    assert observer.get_run(run_id)["status"] == "COMPLETED"
+    assert [x["status"] for x in observer.list_step_attempts(step["id"])] == [
+        "INTERRUPTED", "COMPLETED",
+    ]
+    assert observer.get_step(step["id"])["attempt_count"] == 2
+
+
+@pytest.mark.asyncio
+async def test_finalization_heartbeat_failure_drains_and_records_interruption(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db = work(tmp_path)
+    root = tmp_path / "project"
+    root.mkdir()
+    entered = threading.Event()
+    release = threading.Event()
+    exited = threading.Event()
+    lost = threading.Event()
+
+    class FailDuringFinalize(DurableRunRepository):
+        def heartbeat_step(self, step_id, *, lease_owner):
+            step = self.get_step(step_id)
+            if step["step_key"] == "finalize" and entered.is_set():
+                lost.set()
+                raise OSError("injected finalization heartbeat failure")
+            return super().heartbeat_step(step_id, lease_owner=lease_owner)
+
+    owner = FailDuringFinalize(db)
+    observer = DurableRunRepository(db)
+    run_id = start(owner)
+    original_finalize = Orchestrator._finalize
+
+    def blocking_finalize(self, run):
+        entered.set()
+        try:
+            assert release.wait(timeout=30)
+            (root / "published.txt").write_text("late side effect", encoding="utf-8")
+            return original_finalize(self, run)
+        finally:
+            exited.set()
+
+    monkeypatch.setattr(Orchestrator, "_finalize", blocking_finalize)
+    task = asyncio.create_task(DurableAutopilotOrchestrator(
+        repository=owner, work_id="work_246", project_root=root,
+        lease_ttl_seconds=3,
+    ).execute(run_id, input_payload={}, step_inputs={},
+              lease_owner="lost_finalizer"))
+    try:
+        assert await asyncio.to_thread(entered.wait, 15)
+        assert await asyncio.to_thread(lost.wait, 15)
+        await asyncio.sleep(0.05)
+        assert not task.done()
+        assert not exited.is_set()
+        last = next(s for s in observer.list_steps(run_id)
+                    if s["step_key"] == "finalize")
+        assert last["status"] == "RUNNING"
+        assert observer.get_run(run_id)["status"] == "RUNNING"
+        assert observer.inspect_lease("work_246")["lease_owner"] == "lost_finalizer"
+    finally:
+        release.set()
+
+    with pytest.raises(DurableHeartbeatLostError):
+        await asyncio.wait_for(task, timeout=30)
+    assert exited.is_set()
+    assert (root / "published.txt").read_text(encoding="utf-8") == "late side effect"
+    assert observer.get_run(run_id)["status"] == "INTERRUPTED"
+    assert observer.get_step(last["id"])["status"] == "INTERRUPTED"
+    assert [x["status"] for x in observer.list_step_attempts(last["id"])] == [
+        "INTERRUPTED",
+    ]
+    assert observer.inspect_lease("work_246") is None
+
+
+@pytest.mark.asyncio
+async def test_unexpected_finalization_error_has_no_success_receipt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db = work(tmp_path)
+    repo = DurableRunRepository(db)
+    run_id = start(repo)
+
+    def failed_finalize(self, run):
+        raise RuntimeError("filesystem publication failed")
+
+    monkeypatch.setattr(Orchestrator, "_finalize", failed_finalize)
+    result = await DurableAutopilotOrchestrator(
+        repository=repo, work_id="work_246",
+        project_root=tmp_path / "project",
+    ).execute(run_id, input_payload={}, step_inputs={},
+              lease_owner="failing_finalizer")
+    assert result.machine.state.value.startswith("FAILED")
+    assert repo.get_run(run_id)["status"] == "FAILED_TERMINAL"
+    last = next(s for s in repo.list_steps(run_id) if s["step_key"] == "finalize")
+    assert last["status"] == "FAILED_TERMINAL"
+    assert [x["status"] for x in repo.list_step_attempts(last["id"])] == [
+        "FAILED_TERMINAL",
+    ]
+    assert repo.inspect_lease("work_246") is None

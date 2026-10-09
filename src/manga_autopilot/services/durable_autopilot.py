@@ -350,6 +350,18 @@ class DurableAutopilotOrchestrator:
                     )
                     _check_heartbeat(heartbeat_task)
                     replayable = _json_value(result)
+                    if hook_name == "finalize":
+                        # Project-root report/mirroring performs potentially
+                        # long, destructive filesystem copies. It is part of
+                        # the final tracked RunStep, NOT post-COMPLETED cleanup:
+                        # keep the Work/Run/Step lease guardian alive while the
+                        # sync worker runs and drain it on cancellation/loss.
+                        # A process crash or lost lease leaves this attempt
+                        # RUNNING/INTERRUPTED for explicit reconciliation.
+                        await _invoke_guarded_hook(
+                            legacy._finalize, run, heartbeat_task,
+                        )
+                        _check_heartbeat(heartbeat_task)
                     self.repository.finish_step(
                         step["id"], status="COMPLETED",
                         output={"value": replayable}, lease_owner=owner,
@@ -430,8 +442,9 @@ class DurableAutopilotOrchestrator:
                 run_id, expected_status="RUNNING",
                 new_status="COMPLETED", lease_owner=owner,
             )
-            # Best-effort legacy files are supplemental; Work DB is authority.
-            return legacy._finalize(run)
+            # Finalization already ran under the live lease, as the last
+            # durable RunStep. Never run filesystem mutation after COMPLETED.
+            return run
         except DurableHeartbeatLostError:
             # Lease failure can also be noticed between stages, with no
             # active Step. The Run must not be left as a normal success.
