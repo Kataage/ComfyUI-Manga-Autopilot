@@ -314,6 +314,78 @@ async def test_non_serializable_hook_result_fails_closed(tmp_path: Path) -> None
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("foreign_kind", ["EXPORT", "QA"])
+async def test_foreign_run_kind_rejected_without_durable_side_effects(
+    tmp_path: Path, foreign_kind: str,
+) -> None:
+    """An in-Work generic Run is not a valid durable AUTOPILOT invocation."""
+    db = work(tmp_path)
+    repo = DurableRunRepository(db)
+    run_id = repo.create_run(
+        run_kind=foreign_kind, scope_type="WORK", scope_id="work_246",
+        requested_by="test", input_fingerprint="foreign:v1",
+    )["id"]
+    original = repo.get_run(run_id)
+    called: list[str] = []
+
+    def hook(_):
+        called.append("validate_input")
+        return {"unexpected": "effect"}
+
+    orchestrator = DurableAutopilotOrchestrator(
+        repository=repo, work_id="work_246",
+        hooks=OrchestratorHooks(validate_input=hook),
+        allow_omitted_hooks=True,
+    )
+    with pytest.raises(DurableRunStateError, match="AUTOPILOT"):
+        await orchestrator.execute(
+            run_id, input_payload={}, step_inputs={},
+            lease_owner=f"foreign_{foreign_kind.lower()}",
+        )
+
+    assert repo.get_run(run_id) == original
+    assert repo.list_steps(run_id) == []
+    assert repo.inspect_lease("work_246") is None
+    assert called == []
+
+
+@pytest.mark.asyncio
+async def test_autopilot_kind_runs_all_required_hooks(
+    tmp_path: Path,
+) -> None:
+    """Do not reject legitimate AUTOPILOT Runs or change execution receipts."""
+    repo = DurableRunRepository(work(tmp_path))
+    run_id = start(repo)
+    called: list[str] = []
+
+    async def hook(_):
+        called.append("executed")
+        return {"real_hook_invoked": True}
+
+    hooks = OrchestratorHooks(**{
+        name: hook for name in OrchestratorHooks.__dataclass_fields__
+    })
+    result = await DurableAutopilotOrchestrator(
+        repository=repo, work_id="work_246", hooks=hooks,
+    ).execute(run_id, input_payload={}, step_inputs={},
+              lease_owner="correct_autopilot_kind")
+
+    assert result.machine.state.value == "COMPLETED"
+    assert repo.get_run(run_id)["status"] == "COMPLETED"
+    assert len(repo.list_steps(run_id)) == len(called) == len(
+        OrchestratorHooks.__dataclass_fields__,
+    )
+    assert all(
+        json.loads(step["output_json"]) == {
+            "value": {"real_hook_invoked": True},
+            "execution": "EXECUTED",
+        }
+        for step in repo.list_steps(run_id)
+    )
+    assert repo.inspect_lease("work_246") is None
+
+
+@pytest.mark.asyncio
 async def test_durable_run_requires_matching_work_and_valid_lease(tmp_path: Path) -> None:
     db = work(tmp_path)
     repo = DurableRunRepository(db)

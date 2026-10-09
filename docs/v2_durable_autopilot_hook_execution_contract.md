@@ -2,6 +2,25 @@
 
 This document describes only the **opt-in Work-DB `DurableAutopilotOrchestrator` bridge**. It does not change legacy project HTTP routes and does not establish production manga quality, GPU or live ComfyUI qualification.
 
+## Durable Run kind boundary
+
+`DurableRunRepository.create_run` is intentionally generic: Work-scoped
+`AUTOPILOT`, `EXPORT`, `QA`, and future operation-specific `run_kind`
+values may be persisted. A caller must dispatch each kind to its appropriate
+operation handler; this document does not define or implement other handlers.
+
+The opt-in `DurableAutopilotOrchestrator.execute()` accepts **only** an
+existing Run with `scope_type == "WORK"`, matching `scope_id`, and
+**exact** `run_kind == "AUTOPILOT"` (case-sensitive). A foreign kind is
+rejected with `DurableRunStateError` before acquiring the exclusive Work
+mutation lease, before transitioning the Run, before creating any RunSteps or
+attempts, and before invoking a stage hook. Neither the explicitly opted-in
+GPU-free skeleton nor a process restart overrides this boundary.
+
+This kind validation does not modify the existing AUTOPILOT stage fingerprint
+or receipt policy. No migration or narrowing of the generic repository API is
+required.
+
 ## Supported, required, and explicitly omitted stages
 
 - **Supported/executed:** a callable hook is provided for a stage in `OrchestratorHooks`. Its result (including a genuine JSON `null`) is serialized with an explicit `execution: "EXECUTED"` provenance marker in the completed RunStep/attempt receipt.
