@@ -33,6 +33,8 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
+from manga_autopilot.services.run_cleanup import project_run_directory_lock
+
 log = logging.getLogger(__name__)
 
 
@@ -66,44 +68,44 @@ def save_run_metadata(
         Set to ``False`` when calling from ``_finalize`` to avoid
         overwriting a newer run's pointer after restart.
     """
-    project_root = Path(project_root)
-    runs_dir = project_root / "runs"
-    run_dir = runs_dir / run.run_id
-    run_dir.mkdir(parents=True, exist_ok=True)
+    project_root = Path(project_root)    with project_run_directory_lock(project_root):
+        runs_dir = project_root / "runs"
+        run_dir = runs_dir / run.run_id
+        run_dir.mkdir(parents=True, exist_ok=True)
 
-    status_value = run.machine.state.value
-    source = run.source
-    if source.get("restart_of_run_id"):
-        kind = "restart"
-    elif source.get("resume_of_run_id"):
-        kind = "resume"
-    else:
-        kind = "start"
-    payload: dict[str, Any] = {
-        "run_id": run.run_id,
-        "project_id": run.project_id,
-        "kind": kind,
-        "status": status_value,
-        "started_at": run.started_at.isoformat(),
-        "completed_at": run.finished_at.isoformat() if run.finished_at else None,
-        "cancelled_at": None,
-        "failed_at": None,
-        "input": run.input,
-        "source": run.source,
-    }
-    if status_value == "CANCELLED":
-        payload["cancelled_at"] = (run.finished_at or run._now()).isoformat()
-    elif status_value.startswith("FAILED"):
-        payload["failed_at"] = (run.finished_at or run._now()).isoformat()
-    if artifacts is not None:
-        payload["artifacts"] = artifacts
+        status_value = run.machine.state.value
+        source = run.source
+        if source.get("restart_of_run_id"):
+            kind = "restart"
+        elif source.get("resume_of_run_id"):
+            kind = "resume"
+        else:
+            kind = "start"
+        payload: dict[str, Any] = {
+            "run_id": run.run_id,
+            "project_id": run.project_id,
+            "kind": kind,
+            "status": status_value,
+            "started_at": run.started_at.isoformat(),
+            "completed_at": run.finished_at.isoformat() if run.finished_at else None,
+            "cancelled_at": None,
+            "failed_at": None,
+            "input": run.input,
+            "source": run.source,
+        }
+        if status_value == "CANCELLED":
+            payload["cancelled_at"] = (run.finished_at or run._now()).isoformat()
+        elif status_value.startswith("FAILED"):
+            payload["failed_at"] = (run.finished_at or run._now()).isoformat()
+        if artifacts is not None:
+            payload["artifacts"] = artifacts
 
-    run_file = run_dir / "run.json"
-    run_file.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        run_file = run_dir / "run.json"
+        run_file.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
-    if update_latest:
-        latest_file = project_root / "latest_run_id.txt"
-        latest_file.write_text(run.run_id, encoding="utf-8")
+        if update_latest:
+            latest_file = project_root / "latest_run_id.txt"
+            latest_file.write_text(run.run_id, encoding="utf-8")
 
 
 # ----------------------------------------------------------------- states
