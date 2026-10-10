@@ -18,6 +18,7 @@ from manga_autopilot.models.panel import (
     load_panel_records,
     write_panel_records,
 )
+from manga_autopilot.routes.work_io import run_owned_work_io
 from manga_autopilot.services.autopilot import (
     AutopilotController,
     AutopilotRun,
@@ -1094,15 +1095,19 @@ async def cleanup_runs(request: web.Request) -> web.Response:
         dry_run=bool(body.get("dry_run", True)),
     )
 
-    plan = build_run_cleanup_plan(paths.root, policy)
+    # Cleanup holds an OS-level cross-process writer lock and may recursively
+    # delete large directories. Keep it off aiohttp's event loop while draining
+    # its owned worker on HTTP cancellation.
+    plan = await run_owned_work_io(build_run_cleanup_plan, paths.root, policy)
     plan = RunCleanupPlan(
         project_id=project_id,
         dry_run=plan.dry_run,
         protected_run_ids=plan.protected_run_ids,
         candidates=plan.candidates,
+        policy=plan.policy,
     )
 
-    result = execute_run_cleanup_plan(plan)
+    result = await run_owned_work_io(execute_run_cleanup_plan, plan)
 
     return web.json_response({
         "project_id": project_id,
