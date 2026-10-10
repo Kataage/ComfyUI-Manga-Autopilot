@@ -754,3 +754,139 @@ def test_phase_c_independent_audit_archived_entity_rejects_direct_nonrecovery_up
     )
     assert accepted["archived_at"] is None
     assert accepted["revision"] == reopened["revision"] + (0 if noop else 1)
+
+@pytest.mark.parametrize("scope", ["page", "panel"])
+@pytest.mark.parametrize("case", ["mixed_recovery", "rearchive", "empty", "stale_revision"])
+def test_issue413_archived_entity_recovery_is_exclusive_and_revision_guarded(
+    repositories, scope: str, case: str,
+) -> None:
+    """Archive recovery is not an opportunity to smuggle in other edits."""
+    from manga_autopilot.repositories.page_domain import PageDomainArchivedError
+
+    pages, _, panels = repositories
+    _setup(repositories)
+    is_page = scope == "page"
+    record = pages.get_page("page_001") if is_page else panels.get_panel("panel_001")
+    update = (
+        lambda expected_revision, **changes: pages.update_page(
+            "page_001", expected_revision=expected_revision, **changes,
+        )
+        if is_page else panels.update_panel(
+            "panel_001", expected_revision=expected_revision, **changes,
+        )
+    )
+    archived = update(
+        record["revision"], archived_at="2026-10-11T03:00:00Z",
+    )
+    payload = {
+        "mixed_recovery": (
+            {"archived_at": None, "page_purpose": "hidden change"}
+            if is_page else
+            {"archived_at": None, "panel_purpose": "hidden change"}
+        ),
+        "rearchive": {"archived_at": "2026-10-11T04:00:00Z"},
+        "empty": {},
+        "stale_revision": {
+            "page_purpose" if is_page else "panel_purpose": "stale hidden change",
+        },
+    }[case]
+    with repository_read(pages.database_path) as conn:
+        ledger = tuple(
+            conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+            for table in ("commits", "entity_revisions", "invalidations")
+        )
+    expected = (archived["revision"] - 1) if case == "stale_revision" else archived["revision"]
+    error = (
+        RevisionConflictError if case == "stale_revision"
+        else PageDomainArchivedError if is_page
+        else PageDomainPanelArchivedError
+    )
+    with pytest.raises(error):
+        update(expected, **payload)
+    latest = pages.get_page("page_001") if is_page else panels.get_panel("panel_001")
+    assert latest == archived
+    with repository_read(pages.database_path) as conn:
+        assert tuple(
+            conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+            for table in ("commits", "entity_revisions", "invalidations")
+        ) == ledger
+
+
+@pytest.mark.parametrize("scope", ["page", "panel"])
+def test_issue413_archive_race_fences_later_semantic_update(
+    repositories, monkeypatch, scope: str,
+) -> None:
+    """An archive holding BEGIN IMMEDIATE must win over a later edit."""
+    import threading
+
+    import manga_autopilot.repositories.page_domain as domain
+
+    pages, _, panels = repositories
+    _setup(repositories)
+    is_page = scope == "page"
+    target_table = "pages" if is_page else "panels"
+    target_id = "page_001" if is_page else "panel_001"
+    repo = pages if is_page else panels
+    record = repo.get_page(target_id) if is_page else repo.get_panel(target_id)
+    update = (
+        lambda expected_revision, **changes: pages.update_page(
+            target_id, expected_revision=expected_revision, **changes,
+        )
+        if is_page else panels.update_panel(
+            target_id, expected_revision=expected_revision, **changes,
+        )
+    )
+    at_archive_lock = threading.Event()
+    allow_archive = threading.Event()
+    attempted_edit = threading.Event()
+    outcomes: dict[str, object] = {}
+    original_patch = domain._patch
+    stamp = "2026-10-11T05:00:00Z"
+
+    def pause_archival_patch(conn, table, entity_id, **kwargs):
+        if (
+            table == target_table and entity_id == target_id
+            and kwargs.get("attrs", {}).get("archived_at") == stamp
+        ):
+            at_archive_lock.set()
+            if not allow_archive.wait(timeout=10):
+                raise RuntimeError("archive test lock was not released")
+        return original_patch(conn, table, entity_id, **kwargs)
+
+    monkeypatch.setattr(domain, "_patch", pause_archival_patch)
+
+    def archive_worker():
+        try:
+            outcomes["archive"] = update(record["revision"], archived_at=stamp)
+        except BaseException as exc:
+            outcomes["archive_error"] = exc
+
+    def edit_worker():
+        attempted_edit.set()
+        try:
+            outcomes["edit"] = update(
+                record["revision"] + 1,
+                **{"page_purpose" if is_page else "panel_purpose": "racy hidden edit"},
+            )
+        except BaseException as exc:
+            outcomes["edit_error"] = exc
+
+    archival = threading.Thread(target=archive_worker, daemon=True)
+    editor = threading.Thread(target=edit_worker, daemon=True)
+    archival.start()
+    try:
+        assert at_archive_lock.wait(timeout=5), "archive never acquired writer lock"
+        editor.start()
+        assert attempted_edit.wait(timeout=5), "edit never started"
+    finally:
+        allow_archive.set()
+        archival.join(timeout=10)
+        if editor.ident is not None:
+            editor.join(timeout=10)
+    assert not archival.is_alive() and not editor.is_alive()
+    assert "archive_error" not in outcomes, outcomes
+    assert "edit" not in outcomes, outcomes
+    error_type = PageDomainArchivedError if is_page else PageDomainPanelArchivedError
+    assert isinstance(outcomes.get("edit_error"), error_type), outcomes
+    after = repo.get_page(target_id) if is_page else repo.get_panel(target_id)
+    assert after == outcomes["archive"]
