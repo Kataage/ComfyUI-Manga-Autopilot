@@ -1809,3 +1809,68 @@ async def test_issue407_slow_durable_step_io_does_not_block_lease_event_loop(
         "Durable Autopilot runs synchronous RunStep SQLite IO on its own "
         "heartbeat event loop, starving independent lease renewal callbacks"
     )
+
+
+@pytest.mark.asyncio
+async def test_issue407_slow_lease_renewal_does_not_block_guardian_event_loop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Lease heartbeat SQLite waits cannot stall unrelated async callbacks."""
+    db = work(tmp_path)
+    repo = DurableRunRepository(db)
+    run_id = start(repo)
+    loop = asyncio.get_running_loop()
+    entered_hook = asyncio.Event()
+    release_hook = asyncio.Event()
+    entered_heartbeat = threading.Event()
+    release_heartbeat = threading.Event()
+    pulse = threading.Event()
+    observed: dict[str, bool] = {}
+    real_heartbeat = DurableRunRepository.heartbeat_lease
+
+    def delayed_heartbeat(self, *args, **kwargs):
+        entered_heartbeat.set()
+        if not release_heartbeat.wait(timeout=12):
+            raise TimeoutError("audit-controlled lease renewal not released")
+        return real_heartbeat(self, *args, **kwargs)
+
+    async def suspended_hook(_):
+        entered_hook.set()
+        await release_hook.wait()
+        return {"ok": True}
+
+    def independent_tick() -> None:
+        if not entered_heartbeat.wait(timeout=10):
+            observed["pulse_during_heartbeat"] = False
+            release_heartbeat.set()
+            return
+        try:
+            loop.call_soon_threadsafe(pulse.set)
+            observed["pulse_during_heartbeat"] = pulse.wait(timeout=3)
+        finally:
+            release_heartbeat.set()
+
+    monkeypatch.setattr(DurableRunRepository, "heartbeat_lease", delayed_heartbeat)
+    watcher = threading.Thread(target=independent_tick, daemon=True)
+    watcher.start()
+    runner_instance = DurableAutopilotOrchestrator(
+        repository=repo, work_id="work_246",
+        hooks=OrchestratorHooks(validate_input=suspended_hook),
+        allow_omitted_hooks=True, lease_ttl_seconds=6,
+    )
+    task = asyncio.create_task(runner_instance.execute(
+        run_id, input_payload={}, step_inputs={}, lease_owner="audit_renewal",
+    ))
+    try:
+        await asyncio.wait_for(entered_hook.wait(), timeout=10)
+        await asyncio.wait_for(asyncio.to_thread(watcher.join, 12), timeout=14)
+        assert not watcher.is_alive()
+    finally:
+        release_heartbeat.set()
+        release_hook.set()
+    result = await asyncio.wait_for(task, timeout=20)
+    assert result.machine.state.value == "COMPLETED"
+    assert observed["pulse_during_heartbeat"] is True, (
+        "Durable lease guardian's synchronous SQLite heartbeat blocks "
+        "unrelated event-loop work during its database wait"
+    )
