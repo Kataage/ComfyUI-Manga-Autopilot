@@ -68,7 +68,8 @@ def save_run_metadata(
         Set to ``False`` when calling from ``_finalize`` to avoid
         overwriting a newer run's pointer after restart.
     """
-    project_root = Path(project_root)    with project_run_directory_lock(project_root):
+    project_root = Path(project_root)
+    with project_run_directory_lock(project_root):
         runs_dir = project_root / "runs"
         run_dir = runs_dir / run.run_id
         run_dir.mkdir(parents=True, exist_ok=True)
