@@ -14,12 +14,12 @@ from __future__ import annotations
 
 import json
 import logging
-import shutil
 import os
 import secrets
+import shutil
 import stat
+from collections.abc import Iterator
 from contextlib import contextmanager
-from typing import Iterator
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -43,28 +43,25 @@ def project_run_directory_lock(project_root: Path) -> Iterator[None]:
     flags = os.O_CREAT | os.O_RDWR | getattr(os, "O_BINARY", 0)
     flags |= getattr(os, "O_NOFOLLOW", 0)
     fd = os.open(lock_path, flags, 0o600)
-    try:
-        with os.fdopen(fd, "r+b") as lock:
-            if os.name == "nt":
-                import msvcrt
+    with os.fdopen(fd, "r+b") as lock:
+        if os.name == "nt":
+            import msvcrt
 
+            lock.seek(0)
+            msvcrt.locking(lock.fileno(), msvcrt.LK_LOCK, 1)
+            try:
+                yield
+            finally:
                 lock.seek(0)
-                msvcrt.locking(lock.fileno(), msvcrt.LK_LOCK, 1)
-                try:
-                    yield
-                finally:
-                    lock.seek(0)
-                    msvcrt.locking(lock.fileno(), msvcrt.LK_UNLCK, 1)
-            else:
-                import fcntl
+                msvcrt.locking(lock.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
 
-                fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
-                try:
-                    yield
-                finally:
-                    fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
-    except BaseException:
-        raise
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
 
 
 def _directory_identity(path: Path) -> tuple[int, int] | None:
@@ -237,13 +234,16 @@ def build_run_cleanup_plan(
             reason = "older than keep_last"
 
         if eligible:
+            identity = _directory_identity(run_path)
+            if identity is None:
+                continue
             candidates.append(RunCleanupCandidate(
                 run_id=run_id,
                 status=status,
                 path=str(run_path),
                 reason=reason,
-                directory_device=_directory_identity(run_path)[0],
-                directory_inode=_directory_identity(run_path)[1],
+                directory_device=identity[0],
+                directory_inode=identity[1],
             ))
         else:
             protected.append(run_id)
@@ -304,11 +304,12 @@ def execute_run_cleanup_plan(plan: RunCleanupPlan) -> RunCleanupResult:
                     skipped.append(candidate.run_id)
                     continue
                 policy = plan.policy
+                current_latest = _current_latest(project_root)
                 if (
-                    _current_latest(project_root) is None
+                    current_latest is None
                     or (
                         (policy is None or policy.keep_latest)
-                        and _current_latest(project_root) == candidate.run_id
+                        and current_latest == candidate.run_id
                     )
                     or (
                         candidate.status == "RUNNING"
