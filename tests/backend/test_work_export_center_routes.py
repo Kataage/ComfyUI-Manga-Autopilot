@@ -849,3 +849,51 @@ async def test_canceled_http_stream_read_finishes_before_closing_spool_and_slot(
     after = await asyncio.wait_for(client.get(url), timeout=10)
     assert after.status == 200
     assert await after.read() == _png()
+
+
+@pytest.mark.asyncio
+async def test_issue405_export_center_db_read_does_not_starve_event_loop(
+    browser_api, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A slow Work open for export discovery must not block lease ticks."""
+    client, _handle, _repo = browser_api
+    loop = asyncio.get_running_loop()
+    started = threading.Event()
+    release = threading.Event()
+    pulse = threading.Event()
+    observed: dict[str, bool] = {}
+    original_open = ArtifactRepository._open
+
+    def slow_open(self):
+        started.set()
+        if not release.wait(timeout=15):
+            raise TimeoutError("audit-controlled Export Center open not released")
+        return original_open(self)
+
+    def tick() -> None:
+        if not started.wait(timeout=10):
+            observed["during_open"] = False
+            release.set()
+            return
+        try:
+            loop.call_soon_threadsafe(pulse.set)
+            observed["during_open"] = pulse.wait(timeout=3)
+        finally:
+            release.set()
+
+    monkeypatch.setattr(ArtifactRepository, "_open", slow_open)
+    watcher = threading.Thread(target=tick, daemon=True)
+    watcher.start()
+    try:
+        response = await client.get(
+            "/manga_autopilot/api/v2/works/work_center/exports"
+        )
+        assert response.status == 200
+        assert (await response.json())["work_id"] == "work_center"
+    finally:
+        release.set()
+        await asyncio.to_thread(watcher.join, 10)
+    assert not watcher.is_alive()
+    assert observed["during_open"] is True, (
+        "Export Center SQLite/Work lookup blocks unrelated event-loop callbacks"
+    )

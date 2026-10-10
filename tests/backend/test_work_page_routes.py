@@ -721,3 +721,123 @@ async def test_page_http_mutation_conflicts_with_live_autopilot_work_lease(api):
         finish.set()
         await asyncio.wait_for(execution, timeout=20)
     assert repo.inspect_lease(handle.work_id) is None
+
+
+@pytest.mark.asyncio
+async def test_issue405_page_read_keeps_event_loop_heartbeat_responsive(
+    api, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Simulated slow SQLite/Work open must not block unrelated lease ticks.
+
+    A separate watcher thread waits until an actual Page read begins, schedules
+    a harmless event-loop pulse and releases the read after observing whether
+    that pulse ran *during* its I/O. The watcher always releases the read; this
+    test cannot hang if the route incorrectly blocks the event loop.
+    """
+    import asyncio
+    import threading
+
+    from manga_autopilot.services.page_application import PageApplicationService
+
+    client, prefix, _, _ = api
+    loop = asyncio.get_running_loop()
+    started = threading.Event()
+    release = threading.Event()
+    heartbeat_pulse = threading.Event()
+    observed: dict[str, bool] = {}
+    original_get = PageApplicationService.get_page
+
+    def slow_page_read(self, *args, **kwargs):
+        started.set()
+        if not release.wait(timeout=15):
+            raise TimeoutError("audit-controlled slow Page read was not released")
+        return original_get(self, *args, **kwargs)
+
+    def independent_lease_tick() -> None:
+        if not started.wait(timeout=10):
+            observed["pulse_during_io"] = False
+            release.set()
+            return
+        try:
+            loop.call_soon_threadsafe(heartbeat_pulse.set)
+            observed["pulse_during_io"] = heartbeat_pulse.wait(timeout=3)
+        finally:
+            release.set()
+
+    monkeypatch.setattr(PageApplicationService, "get_page", slow_page_read)
+    watcher = threading.Thread(target=independent_lease_tick, daemon=True)
+    watcher.start()
+    try:
+        response = await client.get(prefix + "/page_001")
+        assert response.status == 200
+        assert (await response.json())["page"]["id"] == "page_001"
+    finally:
+        release.set()
+        await asyncio.to_thread(watcher.join, 10)
+    assert not watcher.is_alive()
+    assert observed["pulse_during_io"] is True, (
+        "Page HTTP read blocked aiohttp's event loop, preventing an otherwise "
+        "ready durable Work lease heartbeat from running during slow I/O"
+    )
+
+
+@pytest.mark.asyncio
+async def test_issue405_cancelled_layout_patch_drains_its_owned_sqlite_worker(
+    api, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Repeated HTTP cancellations cannot detach a committing Work mutation."""
+    import asyncio
+    import threading
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    from manga_autopilot.routes import work_page_routes
+    from manga_autopilot.services.page_application import PageApplicationService
+
+    _client, _prefix, root, handle = api
+    started = threading.Event()
+    release = threading.Event()
+    original_update = PageApplicationService.update_layout
+
+    def blocked_update(self, *args, **kwargs):
+        started.set()
+        if not release.wait(timeout=15):
+            raise TimeoutError("controlled Work PATCH worker never resumed")
+        return original_update(self, *args, **kwargs)
+
+    monkeypatch.setattr(PageApplicationService, "update_layout", blocked_update)
+    request = SimpleNamespace(
+        app={"manga_storage_root": str(root)},
+        match_info={"work_id": handle.work_id, "page_id": "page_001"},
+        json=AsyncMock(return_value={
+            "expected_revision": 1,
+            "geometry_json": {"width": 1337, "height": 1600},
+        }),
+    )
+
+    task = asyncio.create_task(work_page_routes.update_work_page_layout(request))
+    try:
+        assert await asyncio.to_thread(started.wait, 10), (
+            "the HTTP layout command never reached its offloaded worker"
+        )
+        task.cancel()
+        await asyncio.sleep(0.04)
+        task.cancel()
+        await asyncio.sleep(0.04)
+        assert not task.done(), (
+            "cancelled HTTP PATCH detached a still-running Work SQLite worker"
+        )
+    finally:
+        release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, timeout=20)
+
+    # Cancellation cannot undo a completed guarded commit. The server must
+    # drain it before exit; the persisted revision is the client-visible truth.
+    state = PageApplicationService(root).get_page(
+        handle.work_id, "page_001"
+    )
+    assert state["layout"]["revision"] == 2
+    assert state["layout"]["geometry_json"] == {
+        "width": 1337, "height": 1600,
+    }
