@@ -1954,3 +1954,61 @@ async def test_issue407_cancelled_start_step_waits_for_commit_then_interrupts(
     steps = repo.list_steps(run_id)
     assert any(step["status"] == "INTERRUPTED" for step in steps)
     assert not any(step["status"] == "RUNNING" for step in steps)
+
+
+@pytest.mark.asyncio
+async def test_issue407_pending_step_is_not_heartbeated_until_start_is_durable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Guardian renews Work/Run while a Step is still waiting to start."""
+    import time
+
+    db = work(tmp_path)
+    repo = DurableRunRepository(db)
+    run_id = start(repo)
+    entered = threading.Event()
+    first_run_tick = threading.Event()
+    release = threading.Event()
+    actual_start = DurableRunRepository.start_step
+    actual_heartbeat_run = DurableRunRepository.heartbeat_run
+
+    def slow_first_start(self, *args, **kwargs):
+        if not entered.is_set():
+            entered.set()
+            if not release.wait(timeout=12):
+                raise TimeoutError("controlled pending Step was never released")
+        return actual_start(self, *args, **kwargs)
+
+    def observe_run_heartbeat(self, *args, **kwargs):
+        value = actual_heartbeat_run(self, *args, **kwargs)
+        first_run_tick.set()
+        return value
+
+    def release_after_guardian_tick() -> None:
+        if entered.wait(timeout=10) and first_run_tick.wait(timeout=10):
+            # Leave enough time for a wrongly active pending Step heartbeat
+            # to fail before making start_step durable.
+            time.sleep(0.35)
+        release.set()
+
+    monkeypatch.setattr(DurableRunRepository, "start_step", slow_first_start)
+    monkeypatch.setattr(
+        DurableRunRepository, "heartbeat_run", observe_run_heartbeat,
+    )
+    watcher = threading.Thread(target=release_after_guardian_tick, daemon=True)
+    watcher.start()
+    runner_instance = DurableAutopilotOrchestrator(
+        repository=repo, work_id="work_246",
+        hooks=OrchestratorHooks(), allow_omitted_hooks=True,
+        lease_ttl_seconds=6,
+    )
+    try:
+        result = await asyncio.wait_for(runner_instance.execute(
+            run_id, input_payload={}, step_inputs={}, lease_owner="pending_tick",
+        ), timeout=25)
+    finally:
+        release.set()
+        await asyncio.to_thread(watcher.join, 10)
+    assert first_run_tick.is_set(), "the lease guardian never renewed the Run"
+    assert result.machine.state.value == "COMPLETED"
+    assert repo.inspect_lease("work_246") is None
