@@ -2468,10 +2468,16 @@ def test_phase_c_audit_recovery_snapshot_survives_checkpoint_between_db_and_wal(
 
         def interleaved_copy(source, destination, *args, **kwargs):
             result = real_copy(source, destination, *args, **kwargs)
-            if Path(source) == database and not checkpointed:
+            if Path(source) == database or Path(source) == database.with_name(
+                database.name + "-wal"
+            ):
+                pytest.fail("recovery must not raw-copy live SQLite DB/WAL files")
+            if Path(source) == staging / "manifest.json" and not checkpointed:
                 checkpointed.append(True)
-                # Scanner copied the old main-file pages. SQLite now moves
-                # the already-committed repairs out of WAL before WAL copy.
+                # During the recovery snapshot, a source checkpoint can
+                # move already-committed frames into its main DB. The online
+                # backup must use SQLite's consistent snapshot instead of
+                # composing separately copied DB and WAL generations.
                 assert keeper.execute(
                     "PRAGMA wal_checkpoint(TRUNCATE)"
                 ).fetchone()[0] == 0
@@ -2479,7 +2485,7 @@ def test_phase_c_audit_recovery_snapshot_survives_checkpoint_between_db_and_wal(
 
         monkeypatch.setattr(lifecycle_module.shutil, "copy2", interleaved_copy)
         findings = repository.scan_recovery()
-        assert checkpointed, "test did not hit database/WAL copy boundary"
+        assert checkpointed, "test did not checkpoint during recovery snapshot"
         assert len(findings) == 1
         assert findings[0].kind == "STALE_STAGING_VALID", (
             "recovery classified a healthy Work as corrupt because its "
