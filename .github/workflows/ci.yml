@@ -30,7 +30,7 @@ jobs:
       - name: Run ruff
         run: ruff check .
       - name: Run pytest
-        run: pytest tests/backend/ -q
+        run: pytest tests/backend/ -q --tb=line --maxfail=1
 
   windows-persistence:
     name: windows persistence safety (python 3.11)
@@ -71,4 +71,4 @@ jobs:
           tests/backend/test_work_export_center_routes.py
           tests/backend/test_export_center_browser_contract.py
           tests/backend/test_work_vertical_slice_live.py
-          -q
+          -q --tb=line --maxfail=1
