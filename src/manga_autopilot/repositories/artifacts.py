@@ -13,6 +13,7 @@ import io
 import json
 import os
 import sqlite3
+import stat
 import tempfile
 from collections.abc import Callable
 from pathlib import Path, PurePosixPath
@@ -30,6 +31,7 @@ from manga_autopilot.storage import (
     repository_write,
     validate_work_id,
 )
+from manga_autopilot.storage.paths import UnsafeStoragePathError
 from manga_autopilot.storage.repository import assert_work_mutation_allowed
 
 _IMAGE_FORMATS = {
@@ -126,6 +128,83 @@ def _fingerprint_file(path: Path) -> tuple[str, int]:
             digest.update(piece)
             count += len(piece)
     return digest.hexdigest(), count
+
+
+def _verify_published_file(
+    target: Path,
+    *,
+    work_root: Path,
+    expected_identity: tuple[int, int],
+    expected_sha256: str,
+    expected_size: int,
+) -> None:
+    """Validate the *published* pathname and pinned bytes inside the Work commit.
+
+    The first SHA/size comes from the private temp file. Hard-link publication
+    normally preserves its device/inode, but the visible final pathname can be
+    replaced or edited before its READY row is committed. Read a pinned, regular,
+    non-symlink final file and require that its inode and bytes still match the
+    originally validated temp object. Inspect the pathname again after reading.
+
+    This closes the deterministic publication-to-commit corruption window for
+    repository-owned writes. An external actor that ignores Work/OS discipline
+    can still change a local file *after* validation; a filesystem and SQLite
+    cannot provide one atomic transaction. Read-time integrity checks remain.
+    """
+    try:
+        assert_managed_path(
+            target, containment_root=work_root,
+            field_name="published Artifact final path",
+        )
+        before = target.lstat()
+        identity = (before.st_dev, before.st_ino)
+        if not stat.S_ISREG(before.st_mode) or identity != expected_identity:
+            raise ArtifactIntegrityError(
+                "published Artifact path changed before READY registration"
+            )
+
+        flags = os.O_RDONLY | getattr(os, "O_BINARY", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        with os.fdopen(os.open(target, flags), "rb") as published:
+            opened = os.fstat(published.fileno())
+            if (
+                not stat.S_ISREG(opened.st_mode)
+                or (opened.st_dev, opened.st_ino) != expected_identity
+            ):
+                raise ArtifactIntegrityError(
+                    "published Artifact file identity changed before READY registration"
+                )
+            digest = hashlib.sha256()
+            count = 0
+            while piece := published.read(_READ_CHUNK_BYTES):
+                digest.update(piece)
+                count += len(piece)
+            finished = os.fstat(published.fileno())
+
+        after = target.lstat()
+        assert_managed_path(
+            target, containment_root=work_root,
+            field_name="published Artifact final path",
+        )
+        if (
+            not stat.S_ISREG(after.st_mode)
+            or (after.st_dev, after.st_ino) != expected_identity
+            or (finished.st_dev, finished.st_ino) != expected_identity
+            or opened.st_size != finished.st_size
+            or opened.st_mtime_ns != finished.st_mtime_ns
+            or opened.st_ctime_ns != finished.st_ctime_ns
+            or after.st_size != finished.st_size
+            or after.st_mtime_ns != finished.st_mtime_ns
+            or count != expected_size
+            or digest.hexdigest() != expected_sha256
+        ):
+            raise ArtifactIntegrityError(
+                "published Artifact bytes or identity changed before READY registration"
+            )
+    except (OSError, UnsafeStoragePathError) as exc:
+        raise ArtifactIntegrityError(
+            "published Artifact cannot be verified before READY registration"
+        ) from exc
 
 
 def _publish_exclusive(temp: Path, destination: Path) -> None:
@@ -494,6 +573,8 @@ class ArtifactRepository:
             _copy_and_sync(stream, temp)
             width, height = _validate_media(temp, mime)
             digest, size = _fingerprint_file(temp)
+            validated = temp.stat()
+            source_identity = (validated.st_dev, validated.st_ino)
             assert_managed_path(
                 target, containment_root=work.root, field_name="artifact final path"
             )
@@ -564,6 +645,18 @@ class ArtifactRepository:
                 before_state=None,
                 after_state=row,
                 created_at=commit.created_at,
+            )
+            # The only READY state that may escape this transaction is one
+            # whose actual published bytes and inode match the validated temp.
+            # A failed check rolls back Commit, Artifact and EntityRevision.
+            # Verify last, after guards and history writes, to minimize the
+            # unavoidable local filesystem/SQLite coordination gap.
+            _verify_published_file(
+                target,
+                work_root=work.root,
+                expected_identity=source_identity,
+                expected_sha256=digest,
+                expected_size=size,
             )
         return row
 

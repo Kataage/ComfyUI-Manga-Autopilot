@@ -391,3 +391,161 @@ def test_w0004_to_w0005_upgrade_preserves_identity_backup_and_history(tmp_path):
     )
     assert again.applied_versions == ()
     assert again.backup_path is None
+
+@pytest.mark.parametrize("publication_race", [
+    "same_size_in_place_mutation",
+    "same_size_path_replacement",
+    "truncated_after_publication",
+])
+def test_phase_c_independent_audit_artifact_ready_requires_published_bytes_to_match(
+    work, monkeypatch, publication_race: str,
+) -> None:
+    """A READY Artifact must never attest bytes replaced after file publication.
+
+    Independent audit only: a deterministic local actor changes the published
+    pathname after the exclusive file link but before the Work DB transaction.
+    The pre-publication digest was computed from the disposable temp file;
+    therefore it does NOT verify the file currently at the final pathname.
+    """
+    repo, handle = work
+    previous = _counts(handle.database_path)
+    before = _png()
+    original_publish = artifacts_module._publish_exclusive
+    observed = []
+
+    def tamper_published_file(temp: Path, target: Path) -> None:
+        original_publish(temp, target)
+        assert target.read_bytes() == before
+        observed.append(True)
+        if publication_race == "same_size_in_place_mutation":
+            # Preserves the length and original inode, changing only SHA256.
+            tampered = bytes([before[0] ^ 1]) + before[1:]
+            target.write_bytes(tampered)
+        elif publication_race == "same_size_path_replacement":
+            replacement = target.with_name("untrusted_replacement.png")
+            replacement.write_bytes(bytes([before[0] ^ 1]) + before[1:])
+            replacement.replace(target)
+        else:
+            target.write_bytes(b"untrusted")
+        assert target.is_file()
+        assert target.read_bytes() != before
+
+    monkeypatch.setattr(artifacts_module, "_publish_exclusive", tamper_published_file)
+    # The repository must reject publication atomically, leaving only a
+    # recoverable orphan filesystem file and no committed READY row/history.
+    with pytest.raises(ArtifactIntegrityError):
+        _register(repo, artifact_id="artifact_postlink_race")
+    assert observed == [True]
+    assert _counts(handle.database_path) == previous
+    with pytest.raises(ArtifactNotFoundError):
+        repo.get("artifact_postlink_race")
+
+
+def test_phase_c_independent_audit_generic_binary_artifact_postlink_tampering(
+    work, monkeypatch,
+) -> None:
+    """Non-image exports share the publication contract and must fail closed."""
+    repo, handle = work
+    previous = _counts(handle.database_path)
+    original_publish = artifacts_module._publish_exclusive
+
+    def tamper_published_binary(temp: Path, target: Path) -> None:
+        original_publish(temp, target)
+        target.write_bytes(b"changed body after publication")
+
+    monkeypatch.setattr(artifacts_module, "_publish_exclusive", tamper_published_binary)
+    with pytest.raises(ArtifactIntegrityError):
+        repo.register_local_bytes(
+            data=b"original binary payload",
+            artifact_type="generation_log",
+            dependency_fingerprint="run:artifact-snapshot",
+            relative_path="assets/logs/registered.bin",
+            artifact_id="artifact_binary_postlink_race",
+        )
+    assert _counts(handle.database_path) == previous
+    with pytest.raises(ArtifactNotFoundError):
+        repo.get("artifact_binary_postlink_race")
+
+def test_issue417_same_bytes_new_inode_is_not_original_published_artifact(
+    work, monkeypatch,
+) -> None:
+    """A final pathname replaced with equal bytes is not the linked temp inode."""
+    repo, handle = work
+    baseline = _counts(handle.database_path)
+    original = artifacts_module._publish_exclusive
+
+    def replace_with_identical_bytes(temp: Path, target: Path) -> None:
+        original(temp, target)
+        new_file = target.with_name("not_the_published_inode.png")
+        new_file.write_bytes(target.read_bytes())
+        new_file.replace(target)
+
+    monkeypatch.setattr(
+        artifacts_module, "_publish_exclusive", replace_with_identical_bytes,
+    )
+    with pytest.raises(ArtifactIntegrityError):
+        _register(repo, artifact_id="artifact_same_bytes_new_inode")
+    assert _counts(handle.database_path) == baseline
+    with pytest.raises(ArtifactNotFoundError):
+        repo.get("artifact_same_bytes_new_inode")
+
+
+def test_issue417_final_bytes_modified_after_artifact_row_insert_are_rolled_back(
+    work, monkeypatch,
+) -> None:
+    """Validation must be inside the Work write transaction, near its commit."""
+    repo, handle = work
+    baseline = _counts(handle.database_path)
+    original = artifacts_module.create_work_entity_revision
+    injected = []
+
+    def modify_before_commit(conn, **kwargs):
+        result = original(conn, **kwargs)
+        published = handle.root / "assets" / "panels" / "reveal.png"
+        assert conn.in_transaction
+        assert conn.execute(
+            "SELECT COUNT(*) FROM artifacts WHERE id = ?",
+            ("artifact_changed_inside_transaction",),
+        ).fetchone()[0] == 1
+        published.write_bytes(b"modified after the Artifact row was staged")
+        injected.append(True)
+        return result
+
+    monkeypatch.setattr(
+        artifacts_module, "create_work_entity_revision", modify_before_commit,
+    )
+    with pytest.raises(ArtifactIntegrityError):
+        _register(repo, artifact_id="artifact_changed_inside_transaction")
+    assert injected == [True]
+    assert _counts(handle.database_path) == baseline
+    with pytest.raises(ArtifactNotFoundError):
+        repo.get("artifact_changed_inside_transaction")
+
+
+def test_issue417_postpublication_symlink_swap_is_not_committed(
+    work, monkeypatch, tmp_path: Path,
+) -> None:
+    """A replaced final-path symlink never becomes a READY Artifact."""
+    repo, handle = work
+    baseline = _counts(handle.database_path)
+    outside = tmp_path / "outside.png"
+    outside.write_bytes(_png())
+    original = artifacts_module._publish_exclusive
+
+    def swap_final_with_symlink(temp: Path, target: Path) -> None:
+        original(temp, target)
+        target.unlink()
+        try:
+            target.symlink_to(outside)
+        except OSError as exc:
+            pytest.skip(f"symlink privilege unavailable: {exc}")
+
+    monkeypatch.setattr(
+        artifacts_module, "_publish_exclusive", swap_final_with_symlink,
+    )
+    with pytest.raises(ArtifactIntegrityError):
+        _register(repo, artifact_id="artifact_postpublication_link")
+    assert outside.read_bytes() == _png()
+    assert _counts(handle.database_path) == baseline
+    with pytest.raises(ArtifactNotFoundError):
+        repo.get("artifact_postpublication_link")
