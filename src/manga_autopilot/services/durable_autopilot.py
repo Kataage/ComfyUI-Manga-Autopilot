@@ -327,15 +327,24 @@ class DurableAutopilotOrchestrator:
             while True:
                 await asyncio.sleep(period)
                 try:
-                    await _run_owned_durable_sqlite(self.repository.heartbeat_lease,
-                        work_id=self.work_id, lease_owner=owner,
-                        ttl_seconds=self.lease_ttl_seconds,
-                    )
-                    await _run_owned_durable_sqlite(self.repository.heartbeat_run, run_id, lease_owner=owner)
-                    if active_step_id is not None:
-                        await _run_owned_durable_sqlite(self.repository.heartbeat_step,
-                            active_step_id, lease_owner=owner,
+                    # Keep lease -> Run -> active Step renewal contiguous in
+                    # one owned worker. The loop remains responsive during the
+                    # blocking I/O, without yielding between these updates.
+                    def renew_one_cycle() -> None:
+                        self.repository.heartbeat_lease(
+                            work_id=self.work_id, lease_owner=owner,
+                            ttl_seconds=self.lease_ttl_seconds,
                         )
+                        self.repository.heartbeat_run(
+                            run_id, lease_owner=owner,
+                        )
+                        step_to_renew = active_step_id
+                        if step_to_renew is not None:
+                            self.repository.heartbeat_step(
+                                step_to_renew, lease_owner=owner,
+                            )
+
+                    await _run_owned_durable_sqlite(renew_one_cycle)
                 except Exception as exc:
                     raise DurableHeartbeatLostError(
                         "durable Work lease heartbeat renewal failed"
@@ -578,13 +587,14 @@ class DurableAutopilotOrchestrator:
             # outside the per-hook cancellation handler. Their workers are
             # drained before reaching this point. Reconcile any still-RUNNING
             # Step/Run under our live Work lease before trying to release it.
-            if lease_acquired.is_set():
+            # Pre-Step cancellation retains a RUNNING Run and its lease as
+            # explicit recovery evidence (existing #382 safety contract).
+            # Only a start_step that was actually submitted is reconciled here.
+            if lease_acquired.is_set() and pending_start_step_id is not None:
                 try:
-                    interrupted_step_id = active_step_id or pending_start_step_id
-                    if interrupted_step_id is not None:
-                        try:
-                            await _run_owned_durable_sqlite(
-                                self.repository.finish_step, interrupted_step_id,
+                    try:
+                        await _run_owned_durable_sqlite(
+                            self.repository.finish_step, pending_start_step_id,
                                 status="INTERRUPTED",
                                 error={"reason": "task_cancelled"},
                                 lease_owner=owner,
