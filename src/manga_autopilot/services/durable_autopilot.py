@@ -440,11 +440,14 @@ class DurableAutopilotOrchestrator:
                     )
 
                 # No untracked result is treated as successful completion.
+                # Track the intended Step before yielding to a worker:
+                # cancellation may land after start_step commits but before
+                # its asyncio waiter observes the completed result.
+                active_step_id = str(step["id"])
                 await _run_owned_durable_sqlite(self.repository.start_step,
                     step["id"], input_fingerprint=fingerprint,
                     lease_owner=owner,
                 )
-                active_step_id = str(step["id"])
                 machine.advance(reason=hook_name)
                 memory_step = run.record_step(hook_name, target_state)
                 run.log_event("step_started", {"step": hook_name})
@@ -565,6 +568,35 @@ class DurableAutopilotOrchestrator:
             # Finalization already ran under the live lease, as the last
             # durable RunStep. Never run filesystem mutation after COMPLETED.
             return run
+        except asyncio.CancelledError:
+            # New await points exist in setup, Run/Step writes and completion,
+            # outside the per-hook cancellation handler. Their workers are
+            # drained before reaching this point. Reconcile any still-RUNNING
+            # Step/Run under our live Work lease before trying to release it.
+            if lease_acquired.is_set():
+                try:
+                    if active_step_id is not None:
+                        try:
+                            await _run_owned_durable_sqlite(
+                                self.repository.finish_step, active_step_id,
+                                status="INTERRUPTED",
+                                error={"reason": "task_cancelled"},
+                                lease_owner=owner,
+                            )
+                        except DurableRunStateError:
+                            # A cancellation racing a completed Step should
+                            # not rewrite a terminal, persisted receipt.
+                            pass
+                    await _run_owned_durable_sqlite(
+                        self.repository.transition_run, run_id,
+                        expected_status="RUNNING", new_status="INTERRUPTED",
+                        lease_owner=owner,
+                    )
+                except (WorkLeaseConflictError, DurableRunStateError):
+                    # Ownership lost or Run not RUNNING: fail closed and
+                    # preserve its explicit recovery evidence.
+                    pass
+            raise
         except DurableHeartbeatLostError:
             # Lease failure can also be noticed between stages, with no
             # active Step. The Run must not be left as a normal success.
