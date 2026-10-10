@@ -8,6 +8,7 @@ import os
 import shutil
 import sqlite3
 import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -2320,3 +2321,101 @@ def test_recovery_refuses_orphan_with_symlinked_critical_database(
     with pytest.raises(WorkRecoveryError, match="invalid orphan"):
         repository.reconcile_orphan_work("work_orphan")
     assert outside.read_bytes() == before
+
+
+def test_issue403_concurrent_atomic_manifest_writers_use_private_temporaries(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Concurrent independent JSON publishers must never share a temp inode."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    path = tmp_path / "manifest.json"
+    ready = threading.Barrier(2, timeout=25)
+    source_names: list[str] = []
+    publishing = threading.Lock()
+    original_replace = lifecycle_module.os.replace
+
+    def synchronize_publication(source: object, destination: object) -> None:
+        if Path(destination) == path:
+            # Fails if two different paths are published simultaneously on
+            # Windows, even when exclusive private temporary files exist.
+            assert publishing.acquire(blocking=False), "unserialized publication"
+            try:
+                source_names.append(Path(source).name)
+                time.sleep(0.05)
+                original_replace(source, destination)
+            finally:
+                publishing.release()
+        else:
+            original_replace(source, destination)
+
+    def publish_once() -> None:
+        ready.wait()
+        lifecycle_module._write_json_atomic(path, {"version": 2})
+
+    monkeypatch.setattr(lifecycle_module.os, "replace", synchronize_publication)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [pool.submit(publish_once) for _ in range(2)]
+        for future in futures:
+            future.result(timeout=30)
+
+    assert len(source_names) == 2
+    assert source_names[0] != source_names[1], (
+        "each concurrent publisher must own its exclusive temporary pathname"
+    )
+    assert json.loads(path.read_text(encoding="utf-8")) == {"version": 2}
+    assert not list(tmp_path.glob("manifest.json.*.tmp"))
+
+
+def test_issue403_parallel_work_open_with_forced_refresh_has_no_temp_collision(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Synchronize two valid Work opens before and during manifest publication."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    previous = WorkLifecycleRepository(tmp_path, app_version="previous")
+    created = previous.create_work(
+        work_id="work_parallel_refresh", title="Concurrent Manifest Refresh",
+    )
+    current = WorkLifecycleRepository(tmp_path, app_version="current")
+    entering_writer = threading.Barrier(2, timeout=25)
+    publishing = threading.Lock()
+    source_names: list[str] = []
+    original_write = lifecycle_module._write_json_atomic
+    original_replace = lifecycle_module.os.replace
+
+    def synchronized_writer(path: Path, payload: dict[str, object]) -> None:
+        if path == created.manifest_path:
+            entering_writer.wait()
+        original_write(path, payload)
+
+    def synchronized_replace(source: object, destination: object) -> None:
+        if Path(destination) == created.manifest_path:
+            assert publishing.acquire(blocking=False), "unserialized Work refresh"
+            try:
+                source_names.append(Path(source).name)
+                time.sleep(0.05)
+                original_replace(source, destination)
+            finally:
+                publishing.release()
+        else:
+            original_replace(source, destination)
+
+    monkeypatch.setattr(lifecycle_module, "_write_json_atomic", synchronized_writer)
+    monkeypatch.setattr(lifecycle_module.os, "replace", synchronized_replace)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [
+            pool.submit(current.open_work, "work_parallel_refresh")
+            for _ in range(2)
+        ]
+        opened = [future.result(timeout=30) for future in futures]
+
+    assert len(opened) == 2
+    assert all(handle.work_id == "work_parallel_refresh" for handle in opened)
+    assert len(source_names) == 2
+    assert source_names[0] != source_names[1]
+    assert json.loads(created.manifest_path.read_text(encoding="utf-8"))[
+        "app_version"
+    ] == "current"
+    assert not list(created.root.glob("manifest.json.*.tmp"))

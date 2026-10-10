@@ -11,7 +11,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from tempfile import TemporaryDirectory
+from tempfile import NamedTemporaryFile, TemporaryDirectory
 from typing import Any
 
 from manga_autopilot.primitives import new_id, sha256_file
@@ -301,27 +301,93 @@ def _durable_move_directory(source: Path, destination: Path) -> None:
         _fsync_directory(destination.parent)
 
 
+@contextmanager
+def _json_publication_lock(path: Path) -> Iterator[None]:
+    """Serialize final replacement across processes on Windows and POSIX.
+
+    The lock filename stays persistent: unlinking it on release could let a
+    second process lock a new inode while a first writer still owns the old
+    one. Slow serialization and file fsync happen before taking this lock.
+    """
+    lock_path = path.with_name(path.name + ".publish.lock")
+    assert_managed_regular_file(
+        lock_path,
+        containment_root=path.parent,
+        field_name="JSON publication lock",
+        allow_missing=True,
+    )
+    with lock_path.open("a+b") as handle:
+        handle.seek(0, os.SEEK_END)
+        if handle.tell() == 0:
+            handle.write(b"0")
+            handle.flush()
+        handle.seek(0)
+        if os.name == "nt":
+            import msvcrt
+
+            msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            handle.seek(0)
+            if os.name == "nt":
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
 def _write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
     if path.is_symlink():
         raise WorkManifestError(f"refusing to replace symlinked JSON file: {path}")
     path.parent.mkdir(parents=True, exist_ok=True)
-    temp = path.with_name(path.name + ".tmp")
-    if temp.is_symlink():
-        raise WorkManifestError(f"refusing to use symlinked temp file: {temp}")
     data = (
         json.dumps(payload, ensure_ascii=False, sort_keys=True, indent=2) + "\n"
     ).encode("utf-8")
+
+    # Each concurrent opener must own its own same-directory temp file.
+    # NamedTemporaryFile uses exclusive creation and unpredictable names,
+    # preventing truncation, rename and cleanup races over a shared .tmp.
+    # Close the temporary handle before os.replace for Windows compatibility.
+    temp: Path | None = None
     try:
-        with temp.open("wb") as handle:
+        with NamedTemporaryFile(
+            mode="wb",
+            dir=path.parent,
+            prefix=f"{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            temp = Path(handle.name)
             handle.write(data)
             handle.flush()
             os.fsync(handle.fileno())
-        os.replace(temp, path)
-        _fsync_directory(path.parent)
-    finally:
-        if temp.exists():
-            temp.unlink()
 
+        # Never publish a replaced symlink or overwrite a newly substituted
+        # symlink at the destination; the exclusive initial create excludes
+        # preexisting symlinks at the unpredictable temporary name.
+        if temp.is_symlink():
+            raise WorkManifestError(f"refusing to publish symlinked temp file: {temp}")
+        # A private source is not enough on Windows: simultaneous replacements
+        # of the SAME destination can raise WinError 5. Hold a persistent
+        # cross-process file lock only around publication and its fsync.
+        with _json_publication_lock(path):
+            if path.is_symlink():
+                raise WorkManifestError(f"refusing to replace symlinked JSON file: {path}")
+            os.replace(temp, path)
+            _fsync_directory(path.parent)
+    finally:
+        # Cleanup is strictly scoped to our invocation's temporary path. Never
+        # unlink a symlink supplied by an unrelated actor during a race.
+        if temp is not None and not temp.is_symlink():
+            try:
+                temp.unlink(missing_ok=True)
+            except OSError:
+                # A secondary cleanup error must not mask the original failure.
+                pass
 
 def _read_manifest(path: Path) -> dict[str, Any]:
     if path.is_symlink():
