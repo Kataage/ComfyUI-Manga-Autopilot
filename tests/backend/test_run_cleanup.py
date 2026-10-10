@@ -319,3 +319,53 @@ async def test_cleanup_api_returns_404_for_missing_project(
         json={},
     )
     assert cleanup_resp.status == 404
+
+@pytest.mark.parametrize(
+    "became_protected",
+    ["running_after_plan", "latest_after_plan", "replaced_by_running_run"],
+)
+def test_phase_c_independent_audit_cleanup_revalidates_protection_before_deletion(
+    tmp_path: Path, became_protected: str,
+) -> None:
+    """A cleanup plan cannot delete a run newly protected before execution.
+
+    This test-only Phase C audit uses public cleanup service entrypoints.
+    Deliberately freeze the candidate plan, change authoritative run status,
+    latest-run reference, or directory identity, then execute. The default
+    policy protects RUNNING and latest runs even if plan data is stale.
+    Expected RED on merged post-#413 develop without any production change.
+    """
+    project = tmp_path / "proj"
+    project.mkdir()
+    older = _create_fake_run(project, "run_001", "COMPLETED")
+    _create_fake_run(project, "run_002", "COMPLETED")
+    latest = project / "latest_run_id.txt"
+    latest.write_text("run_002", encoding="utf-8")
+
+    plan = build_run_cleanup_plan(
+        project, RunCleanupPolicy(keep_last=0, dry_run=False),
+    )
+    assert [c.run_id for c in plan.candidates] == ["run_001"]
+    assert older.is_dir()
+
+    if became_protected == "running_after_plan":
+        data = json.loads((older / "run.json").read_text(encoding="utf-8"))
+        data["status"] = "RUNNING"
+        (older / "run.json").write_text(json.dumps(data), encoding="utf-8")
+    elif became_protected == "latest_after_plan":
+        latest.write_text("run_001", encoding="utf-8")
+    else:
+        # A replacement under the same pathname is not the Work/Run that
+        # was originally inspected. Do not delete this newly active Run.
+        retired = project / "runs" / "retired_run_001"
+        older.rename(retired)
+        newer = _create_fake_run(project, "run_001", "RUNNING")
+        assert newer == older
+
+    result = execute_run_cleanup_plan(plan)
+    assert older.is_dir(), (
+        "cleanup deleted the current RUNNING/latest/replacement Run "
+        f"after its snapshot became stale: {became_protected}"
+    )
+    assert "run_001" not in result.deleted_run_ids
+    assert "run_001" in result.skipped_run_ids
