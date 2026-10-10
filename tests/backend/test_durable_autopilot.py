@@ -742,13 +742,16 @@ async def test_failed_work_lease_heartbeat_drains_sync_hook_before_interrupting(
     effects = tmp_path / "heartbeat-effect.txt"
 
     class BrokenRenewalRepository(DurableRunRepository):
-        def heartbeat_lease(self, *, work_id, lease_owner, ttl_seconds):
-            # Under concurrent Windows CI load, the guardian can tick
-            # before the sync thread starts; inject loss only IN-FLIGHT.
+        def heartbeat_owned_cycle(
+            self, *, work_id, run_id, lease_owner, ttl_seconds, step_id=None,
+        ):
+            # Inject a fault in the atomic lease/Run/Step renewal only while
+            # the synchronous stage worker is active.
             if not started.is_set():
-                return super().heartbeat_lease(
-                    work_id=work_id, lease_owner=lease_owner,
-                    ttl_seconds=ttl_seconds,
+                return super().heartbeat_owned_cycle(
+                    work_id=work_id, run_id=run_id,
+                    lease_owner=lease_owner, ttl_seconds=ttl_seconds,
+                    step_id=step_id,
                 )
             failed.set()
             raise OSError("injected lease renewal IO failure")
@@ -929,7 +932,9 @@ async def test_lease_guardian_failure_cancels_native_async_hook(
     hook_cancelled = asyncio.Event()
 
     class BrokenRenewalRepository(DurableRunRepository):
-        def heartbeat_lease(self, *, work_id, lease_owner, ttl_seconds):
+        def heartbeat_owned_cycle(
+            self, *, work_id, run_id, lease_owner, ttl_seconds, step_id=None,
+        ):
             failed.set()
             raise OSError("injected transient DB failure")
 
@@ -1075,10 +1080,17 @@ async def test_failed_step_heartbeat_stops_guardian_and_does_not_claim_success(
     completed = threading.Event()
 
     class FailStepHeartbeatRepository(DurableRunRepository):
-        def heartbeat_step(self, step_id, *, lease_owner):
-            # Fault starts only once the local worker has entered its hook.
-            if not started.is_set():
-                return super().heartbeat_step(step_id, lease_owner=lease_owner)
+        def heartbeat_owned_cycle(
+            self, *, work_id, run_id, lease_owner, ttl_seconds, step_id=None,
+        ):
+            # The durable guardian now renews all three receipts in one
+            # transaction. Inject Step failure only for an active attempt.
+            if step_id is None or not started.is_set():
+                return super().heartbeat_owned_cycle(
+                    work_id=work_id, run_id=run_id,
+                    lease_owner=lease_owner, ttl_seconds=ttl_seconds,
+                    step_id=step_id,
+                )
             attempted.set()
             raise OSError("injected RunStep heartbeat storage failure")
 
@@ -1362,12 +1374,18 @@ async def test_finalization_heartbeat_failure_drains_and_records_interruption(
     lost = threading.Event()
 
     class FailDuringFinalize(DurableRunRepository):
-        def heartbeat_step(self, step_id, *, lease_owner):
-            step = self.get_step(step_id)
-            if step["step_key"] == "finalize" and entered.is_set():
+        def heartbeat_owned_cycle(
+            self, *, work_id, run_id, lease_owner, ttl_seconds, step_id=None,
+        ):
+            step = self.get_step(step_id) if step_id is not None else None
+            if step is not None and step["step_key"] == "finalize" and entered.is_set():
                 lost.set()
                 raise OSError("injected finalization heartbeat failure")
-            return super().heartbeat_step(step_id, lease_owner=lease_owner)
+            return super().heartbeat_owned_cycle(
+                work_id=work_id, run_id=run_id,
+                lease_owner=lease_owner, ttl_seconds=ttl_seconds,
+                step_id=step_id,
+            )
 
     # The test isolates a deliberately injected step heartbeat error, not
     # an unrelated wall-clock Work-lease expiry under slow Windows scheduling.
@@ -1826,7 +1844,7 @@ async def test_issue407_slow_lease_renewal_does_not_block_guardian_event_loop(
     release_heartbeat = threading.Event()
     pulse = threading.Event()
     observed: dict[str, bool] = {}
-    real_heartbeat = DurableRunRepository.heartbeat_lease
+    real_heartbeat = DurableRunRepository.heartbeat_owned_cycle
 
     def delayed_heartbeat(self, *args, **kwargs):
         entered_heartbeat.set()
@@ -1850,7 +1868,7 @@ async def test_issue407_slow_lease_renewal_does_not_block_guardian_event_loop(
         finally:
             release_heartbeat.set()
 
-    monkeypatch.setattr(DurableRunRepository, "heartbeat_lease", delayed_heartbeat)
+    monkeypatch.setattr(DurableRunRepository, "heartbeat_owned_cycle", delayed_heartbeat)
     watcher = threading.Thread(target=independent_tick, daemon=True)
     watcher.start()
     runner_instance = DurableAutopilotOrchestrator(
@@ -1970,7 +1988,7 @@ async def test_issue407_pending_step_is_not_heartbeated_until_start_is_durable(
     first_run_tick = threading.Event()
     release = threading.Event()
     actual_start = DurableRunRepository.start_step
-    actual_heartbeat_run = DurableRunRepository.heartbeat_run
+    actual_heartbeat_run = DurableRunRepository.heartbeat_owned_cycle
 
     def slow_first_start(self, *args, **kwargs):
         if not entered.is_set():
@@ -1993,7 +2011,7 @@ async def test_issue407_pending_step_is_not_heartbeated_until_start_is_durable(
 
     monkeypatch.setattr(DurableRunRepository, "start_step", slow_first_start)
     monkeypatch.setattr(
-        DurableRunRepository, "heartbeat_run", observe_run_heartbeat,
+        DurableRunRepository, "heartbeat_owned_cycle", observe_run_heartbeat,
     )
     watcher = threading.Thread(target=release_after_guardian_tick, daemon=True)
     watcher.start()
