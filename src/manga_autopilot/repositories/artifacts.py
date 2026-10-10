@@ -31,8 +31,8 @@ from manga_autopilot.storage import (
     repository_write,
     validate_work_id,
 )
-from manga_autopilot.storage.repository import assert_work_mutation_allowed
 from manga_autopilot.storage.paths import UnsafeStoragePathError
+from manga_autopilot.storage.repository import assert_work_mutation_allowed
 
 _IMAGE_FORMATS = {
     "image/png": "PNG",
