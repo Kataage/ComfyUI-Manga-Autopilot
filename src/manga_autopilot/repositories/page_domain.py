@@ -340,8 +340,23 @@ class PageRepository:
         with repository_write(self.database_path) as conn:
             # Reject even no-op editor requests during exclusive Work mutation.
             assert_work_mutation_allowed(conn)
+            entity_id = _id(page_id, "page_id")
+            existing = _read_row(conn, "pages", entity_id)
+            _positive(expected_revision, "expected_revision")
+            assert_expected_revision(
+                entity_type="pages", entity_id=entity_id,
+                expected_revision=expected_revision,
+                actual_revision=existing["revision"],
+            )
+            # An archived Page is immutable except for deliberate unarchive.
+            # Check under the same BEGIN IMMEDIATE lock as the edit; never
+            # permit an ordinary semantic write or no-op to bypass the fence.
+            if existing["archived_at"] is not None and attrs != {"archived_at": None}:
+                raise PageDomainArchivedError(
+                    f"Page {entity_id} is archived; unarchive before editing."
+                )
             record, _ = _patch(
-                conn, "pages", _id(page_id, "page_id"),
+                conn, "pages", entity_id,
                 expected_revision=expected_revision, attrs=attrs,
             )
             return record
@@ -714,6 +729,13 @@ class PanelRepository:
                 actual_revision=existing["revision"],
             )
             _require_active_page(conn, existing["page_id"])
+            # Parent Page and this Panel have independent archive lifecycles.
+            # Only an explicit, revision-guarded unarchive may mutate an
+            # already archived Panel; mixed recovery/edit and no-ops fail.
+            if existing["archived_at"] is not None and attrs != {"archived_at": None}:
+                raise PageDomainPanelArchivedError(
+                    f"Panel {panel_id} is archived; unarchive before editing."
+                )
             if "selected_candidate_id" in attrs:
                 _validate_selected_candidate(
                     conn, panel_id, attrs["selected_candidate_id"]
