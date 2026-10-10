@@ -660,3 +660,97 @@ def test_issue411_archived_page_rejects_even_noop_child_updates(
             )
         assert layouts.get_slot("slot_001") == record
     assert _commits(pages) == before
+
+@pytest.mark.parametrize("scope", ["page", "panel"])
+@pytest.mark.parametrize("noop", [False, True])
+def test_phase_c_independent_audit_archived_entity_rejects_direct_nonrecovery_updates(
+    repositories, scope: str, noop: bool,
+) -> None:
+    """Archived entities must be read-only until an explicit unarchive command.
+
+    Unlike #411's archived *parent* child-write fence, this exercises the
+    public direct Page/Panel repositories with a non-archival semantic edit or
+    a no-op update against an entity whose own archived_at is already set.
+    Expected RED on the frozen merged post-#411 develop; no production edits.
+    """
+    from manga_autopilot.repositories.page_domain import PageDomainArchivedError
+
+    pages, _, panels = repositories
+    _setup(repositories)
+    if scope == "page":
+        entity = pages.get_page("page_001")
+        archived = pages.update_page(
+            "page_001", expected_revision=entity["revision"],
+            archived_at="2026-10-11T02:00:00Z",
+        )
+        error_type = PageDomainArchivedError
+        payload = {"page_purpose": (
+            archived["page_purpose"] if noop else "hidden page mutation"
+        )}
+
+        def attempt() -> dict:
+            return pages.update_page(
+                "page_001", expected_revision=archived["revision"], **payload,
+            )
+
+        def read() -> dict:
+            return pages.get_page("page_001")
+
+        def unarchive() -> dict:
+            return pages.update_page(
+                "page_001", expected_revision=archived["revision"],
+                archived_at=None,
+            )
+    else:
+        entity = panels.get_panel("panel_001")
+        archived = panels.update_panel(
+            "panel_001", expected_revision=entity["revision"],
+            archived_at="2026-10-11T02:00:00Z",
+        )
+        error_type = PageDomainPanelArchivedError
+        payload = {"panel_purpose": (
+            archived["panel_purpose"] if noop else "hidden panel mutation"
+        )}
+
+        def attempt() -> dict:
+            return panels.update_panel(
+                "panel_001", expected_revision=archived["revision"], **payload,
+            )
+
+        def read() -> dict:
+            return panels.get_panel("panel_001")
+
+        def unarchive() -> dict:
+            return panels.update_panel(
+                "panel_001", expected_revision=archived["revision"],
+                archived_at=None,
+            )
+
+    with repository_read(pages.database_path) as connection:
+        before_ledger = tuple(
+            connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+            for table in ("commits", "entity_revisions", "invalidations")
+        )
+
+    with pytest.raises(error_type, match="archived|unarchive"):
+        attempt()
+
+    assert read() == archived, "archived entity changed despite rejection"
+    with repository_read(pages.database_path) as connection:
+        after_ledger = tuple(
+            connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+            for table in ("commits", "entity_revisions", "invalidations")
+        )
+    assert after_ledger == before_ledger, (
+        "archived direct writes must not change commit/revision/invalidation history"
+    )
+
+    reopened = unarchive()
+    assert reopened["archived_at"] is None
+    accepted = (
+        pages.update_page("page_001", expected_revision=reopened["revision"], **payload)
+        if scope == "page" else
+        panels.update_panel("panel_001", expected_revision=reopened["revision"], **payload)
+    )
+    assert accepted["archived_at"] is None
+    assert accepted["revision"] == reopened["revision"] + (0 if noop else 1)
