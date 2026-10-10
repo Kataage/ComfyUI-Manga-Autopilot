@@ -572,6 +572,21 @@ def _validate_manifest(
         raise WorkManifestError(str(exc)) from exc
 
 
+def _backup_recovery_work_database(
+    source: sqlite3.Connection,
+    destination: sqlite3.Connection,
+) -> None:
+    """Back up a consistent SQLite view while keeping corrupt-DB diagnostics."""
+    try:
+        source.backup(destination, pages=64, sleep=0.05)
+    except sqlite3.DatabaseError as exc:
+        if "file is not a database" in str(exc):
+            raise WorkRecoveryError(
+                f"not a readable SQLite database: {exc}"
+            ) from exc
+        raise
+
+
 @contextmanager
 def _recovery_validation_snapshot(root: Path) -> Iterator[Path]:
     """Copy recovery-critical SQLite inputs so scanning cannot mutate evidence."""
@@ -627,8 +642,8 @@ def _recovery_validation_snapshot(root: Path) -> Iterator[Path]:
             try:
                 target_connection = sqlite3.connect(snapshot_db)
                 try:
-                    source_connection.backup(
-                        target_connection, pages=64, sleep=0.05,
+                    _backup_recovery_work_database(
+                        source_connection, target_connection,
                     )
                 finally:
                     target_connection.close()
@@ -645,8 +660,8 @@ def _recovery_validation_snapshot(root: Path) -> Iterator[Path]:
             with repository_read(database_path) as source_connection:
                 target_connection = sqlite3.connect(snapshot_db)
                 try:
-                    source_connection.backup(
-                        target_connection, pages=64, sleep=0.05,
+                    _backup_recovery_work_database(
+                        source_connection, target_connection,
                     )
                 finally:
                     target_connection.close()
