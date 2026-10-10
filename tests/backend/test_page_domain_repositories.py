@@ -563,6 +563,11 @@ def test_phase_c_independent_audit_archived_page_rejects_child_mutations(
         archived_at="2026-10-11T00:00:00Z",
     )
     before_commits = _commits(pages)
+    with repository_read(pages.database_path) as connection:
+        before_ledger = tuple(
+            connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+            for table in ("commits", "entity_revisions", "invalidations")
+        )
     original_page = pages.get_page(target_page)
     original_panel = panels.get_panel("panel_001")
     original_slot = layouts.get_slot("slot_001")
@@ -600,6 +605,58 @@ def test_phase_c_independent_audit_archived_page_rejects_child_mutations(
     assert _commits(pages) == before_commits, (
         "archived child mutation must not append a Work commit"
     )
+    with repository_read(pages.database_path) as connection:
+        after_ledger = tuple(
+            connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+            for table in ("commits", "entity_revisions", "invalidations")
+        )
+    assert after_ledger == before_ledger, (
+        "failed archived-Page mutations cannot append revisions or invalidations"
+    )
     assert pages.get_page(target_page) == original_page
     assert panels.get_panel("panel_001") == original_panel
     assert layouts.get_slot("slot_001") == original_slot
+
+    # Recovery/unarchive is deliberate and must restore ordinary child writes.
+    released = pages.update_page(
+        target_page, expected_revision=original_page["revision"], archived_at=None,
+    )
+    assert released["archived_at"] is None
+    mutate_archived_child()
+    assert _commits(pages) == before_commits + 2, (
+        "exactly one Work commit to unarchive and one for the successful child edit"
+    )
+
+
+@pytest.mark.parametrize("operation", ["update_panel", "update_slot"])
+def test_issue411_archived_page_rejects_even_noop_child_updates(
+    repositories, operation: str,
+) -> None:
+    """No-op write paths must still respect an archived parent Page."""
+    from manga_autopilot.repositories.page_domain import PageDomainArchivedError
+
+    pages, layouts, panels = repositories
+    _setup(repositories)
+    page = pages.get_page("page_001")
+    pages.update_page(
+        "page_001", expected_revision=page["revision"],
+        archived_at="2026-10-11T00:00:00Z",
+    )
+    before = _commits(pages)
+    if operation == "update_panel":
+        record = panels.get_panel("panel_001")
+        with pytest.raises(PageDomainArchivedError, match="archived|unarchive"):
+            panels.update_panel(
+                "panel_001", expected_revision=record["revision"],
+                panel_purpose=record["panel_purpose"],
+            )
+        assert panels.get_panel("panel_001") == record
+    else:
+        record = layouts.get_slot("slot_001")
+        with pytest.raises(PageDomainArchivedError, match="archived|unarchive"):
+            layouts.update_slot(
+                "slot_001", expected_revision=record["revision"],
+                semantic_json=json.loads(record["semantic_json"]),
+            )
+        assert layouts.get_slot("slot_001") == record
+    assert _commits(pages) == before
