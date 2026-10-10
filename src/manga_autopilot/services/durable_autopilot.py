@@ -316,6 +316,7 @@ class DurableAutopilotOrchestrator:
 
         heartbeat_task: asyncio.Task[None] | None = None
         active_step_id: str | None = None
+        pending_start_step_id: str | None = None
 
         async def renew_lease() -> None:
             # Running ComfyUI hooks can exceed one lease TTL. Refresh the
@@ -443,11 +444,15 @@ class DurableAutopilotOrchestrator:
                 # Track the intended Step before yielding to a worker:
                 # cancellation may land after start_step commits but before
                 # its asyncio waiter observes the completed result.
-                active_step_id = str(step["id"])
+                pending_start_step_id = str(step["id"])
                 await _run_owned_durable_sqlite(self.repository.start_step,
                     step["id"], input_fingerprint=fingerprint,
                     lease_owner=owner,
                 )
+                # A PENDING Step cannot be heartbeated yet. Only expose it
+                # to the guardian after start_step's transaction commits.
+                active_step_id = pending_start_step_id
+                pending_start_step_id = None
                 machine.advance(reason=hook_name)
                 memory_step = run.record_step(hook_name, target_state)
                 run.log_event("step_started", {"step": hook_name})
@@ -575,10 +580,11 @@ class DurableAutopilotOrchestrator:
             # Step/Run under our live Work lease before trying to release it.
             if lease_acquired.is_set():
                 try:
-                    if active_step_id is not None:
+                    interrupted_step_id = active_step_id or pending_start_step_id
+                    if interrupted_step_id is not None:
                         try:
                             await _run_owned_durable_sqlite(
-                                self.repository.finish_step, active_step_id,
+                                self.repository.finish_step, interrupted_step_id,
                                 status="INTERRUPTED",
                                 error={"reason": "task_cancelled"},
                                 lease_owner=owner,
