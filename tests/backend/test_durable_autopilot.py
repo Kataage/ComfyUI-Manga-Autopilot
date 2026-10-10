@@ -1913,3 +1913,44 @@ async def test_issue407_cancelled_lease_acquisition_drains_and_releases_owner(
         "cancelled acquisition created a live lease that no Run owns"
     )
     assert repo.get_run(run_id)["status"] == "PENDING"
+
+
+@pytest.mark.asyncio
+async def test_issue407_cancelled_start_step_waits_for_commit_then_interrupts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A cancelled RunStep startup drains its DB write before reconciliation."""
+    db = work(tmp_path)
+    repo = DurableRunRepository(db)
+    run_id = start(repo)
+    entered = threading.Event()
+    release = threading.Event()
+    real_start = DurableRunRepository.start_step
+
+    def blocked_start(self, *args, **kwargs):
+        entered.set()
+        if not release.wait(timeout=12):
+            raise TimeoutError("controlled RunStep startup was never released")
+        return real_start(self, *args, **kwargs)
+
+    monkeypatch.setattr(DurableRunRepository, "start_step", blocked_start)
+    task = asyncio.create_task(runner(repo, OrchestratorHooks()).execute(
+        run_id, input_payload={}, step_inputs={}, lease_owner="cancel_start",
+    ))
+    try:
+        assert await asyncio.to_thread(entered.wait, 10)
+        task.cancel()
+        await asyncio.sleep(0.05)
+        task.cancel()
+        await asyncio.sleep(0.05)
+        assert not task.done(), "cancelled RunStep detached its sqlite worker"
+        assert repo.inspect_lease("work_246") is not None
+    finally:
+        release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, timeout=20)
+    assert repo.inspect_lease("work_246") is None
+    assert repo.get_run(run_id)["status"] == "INTERRUPTED"
+    steps = repo.list_steps(run_id)
+    assert any(step["status"] == "INTERRUPTED" for step in steps)
+    assert not any(step["status"] == "RUNNING" for step in steps)
