@@ -763,6 +763,86 @@ class DurableRunRepository:
                 "SELECT * FROM work_leases WHERE work_id = ?", (work_id,)
             ).fetchone())
 
+    def heartbeat_owned_cycle(
+        self, *,
+        work_id: str,
+        run_id: str,
+        lease_owner: str,
+        ttl_seconds: int,
+        step_id: str | None = None,
+    ) -> None:
+        """Atomically renew the active Work lease, Run and optional RunStep.
+
+        Durable Autopilot may run the heartbeat in an OS worker while another
+        worker finishes a Step. All three receipts must have one visible
+        timestamp/commit, never an observable lease-only partial renewal.
+        A Step which committed a terminal status before this transaction is
+        already finished and needs no heartbeat. Other mismatches fail closed.
+        """
+        _required(work_id, "work_id")
+        _required(run_id, "run_id")
+        _required(lease_owner, "lease_owner")
+        if type(ttl_seconds) is not int or ttl_seconds <= 0:
+            raise ValueError("ttl_seconds must be a positive integer")
+        if step_id is not None:
+            _required(step_id, "step_id")
+
+        with repository_write(self.database_path) as conn:
+            # BEGIN IMMEDIATE has acquired the SQLite writer lock. Sample the
+            # clock here, not before any potential busy timeout.
+            now = self._now()
+            lease = conn.execute(
+                "SELECT * FROM work_leases WHERE work_id = ?", (work_id,),
+            ).fetchone()
+            if (
+                lease is None
+                or lease["lease_owner"] != lease_owner
+                or lease["run_id"] != run_id
+                or _utc(datetime.fromisoformat(lease["expires_at"])) <= now
+            ):
+                raise WorkLeaseConflictError(
+                    "mutation lease is missing, lost or expired"
+                )
+            self._assert_owner(conn, run_id, lease_owner)
+
+            renew_step = False
+            if step_id is not None:
+                step = self._get(conn, "run_steps", step_id)
+                if step["run_id"] != run_id:
+                    raise WorkLeaseConflictError("RunStep belongs to another Run")
+                self._assert_run_step_history_mutable(conn, run_id)
+                if step["status"] == "RUNNING":
+                    renew_step = True
+                elif step["status"] not in _STEP_TERMINAL:
+                    # A PENDING or STALE Step must not be mistaken for a live
+                    # attempt; only a committed terminal Step can be skipped.
+                    raise DurableRunStateError("step is not RUNNING")
+
+            timestamp = now.isoformat()
+            conn.execute(
+                """UPDATE work_leases SET heartbeat_at = ?, expires_at = ?
+                   WHERE work_id = ? AND lease_owner = ? AND run_id = ?""",
+                (
+                    timestamp, (now + timedelta(seconds=ttl_seconds)).isoformat(),
+                    work_id, lease_owner, run_id,
+                ),
+            )
+            run_cursor = conn.execute(
+                """UPDATE runs SET heartbeat_at = ?
+                   WHERE id = ? AND status = 'RUNNING' AND lease_owner = ?""",
+                (timestamp, run_id, lease_owner),
+            )
+            if run_cursor.rowcount != 1:
+                raise DurableRunStateError("Run heartbeat owner/state mismatch")
+            if renew_step:
+                step_cursor = conn.execute(
+                    """UPDATE run_steps SET heartbeat_at = ?
+                       WHERE id = ? AND run_id = ? AND status = 'RUNNING'""",
+                    (timestamp, step_id, run_id),
+                )
+                if step_cursor.rowcount != 1:
+                    raise DurableRunStateError("step is not RUNNING")
+
     def release_lease(self, *, work_id: str, lease_owner: str) -> None:
         _required(lease_owner, "lease_owner")
         with repository_write(self.database_path) as conn:
