@@ -6,6 +6,7 @@ import errno
 import json
 import os
 import shutil
+import sqlite3
 from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -571,6 +572,21 @@ def _validate_manifest(
         raise WorkManifestError(str(exc)) from exc
 
 
+def _backup_recovery_work_database(
+    source: sqlite3.Connection,
+    destination: sqlite3.Connection,
+) -> None:
+    """Back up a consistent SQLite view while keeping corrupt-DB diagnostics."""
+    try:
+        source.backup(destination, pages=64, sleep=0.05)
+    except sqlite3.DatabaseError as exc:
+        if "file is not a database" in str(exc):
+            raise WorkRecoveryError(
+                f"not a readable SQLite database: {exc}"
+            ) from exc
+        raise
+
+
 @contextmanager
 def _recovery_validation_snapshot(root: Path) -> Iterator[Path]:
     """Copy recovery-critical SQLite inputs so scanning cannot mutate evidence."""
@@ -592,21 +608,63 @@ def _recovery_validation_snapshot(root: Path) -> Iterator[Path]:
         snapshot_root = Path(temp_dir) / root.name
         snapshot_root.mkdir()
         shutil.copy2(manifest_path, snapshot_root / manifest_path.name)
-        shutil.copy2(database_path, snapshot_root / database_path.name)
 
-        # Copy durable SQLite sidecars that may contain authoritative committed
-        # state. The WAL index (-shm) is transient and is rebuilt in the
-        # writable temporary snapshot rather than copied from recovery evidence.
-        for suffix in ("-wal", "-journal"):
+        # Check potential SQLite sidecar path tricks before asking SQLite to
+        # open the source. Never blindly copy separate generations of the
+        # database and WAL: a concurrent checkpoint can truncate the WAL
+        # between two shutil.copy2 calls, falsely condemning valid Work.
+        for suffix in ("-wal", "-shm", "-journal"):
             source = database_path.with_name(database_path.name + suffix)
-            if not source.exists() and not source.is_symlink():
-                continue
-            assert_managed_regular_file(
-                source,
-                containment_root=root,
-                field_name=f"Work database sidecar {suffix}",
+            if source.exists() or source.is_symlink():
+                assert_managed_regular_file(
+                    source,
+                    containment_root=root,
+                    field_name=f"Work database sidecar {suffix}",
+                )
+
+        # SQLite's online backup reads a coherent committed view, including
+        # pending WAL frames, even if another connection checkpoints while it
+        # is copying. A normal mode=ro SQLite open may create a WAL/-shm
+        # sidecar even for an idle, fully checkpointed source. For a database
+        # with no WAL/journal evidence, immutable read-only mode avoids those
+        # scanner-originated source filesystem changes. Recheck for concurrent
+        # source changes and fall back to the live WAL-aware snapshot if needed.
+        snapshot_db = snapshot_root / database_path.name
+        wal = database_path.with_name(database_path.name + "-wal")
+        journal = database_path.with_name(database_path.name + "-journal")
+        needs_live_read = wal.exists() or journal.exists()
+        if not needs_live_read:
+            before_stat = database_path.stat()
+            source_connection = sqlite3.connect(
+                f"{database_path.as_uri()}?mode=ro&immutable=1",
+                uri=True,
             )
-            shutil.copy2(source, snapshot_root / source.name)
+            try:
+                target_connection = sqlite3.connect(snapshot_db)
+                try:
+                    _backup_recovery_work_database(
+                        source_connection, target_connection,
+                    )
+                finally:
+                    target_connection.close()
+            finally:
+                source_connection.close()
+            after_stat = database_path.stat()
+            needs_live_read = (
+                wal.exists() or journal.exists()
+                or before_stat.st_mtime_ns != after_stat.st_mtime_ns
+                or before_stat.st_size != after_stat.st_size
+                or before_stat.st_ino != after_stat.st_ino
+            )
+        if needs_live_read:
+            with repository_read(database_path) as source_connection:
+                target_connection = sqlite3.connect(snapshot_db)
+                try:
+                    _backup_recovery_work_database(
+                        source_connection, target_connection,
+                    )
+                finally:
+                    target_connection.close()
 
         yield snapshot_root
 

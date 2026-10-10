@@ -2419,3 +2419,155 @@ def test_issue403_parallel_work_open_with_forced_refresh_has_no_temp_collision(
         "app_version"
     ] == "current"
     assert not list(created.root.glob("manifest.json.*.tmp"))
+
+
+def test_phase_c_audit_recovery_snapshot_survives_checkpoint_between_db_and_wal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A valid live Work must not be quarantined by a mixed-generation copy.
+
+    Simulate an ordinary SQLite WAL checkpoint at the exact inter-file copy
+    boundary; the source has already committed its repaired authoritative
+    revision before the recovery scan starts.
+    """
+    repository = WorkLifecycleRepository(tmp_path)
+    work_id = "work_checkpoint_race"
+    created = repository.create_work(work_id=work_id, title="Valid recovered Work")
+    staging = tmp_path / "works" / f".creating-{work_id}"
+    os.replace(created.root, staging)
+    with repository_write(repository.paths.master_db) as connection:
+        connection.execute(
+            "DELETE FROM work_catalog WHERE work_id = ?", (work_id,),
+        )
+    database = staging / "work.sqlite3"
+    keeper = sqlite3.connect(database)
+    try:
+        keeper.execute("PRAGMA journal_mode=WAL")
+        keeper.execute("PRAGMA wal_autocheckpoint=0")
+        # Force main database pages to represent an older, invalid revision
+        # while the newest committed WAL restores the *valid* authoritative
+        # Work head. This is a deterministic two-generation copy fixture,
+        # not a damaged source Work.
+        keeper.execute(
+            "UPDATE work_metadata SET current_revision = current_revision + 99"
+        )
+        keeper.commit()
+        assert keeper.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()[0] == 0
+        keeper.execute(
+            "UPDATE work_metadata SET current_revision = current_revision - 99"
+        )
+        keeper.commit()
+        assert database.with_name(database.name + "-wal").stat().st_size > 0
+
+        clean = repository.scan_recovery()
+        assert len(clean) == 1
+        assert clean[0].kind == "STALE_STAGING_VALID", clean[0].diagnostics
+
+        real_copy = lifecycle_module.shutil.copy2
+        checkpointed = []
+
+        def interleaved_copy(source, destination, *args, **kwargs):
+            result = real_copy(source, destination, *args, **kwargs)
+            if Path(source) == database or Path(source) == database.with_name(
+                database.name + "-wal"
+            ):
+                pytest.fail("recovery must not raw-copy live SQLite DB/WAL files")
+            if Path(source) == staging / "manifest.json" and not checkpointed:
+                checkpointed.append(True)
+                # During the recovery snapshot, a source checkpoint can
+                # move already-committed frames into its main DB. The online
+                # backup must use SQLite's consistent snapshot instead of
+                # composing separately copied DB and WAL generations.
+                assert keeper.execute(
+                    "PRAGMA wal_checkpoint(TRUNCATE)"
+                ).fetchone()[0] == 0
+            return result
+
+        monkeypatch.setattr(lifecycle_module.shutil, "copy2", interleaved_copy)
+        findings = repository.scan_recovery()
+        assert checkpointed, "test did not checkpoint during recovery snapshot"
+        assert len(findings) == 1
+        assert findings[0].kind == "STALE_STAGING_VALID", (
+            "recovery classified a healthy Work as corrupt because its "
+            "copied main DB precedes a WAL checkpoint while the copied WAL "
+            "follows it; a false quarantine recommendation risks valid data"
+        )
+        assert findings[0].recommended_action == "finalize"
+    finally:
+        keeper.close()
+
+
+@pytest.mark.parametrize(
+    ("recovery_shape", "expected_kind", "expected_action"),
+    [
+        ("staging", "STALE_STAGING_VALID", "finalize"),
+        ("orphan", "UNREGISTERED_WORK_VALID", "register"),
+    ],
+)
+def test_issue409_recovery_online_backup_reads_committed_wal_without_source_writes(
+    tmp_path: Path, recovery_shape: str, expected_kind: str,
+    expected_action: str,
+) -> None:
+    """Read-only recovery validates WAL-only commits without changing evidence."""
+    repo = WorkLifecycleRepository(tmp_path)
+    work_id = f"work_wal_snapshot_{recovery_shape}"
+    created = repo.create_work(work_id=work_id, title="WAL Snapshot")
+    with repository_write(repo.paths.master_db) as conn:
+        conn.execute("DELETE FROM work_catalog WHERE work_id = ?", (work_id,))
+    root = created.root
+    if recovery_shape == "staging":
+        root = tmp_path / "works" / f".creating-{work_id}"
+        os.replace(created.root, root)
+
+    database = root / "work.sqlite3"
+    keeper = sqlite3.connect(database)
+    try:
+        assert keeper.execute("PRAGMA journal_mode=WAL").fetchone()[0] == "wal"
+        keeper.execute("PRAGMA wal_autocheckpoint=0")
+        # Commit a real, head-consistent Work metadata update into WAL.
+        # Updating an identical value may generate NO WAL frame in SQLite.
+        keeper.execute(
+            "UPDATE work_metadata SET updated_at = ?",
+            ("2026-10-10T00:00:00+00:00",),
+        )
+        keeper.commit()
+        wal = database.with_name(database.name + "-wal")
+        assert wal.is_file() and wal.stat().st_size > 0
+        before_db = database.read_bytes()
+        before_wal = wal.read_bytes()
+        findings = repo.scan_recovery()
+        assert len(findings) == 1, findings
+        assert findings[0].kind == expected_kind, findings[0].diagnostics
+        assert findings[0].recommended_action == expected_action
+        assert database.read_bytes() == before_db
+        assert wal.read_bytes() == before_wal
+    finally:
+        keeper.close()
+
+
+@pytest.mark.parametrize("suffix", ["-wal", "-shm", "-journal"])
+def test_issue409_recovery_rejects_symlinked_sqlite_sidecars(
+    tmp_path: Path, suffix: str,
+) -> None:
+    """Untrusted live SQLite journal paths must never be followed by backup."""
+    repo = WorkLifecycleRepository(tmp_path)
+    created = repo.create_work(work_id="work_sidecar_guard", title="Guarded")
+    with repository_write(repo.paths.master_db) as conn:
+        conn.execute(
+            "DELETE FROM work_catalog WHERE work_id = ?", ("work_sidecar_guard",),
+        )
+    outside = tmp_path / "outside-sqlite-sidecar.txt"
+    outside.write_bytes(b"preserve external evidence")
+    sidecar = created.database_path.with_name(created.database_path.name + suffix)
+    if sidecar.exists():
+        sidecar.unlink()
+    try:
+        sidecar.symlink_to(outside)
+    except OSError:
+        pytest.skip("file symlinks are not available in this environment")
+    finding, = repo.scan_recovery()
+    assert finding.kind == "UNREGISTERED_WORK_INVALID"
+    assert finding.valid is False
+    assert finding.recommended_action is None
+    assert "symlink" in " ".join(finding.diagnostics)
+    assert outside.read_bytes() == b"preserve external evidence"
