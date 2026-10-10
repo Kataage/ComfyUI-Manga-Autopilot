@@ -6,6 +6,7 @@ import errno
 import json
 import os
 import shutil
+import sqlite3
 from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -592,21 +593,31 @@ def _recovery_validation_snapshot(root: Path) -> Iterator[Path]:
         snapshot_root = Path(temp_dir) / root.name
         snapshot_root.mkdir()
         shutil.copy2(manifest_path, snapshot_root / manifest_path.name)
-        shutil.copy2(database_path, snapshot_root / database_path.name)
 
-        # Copy durable SQLite sidecars that may contain authoritative committed
-        # state. The WAL index (-shm) is transient and is rebuilt in the
-        # writable temporary snapshot rather than copied from recovery evidence.
-        for suffix in ("-wal", "-journal"):
+        # Check potential SQLite sidecar path tricks before asking SQLite to
+        # open the source. Never blindly copy separate generations of the
+        # database and WAL: a concurrent checkpoint can truncate the WAL
+        # between two shutil.copy2 calls, falsely condemning valid Work.
+        for suffix in ("-wal", "-shm", "-journal"):
             source = database_path.with_name(database_path.name + suffix)
-            if not source.exists() and not source.is_symlink():
-                continue
-            assert_managed_regular_file(
-                source,
-                containment_root=root,
-                field_name=f"Work database sidecar {suffix}",
-            )
-            shutil.copy2(source, snapshot_root / source.name)
+            if source.exists() or source.is_symlink():
+                assert_managed_regular_file(
+                    source,
+                    containment_root=root,
+                    field_name=f"Work database sidecar {suffix}",
+                )
+
+        # SQLite's online backup reads a coherent committed view, including
+        # pending WAL frames, even if another connection checkpoints while it
+        # is copying. The source is opened read-only; both SQLite connections
+        # stay within this scope and the source's critical files are untouched.
+        snapshot_db = snapshot_root / database_path.name
+        with repository_read(database_path) as source_connection:
+            target_connection = sqlite3.connect(snapshot_db)
+            try:
+                source_connection.backup(target_connection, pages=64, sleep=0.05)
+            finally:
+                target_connection.close()
 
         yield snapshot_root
 
