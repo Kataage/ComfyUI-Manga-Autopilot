@@ -369,3 +369,108 @@ def test_phase_c_independent_audit_cleanup_revalidates_protection_before_deletio
     )
     assert "run_001" not in result.deleted_run_ids
     assert "run_001" in result.skipped_run_ids
+
+def test_issue415_run_cleanup_writer_lock_and_stale_directory(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    """Execution waits for the publisher lock and then rereads current status."""
+    import threading
+    from contextlib import contextmanager
+
+    import manga_autopilot.services.run_cleanup as cleanup
+
+    project = tmp_path / "project"
+    project.mkdir()
+    target = _create_fake_run(project, "run_001", "COMPLETED")
+    _create_fake_run(project, "run_002", "COMPLETED")
+    (project / "latest_run_id.txt").write_text("run_002", encoding="utf-8")
+    plan = build_run_cleanup_plan(
+        project, RunCleanupPolicy(keep_last=0, dry_run=False),
+    )
+    original_lock = cleanup.project_run_directory_lock
+    waiting = threading.Event()
+    acquired = threading.Event()
+    outcomes = []
+
+    @contextmanager
+    def traced_lock(root):
+        waiting.set()
+        with original_lock(root):
+            acquired.set()
+            yield
+
+    monkeypatch.setattr(cleanup, "project_run_directory_lock", traced_lock)
+
+    def cleanup_worker():
+        outcomes.append(execute_run_cleanup_plan(plan))
+
+    with original_lock(project):
+        worker = threading.Thread(target=cleanup_worker, daemon=True)
+        worker.start()
+        assert waiting.wait(timeout=5)
+        assert not acquired.is_set(), "cleanup bypassed active publisher lock"
+        data = json.loads((target / "run.json").read_text(encoding="utf-8"))
+        data["status"] = "RUNNING"
+        (target / "run.json").write_text(json.dumps(data), encoding="utf-8")
+    worker.join(timeout=10)
+    assert not worker.is_alive()
+    assert acquired.is_set()
+    assert target.is_dir()
+    assert outcomes[0].deleted_run_ids == []
+    assert outcomes[0].skipped_run_ids == ["run_001"]
+
+
+def test_issue415_cleanup_detects_directory_swap_during_atomic_detach(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    """A replacement introduced at rename time cannot be deleted."""
+    project = tmp_path / "project"
+    project.mkdir()
+    target = _create_fake_run(project, "run_001", "COMPLETED")
+    _create_fake_run(project, "run_002", "COMPLETED")
+    (project / "latest_run_id.txt").write_text("run_002", encoding="utf-8")
+    plan = build_run_cleanup_plan(
+        project, RunCleanupPolicy(keep_last=0, dry_run=False),
+    )
+    original_rename = Path.rename
+    swapped = []
+
+    def replace_target(self, destination):
+        if self == target and not swapped:
+            moved = self.parent / "old_run_001"
+            original_rename(self, moved)
+            _create_fake_run(project, "run_001", "RUNNING")
+            swapped.append(moved)
+        return original_rename(self, destination)
+
+    monkeypatch.setattr(Path, "rename", replace_target)
+    result = execute_run_cleanup_plan(plan)
+    assert len(swapped) == 1
+    assert target.is_dir()
+    assert json.loads((target / "run.json").read_text(encoding="utf-8"))["status"] == "RUNNING"
+    assert swapped[0].is_dir()
+    assert result.deleted_run_ids == []
+    assert result.skipped_run_ids == ["run_001"]
+
+
+def test_issue415_keep_last_is_rechecked_against_current_run_order(
+    tmp_path: Path,
+) -> None:
+    """The retention ranking may change between plan and execute."""
+    project = tmp_path / "project"
+    project.mkdir()
+    oldest = _create_fake_run(project, "run_001", "COMPLETED")
+    _create_fake_run(project, "run_002", "COMPLETED")
+    newest = _create_fake_run(project, "run_003", "COMPLETED")
+    (project / "latest_run_id.txt").write_text("run_003", encoding="utf-8")
+    plan = build_run_cleanup_plan(
+        project, RunCleanupPolicy(keep_last=2, dry_run=False),
+    )
+    assert [c.run_id for c in plan.candidates] == ["run_001"]
+    import shutil
+
+    shutil.rmtree(newest)
+    result = execute_run_cleanup_plan(plan)
+    assert oldest.is_dir()
+    assert result.deleted_run_ids == []
+    assert result.skipped_run_ids == ["run_001"]
