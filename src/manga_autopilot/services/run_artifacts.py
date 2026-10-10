@@ -42,7 +42,8 @@ def mirror_latest_artifacts_to_run(project_root: Path, run_id: str) -> dict[str,
 
     Raises :class:`MirrorError` on I/O failure.
     """
-    project_root = Path(project_root)    with project_run_directory_lock(project_root):
+    project_root = Path(project_root)
+    with project_run_directory_lock(project_root):
         run_dir = project_root / "runs" / run_id
         run_dir.mkdir(parents=True, exist_ok=True)
 
