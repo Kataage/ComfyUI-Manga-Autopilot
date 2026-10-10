@@ -230,6 +230,22 @@ def _check_page(connection: sqlite3.Connection, page_id: str) -> None:
     _read_row(connection, "pages", page_id)
 
 
+def _require_active_page(
+    connection: sqlite3.Connection, page_id: str,
+) -> None:
+    """Fence child writes to archived Pages in the owning SQLite transaction.
+
+    Read-only Page/Panel/Layout queries still use _check_page. Do not cache
+    this guard outside BEGIN IMMEDIATE: archive and child writes must be
+    serialized by the same Work DB writer lock.
+    """
+    page = _read_row(connection, "pages", page_id)
+    if page["archived_at"] is not None:
+        raise PageDomainArchivedError(
+            f"Page {page_id} is archived; unarchive before editing its children."
+        )
+
+
 def _validate_selected_candidate(
     connection: sqlite3.Connection, panel_id: str, candidate_id: Any,
 ) -> None:
@@ -364,6 +380,7 @@ class LayoutRepository:
         with repository_write(self.database_path) as conn:
             # Reject even no-op editor requests during exclusive Work mutation.
             assert_work_mutation_allowed(conn)
+            _require_active_page(conn, page_id)
             page = _read_row(conn, "pages", page_id)
             if page["layout_instance_id"] is not None:
                 raise PageDomainOwnershipError(
@@ -439,7 +456,8 @@ class LayoutRepository:
         with repository_write(self.database_path) as conn:
             # Reject even no-op editor requests during exclusive Work mutation.
             assert_work_mutation_allowed(conn)
-            _read_row(conn, "layout_instances", _id(layout_id, "layout_id"))
+            layout = _read_row(conn, "layout_instances", _id(layout_id, "layout_id"))
+            _require_active_page(conn, layout["page_id"])
             seq, at = _commit(conn, "create_layout_slot")
             return _insert(
                 conn, "layout_slots", _id(slot_id, "slot_id"),
@@ -458,8 +476,11 @@ class LayoutRepository:
         with repository_write(self.database_path) as conn:
             # Reject even no-op editor requests during exclusive Work mutation.
             assert_work_mutation_allowed(conn)
+            slot = _read_row(conn, "layout_slots", _id(slot_id, "slot_id"))
+            layout = _read_row(conn, "layout_instances", slot["layout_instance_id"])
+            _require_active_page(conn, layout["page_id"])
             record, _ = _patch(
-                conn, "layout_slots", _id(slot_id, "slot_id"),
+                conn, "layout_slots", slot_id,
                 expected_revision=expected_revision, attrs=attrs,
             )
             return record
@@ -652,7 +673,7 @@ class PanelRepository:
         with repository_write(self.database_path) as conn:
             # Reject even no-op editor requests during exclusive Work mutation.
             assert_work_mutation_allowed(conn)
-            _check_page(conn, _id(page_id, "page_id"))
+            _require_active_page(conn, _id(page_id, "page_id"))
             if layout_slot_id is not None:
                 _check_slot_page(conn, _id(layout_slot_id, "layout_slot_id"), page_id)
             seq, at = _commit(conn, "create_panel")
@@ -692,6 +713,7 @@ class PanelRepository:
                 expected_revision=expected_revision,
                 actual_revision=existing["revision"],
             )
+            _require_active_page(conn, existing["page_id"])
             if "selected_candidate_id" in attrs:
                 _validate_selected_candidate(
                     conn, panel_id, attrs["selected_candidate_id"]
