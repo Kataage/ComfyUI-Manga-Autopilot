@@ -742,13 +742,16 @@ async def test_failed_work_lease_heartbeat_drains_sync_hook_before_interrupting(
     effects = tmp_path / "heartbeat-effect.txt"
 
     class BrokenRenewalRepository(DurableRunRepository):
-        def heartbeat_lease(self, *, work_id, lease_owner, ttl_seconds):
-            # Under concurrent Windows CI load, the guardian can tick
-            # before the sync thread starts; inject loss only IN-FLIGHT.
+        def heartbeat_owned_cycle(
+            self, *, work_id, run_id, lease_owner, ttl_seconds, step_id=None,
+        ):
+            # Inject a fault in the atomic lease/Run/Step renewal only while
+            # the synchronous stage worker is active.
             if not started.is_set():
-                return super().heartbeat_lease(
-                    work_id=work_id, lease_owner=lease_owner,
-                    ttl_seconds=ttl_seconds,
+                return super().heartbeat_owned_cycle(
+                    work_id=work_id, run_id=run_id,
+                    lease_owner=lease_owner, ttl_seconds=ttl_seconds,
+                    step_id=step_id,
                 )
             failed.set()
             raise OSError("injected lease renewal IO failure")
@@ -929,7 +932,9 @@ async def test_lease_guardian_failure_cancels_native_async_hook(
     hook_cancelled = asyncio.Event()
 
     class BrokenRenewalRepository(DurableRunRepository):
-        def heartbeat_lease(self, *, work_id, lease_owner, ttl_seconds):
+        def heartbeat_owned_cycle(
+            self, *, work_id, run_id, lease_owner, ttl_seconds, step_id=None,
+        ):
             failed.set()
             raise OSError("injected transient DB failure")
 
@@ -1075,10 +1080,17 @@ async def test_failed_step_heartbeat_stops_guardian_and_does_not_claim_success(
     completed = threading.Event()
 
     class FailStepHeartbeatRepository(DurableRunRepository):
-        def heartbeat_step(self, step_id, *, lease_owner):
-            # Fault starts only once the local worker has entered its hook.
-            if not started.is_set():
-                return super().heartbeat_step(step_id, lease_owner=lease_owner)
+        def heartbeat_owned_cycle(
+            self, *, work_id, run_id, lease_owner, ttl_seconds, step_id=None,
+        ):
+            # The durable guardian now renews all three receipts in one
+            # transaction. Inject Step failure only for an active attempt.
+            if step_id is None or not started.is_set():
+                return super().heartbeat_owned_cycle(
+                    work_id=work_id, run_id=run_id,
+                    lease_owner=lease_owner, ttl_seconds=ttl_seconds,
+                    step_id=step_id,
+                )
             attempted.set()
             raise OSError("injected RunStep heartbeat storage failure")
 
@@ -1362,12 +1374,18 @@ async def test_finalization_heartbeat_failure_drains_and_records_interruption(
     lost = threading.Event()
 
     class FailDuringFinalize(DurableRunRepository):
-        def heartbeat_step(self, step_id, *, lease_owner):
-            step = self.get_step(step_id)
-            if step["step_key"] == "finalize" and entered.is_set():
+        def heartbeat_owned_cycle(
+            self, *, work_id, run_id, lease_owner, ttl_seconds, step_id=None,
+        ):
+            step = self.get_step(step_id) if step_id is not None else None
+            if step is not None and step["step_key"] == "finalize" and entered.is_set():
                 lost.set()
                 raise OSError("injected finalization heartbeat failure")
-            return super().heartbeat_step(step_id, lease_owner=lease_owner)
+            return super().heartbeat_owned_cycle(
+                work_id=work_id, run_id=run_id,
+                lease_owner=lease_owner, ttl_seconds=ttl_seconds,
+                step_id=step_id,
+            )
 
     # The test isolates a deliberately injected step heartbeat error, not
     # an unrelated wall-clock Work-lease expiry under slow Windows scheduling.
@@ -1752,3 +1770,332 @@ def test_issue388_finalizer_start_wait_must_not_starve_single_worker_executor() 
                 await asyncio.wait_for(task, timeout=5)
 
     asyncio.run(scenario())
+
+
+@pytest.mark.asyncio
+async def test_issue407_slow_durable_step_io_does_not_block_lease_event_loop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Durable RunStep SQLite operations must not starve their own guardian.
+
+    Simulate a slow synchronous SQLite writer on the *real* durable execution
+    path, then schedule a loop callback from a separate watcher thread. The
+    watcher always releases the writer after a bounded period, even when the
+    event loop is blocked. Only a callback serviced while that IO is pending
+    proves that another short-TTL Work lease heartbeat can run.
+    """
+    db = work(tmp_path)
+    repo = DurableRunRepository(db)
+    run_id = start(repo)
+    loop = asyncio.get_running_loop()
+    started = threading.Event()
+    release = threading.Event()
+    pulse = threading.Event()
+    observed: dict[str, bool] = {}
+    original_start = DurableRunRepository.start_step
+
+    def delayed_start(self, *args, **kwargs):
+        started.set()
+        if not release.wait(timeout=15):
+            raise TimeoutError("audit-controlled RunStep SQLite delay not released")
+        return original_start(self, *args, **kwargs)
+
+    def independent_tick() -> None:
+        if not started.wait(timeout=10):
+            observed["loop_tick_during_step_io"] = False
+            release.set()
+            return
+        try:
+            loop.call_soon_threadsafe(pulse.set)
+            observed["loop_tick_during_step_io"] = pulse.wait(timeout=3)
+        finally:
+            release.set()
+
+    monkeypatch.setattr(DurableRunRepository, "start_step", delayed_start)
+    watcher = threading.Thread(target=independent_tick, daemon=True)
+    watcher.start()
+    try:
+        result = await runner(repo, OrchestratorHooks()).execute(
+            run_id, input_payload={}, step_inputs={}, lease_owner="audit_worker",
+        )
+        assert result.machine.state.value == "COMPLETED"
+    finally:
+        release.set()
+        await asyncio.to_thread(watcher.join, 10)
+    assert not watcher.is_alive()
+    assert observed["loop_tick_during_step_io"] is True, (
+        "Durable Autopilot runs synchronous RunStep SQLite IO on its own "
+        "heartbeat event loop, starving independent lease renewal callbacks"
+    )
+
+
+@pytest.mark.asyncio
+async def test_issue407_slow_lease_renewal_does_not_block_guardian_event_loop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Lease heartbeat SQLite waits cannot stall unrelated async callbacks."""
+    db = work(tmp_path)
+    repo = DurableRunRepository(db)
+    run_id = start(repo)
+    loop = asyncio.get_running_loop()
+    entered_hook = asyncio.Event()
+    release_hook = asyncio.Event()
+    entered_heartbeat = threading.Event()
+    release_heartbeat = threading.Event()
+    pulse = threading.Event()
+    observed: dict[str, bool] = {}
+    real_heartbeat = DurableRunRepository.heartbeat_owned_cycle
+
+    def delayed_heartbeat(self, *args, **kwargs):
+        entered_heartbeat.set()
+        if not release_heartbeat.wait(timeout=12):
+            raise TimeoutError("audit-controlled lease renewal not released")
+        return real_heartbeat(self, *args, **kwargs)
+
+    async def suspended_hook(_):
+        entered_hook.set()
+        await release_hook.wait()
+        return {"ok": True}
+
+    def independent_tick() -> None:
+        if not entered_heartbeat.wait(timeout=10):
+            observed["pulse_during_heartbeat"] = False
+            release_heartbeat.set()
+            return
+        try:
+            loop.call_soon_threadsafe(pulse.set)
+            observed["pulse_during_heartbeat"] = pulse.wait(timeout=3)
+        finally:
+            release_heartbeat.set()
+
+    monkeypatch.setattr(DurableRunRepository, "heartbeat_owned_cycle", delayed_heartbeat)
+    watcher = threading.Thread(target=independent_tick, daemon=True)
+    watcher.start()
+    runner_instance = DurableAutopilotOrchestrator(
+        repository=repo, work_id="work_246",
+        hooks=OrchestratorHooks(validate_input=suspended_hook),
+        allow_omitted_hooks=True, lease_ttl_seconds=6,
+    )
+    task = asyncio.create_task(runner_instance.execute(
+        run_id, input_payload={}, step_inputs={}, lease_owner="audit_renewal",
+    ))
+    try:
+        await asyncio.wait_for(entered_hook.wait(), timeout=10)
+        await asyncio.wait_for(asyncio.to_thread(watcher.join, 12), timeout=14)
+        assert not watcher.is_alive()
+    finally:
+        release_heartbeat.set()
+        release_hook.set()
+    result = await asyncio.wait_for(task, timeout=20)
+    assert result.machine.state.value == "COMPLETED"
+    assert observed["pulse_during_heartbeat"] is True, (
+        "Durable lease guardian's synchronous SQLite heartbeat blocks "
+        "unrelated event-loop work during its database wait"
+    )
+
+
+@pytest.mark.asyncio
+async def test_issue407_cancelled_lease_acquisition_drains_and_releases_owner(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Cancel must not orphan a lease successfully acquired in a worker."""
+    db = work(tmp_path)
+    repo = DurableRunRepository(db)
+    run_id = start(repo)
+    entered = threading.Event()
+    release = threading.Event()
+    original = DurableRunRepository.acquire_lease
+
+    def blocked_acquire(self, *args, **kwargs):
+        entered.set()
+        if not release.wait(timeout=12):
+            raise TimeoutError("controlled Work lease acquire not released")
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(DurableRunRepository, "acquire_lease", blocked_acquire)
+    task = asyncio.create_task(runner(repo, OrchestratorHooks()).execute(
+        run_id, input_payload={}, step_inputs={}, lease_owner="cancel_acquire",
+    ))
+    try:
+        assert await asyncio.to_thread(entered.wait, 10)
+        task.cancel()
+        await asyncio.sleep(0.05)
+        task.cancel()
+        await asyncio.sleep(0.05)
+        assert not task.done(), "cancelled acquire abandoned its SQLite worker"
+    finally:
+        release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, timeout=20)
+    assert repo.inspect_lease("work_246") is None, (
+        "cancelled acquisition created a live lease that no Run owns"
+    )
+    assert repo.get_run(run_id)["status"] == "PENDING"
+
+
+@pytest.mark.asyncio
+async def test_issue407_cancelled_start_step_waits_for_commit_then_interrupts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A cancelled RunStep startup drains its DB write before reconciliation."""
+    db = work(tmp_path)
+    repo = DurableRunRepository(db)
+    run_id = start(repo)
+    entered = threading.Event()
+    release = threading.Event()
+    real_start = DurableRunRepository.start_step
+
+    def blocked_start(self, *args, **kwargs):
+        entered.set()
+        if not release.wait(timeout=12):
+            raise TimeoutError("controlled RunStep startup was never released")
+        return real_start(self, *args, **kwargs)
+
+    monkeypatch.setattr(DurableRunRepository, "start_step", blocked_start)
+    task = asyncio.create_task(runner(repo, OrchestratorHooks()).execute(
+        run_id, input_payload={}, step_inputs={}, lease_owner="cancel_start",
+    ))
+    try:
+        assert await asyncio.to_thread(entered.wait, 10)
+        task.cancel()
+        await asyncio.sleep(0.05)
+        task.cancel()
+        await asyncio.sleep(0.05)
+        assert not task.done(), "cancelled RunStep detached its sqlite worker"
+        assert repo.inspect_lease("work_246") is not None
+    finally:
+        release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, timeout=20)
+    assert repo.inspect_lease("work_246") is None
+    assert repo.get_run(run_id)["status"] == "INTERRUPTED"
+    steps = repo.list_steps(run_id)
+    assert any(step["status"] == "INTERRUPTED" for step in steps)
+    assert not any(step["status"] == "RUNNING" for step in steps)
+
+
+@pytest.mark.asyncio
+async def test_issue407_pending_step_is_not_heartbeated_until_start_is_durable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Guardian renews Work/Run while a Step is still waiting to start."""
+    import time
+
+    db = work(tmp_path)
+    repo = DurableRunRepository(db)
+    run_id = start(repo)
+    entered = threading.Event()
+    first_run_tick = threading.Event()
+    release = threading.Event()
+    actual_start = DurableRunRepository.start_step
+    actual_heartbeat_run = DurableRunRepository.heartbeat_owned_cycle
+
+    def slow_first_start(self, *args, **kwargs):
+        if not entered.is_set():
+            entered.set()
+            if not release.wait(timeout=12):
+                raise TimeoutError("controlled pending Step was never released")
+        return actual_start(self, *args, **kwargs)
+
+    def observe_run_heartbeat(self, *args, **kwargs):
+        value = actual_heartbeat_run(self, *args, **kwargs)
+        first_run_tick.set()
+        return value
+
+    def release_after_guardian_tick() -> None:
+        if entered.wait(timeout=10) and first_run_tick.wait(timeout=10):
+            # Leave enough time for a wrongly active pending Step heartbeat
+            # to fail before making start_step durable.
+            time.sleep(0.35)
+        release.set()
+
+    monkeypatch.setattr(DurableRunRepository, "start_step", slow_first_start)
+    monkeypatch.setattr(
+        DurableRunRepository, "heartbeat_owned_cycle", observe_run_heartbeat,
+    )
+    watcher = threading.Thread(target=release_after_guardian_tick, daemon=True)
+    watcher.start()
+    runner_instance = DurableAutopilotOrchestrator(
+        repository=repo, work_id="work_246",
+        hooks=OrchestratorHooks(), allow_omitted_hooks=True,
+        lease_ttl_seconds=6,
+    )
+    try:
+        result = await asyncio.wait_for(runner_instance.execute(
+            run_id, input_payload={}, step_inputs={}, lease_owner="pending_tick",
+        ), timeout=25)
+    finally:
+        release.set()
+        await asyncio.to_thread(watcher.join, 10)
+    assert first_run_tick.is_set(), "the lease guardian never renewed the Run"
+    assert result.machine.state.value == "COMPLETED"
+    assert repo.inspect_lease("work_246") is None
+
+
+def test_issue407_atomic_guardian_cycle_renews_all_receipts_or_none(
+    tmp_path: Path,
+) -> None:
+    """Lease/Run/Step heartbeats are one visible, fenced DB commit."""
+    class Clock:
+        moment = datetime(2026, 10, 9, tzinfo=timezone.utc)
+
+        def __call__(self):
+            return self.moment
+
+    db = work(tmp_path)
+    clock = Clock()
+    repo = DurableRunRepository(db, clock=clock)
+    run_id = start(repo)
+    repo.acquire_lease(
+        work_id="work_246", lease_owner="atomic_heartbeat",
+        lease_kind="AUTOPILOT_MUTATION", ttl_seconds=6, run_id=run_id,
+    )
+    repo.transition_run(
+        run_id, expected_status="PENDING", new_status="RUNNING",
+        lease_owner="atomic_heartbeat",
+    )
+    step = repo.create_step(
+        run_id=run_id, step_key="validate_input",
+        input_fingerprint="atomic:v1", lease_owner="atomic_heartbeat",
+    )
+    repo.start_step(
+        step["id"], input_fingerprint="atomic:v1",
+        lease_owner="atomic_heartbeat",
+    )
+    clock.moment += timedelta(seconds=2)
+    repo.heartbeat_owned_cycle(
+        work_id="work_246", run_id=run_id,
+        lease_owner="atomic_heartbeat", ttl_seconds=6, step_id=step["id"],
+    )
+    with repository_read(db) as conn:
+        lease = dict(conn.execute("SELECT * FROM work_leases").fetchone())
+        run = dict(conn.execute(
+            "SELECT * FROM runs WHERE id = ?", (run_id,),
+        ).fetchone())
+        persisted_step = dict(conn.execute(
+            "SELECT * FROM run_steps WHERE id = ?", (step["id"],),
+        ).fetchone())
+    now = clock.moment.isoformat()
+    assert lease["heartbeat_at"] == run["heartbeat_at"]
+    assert run["heartbeat_at"] == persisted_step["heartbeat_at"] == now
+    assert lease["expires_at"] == (clock.moment + timedelta(seconds=6)).isoformat()
+
+    # A stale worker may not renew even one of these three rows.
+    clock.moment += timedelta(seconds=7)
+    with pytest.raises(WorkLeaseConflictError):
+        repo.heartbeat_owned_cycle(
+            work_id="work_246", run_id=run_id,
+            lease_owner="atomic_heartbeat", ttl_seconds=6,
+            step_id=step["id"],
+        )
+    with repository_read(db) as conn:
+        stored_lease = dict(conn.execute("SELECT * FROM work_leases").fetchone())
+        stored_run = dict(conn.execute(
+            "SELECT * FROM runs WHERE id = ?", (run_id,),
+        ).fetchone())
+        stored_step = dict(conn.execute(
+            "SELECT * FROM run_steps WHERE id = ?", (step["id"],),
+        ).fetchone())
+    assert stored_lease == lease
+    assert stored_run == run
+    assert stored_step == persisted_step
