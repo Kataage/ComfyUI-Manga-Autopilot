@@ -525,3 +525,81 @@ def test_layout_atomic_snapshot_failure_rolls_back_batch_and_commit(repositories
             "SELECT 1 FROM entity_revisions WHERE entity_type = 'layout_instance'"
             " AND entity_revision = 2 AND entity_id = 'layout_001'"
         ).fetchone()
+
+
+@pytest.mark.parametrize(
+    "operation",
+    [
+        "create_panel",
+        "update_panel",
+        "create_slot",
+        "update_slot",
+        "create_layout",
+    ],
+)
+def test_phase_c_independent_audit_archived_page_rejects_child_mutations(
+    repositories, operation: str,
+) -> None:
+    """Archived Pages are read-only until explicitly unarchived.
+
+    Exercise public Work repository entrypoints directly: an archived Page's
+    child revisions must not advance and no new children or invalidation
+    history may be committed via a path other than the guarded Layout API.
+    """
+    from manga_autopilot.repositories.page_domain import PageDomainArchivedError
+
+    pages, layouts, panels = repositories
+    _setup(repositories)
+    pages.create_page(
+        page_id="page_empty", page_number=2,
+        order_key="0002", page_purpose="Awaiting layout",
+    )
+    archived_page = pages.get_page(
+        "page_empty" if operation == "create_layout" else "page_001"
+    )
+    target_page = archived_page["id"]
+    pages.update_page(
+        target_page, expected_revision=archived_page["revision"],
+        archived_at="2026-10-11T00:00:00Z",
+    )
+    before_commits = _commits(pages)
+    original_page = pages.get_page(target_page)
+    original_panel = panels.get_panel("panel_001")
+    original_slot = layouts.get_slot("slot_001")
+
+    def mutate_archived_child() -> None:
+        if operation == "create_panel":
+            panels.create_panel(
+                panel_id="panel_archived", page_id=target_page,
+                order_index=2, panel_purpose="must not write",
+            )
+        elif operation == "update_panel":
+            panels.update_panel(
+                "panel_001", expected_revision=original_panel["revision"],
+                panel_purpose="mutated after archive",
+            )
+        elif operation == "create_slot":
+            layouts.create_slot(
+                slot_id="slot_archived", layout_id="layout_001",
+                slot_key="forbidden", reading_order=2,
+                geometry={"x": 1, "y": 1, "width": 10, "height": 10},
+            )
+        elif operation == "update_slot":
+            layouts.update_slot(
+                "slot_001", expected_revision=original_slot["revision"],
+                semantic_json={"altered": True},
+            )
+        else:
+            layouts.create_layout(
+                layout_id="layout_archived", page_id=target_page,
+                geometry={"width": 1000, "height": 1000},
+            )
+
+    with pytest.raises(PageDomainArchivedError, match="archived|unarchive"):
+        mutate_archived_child()
+    assert _commits(pages) == before_commits, (
+        "archived child mutation must not append a Work commit"
+    )
+    assert pages.get_page(target_page) == original_page
+    assert panels.get_panel("panel_001") == original_panel
+    assert layouts.get_slot("slot_001") == original_slot
