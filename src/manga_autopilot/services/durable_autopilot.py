@@ -319,46 +319,24 @@ class DurableAutopilotOrchestrator:
         pending_start_step_id: str | None = None
 
         async def renew_lease() -> None:
-            # Running ComfyUI hooks can exceed one lease TTL. Refresh the
-            # Work-exclusive token, Run and in-flight RunStep in each cycle.
-            # All assignments to active_step_id happen on this event loop,
-            # and each repository call uses its own short transaction.
+            # The Work lease, owning Run and committed RUNNING Step share one
+            # BEGIN IMMEDIATE heartbeat commit. Readers cannot observe a
+            # renewed Work lease with a stale active Step heartbeat.
             period = max(1, min(60, self.lease_ttl_seconds // 3))
             while True:
                 await asyncio.sleep(period)
                 try:
-                    # Keep lease -> Run -> active Step renewal contiguous in
-                    # one owned worker. The loop remains responsive during the
-                    # blocking I/O, without yielding between these updates.
-                    def renew_one_cycle() -> None:
-                        self.repository.heartbeat_lease(
-                            work_id=self.work_id, lease_owner=owner,
-                            ttl_seconds=self.lease_ttl_seconds,
-                        )
-                        self.repository.heartbeat_run(
-                            run_id, lease_owner=owner,
-                        )
-                        step_to_renew = active_step_id
-                        if step_to_renew is not None:
-                            try:
-                                self.repository.heartbeat_step(
-                                    step_to_renew, lease_owner=owner,
-                                )
-                            except DurableRunStateError:
-                                # Completion may commit concurrently with
-                                # the guardian's lease/Run renewals. A
-                                # now-terminal Step needs no further tick;
-                                # a still-RUNNING or PENDING Step error must
-                                # fail closed, not mask a real lost guardian.
-                                current = self.repository.get_step(step_to_renew)
-                                if current["status"] not in {
-                                    "COMPLETED", "INTERRUPTED",
-                                    "FAILED_RETRYABLE", "FAILED_TERMINAL",
-                                    "NEEDS_ATTENTION",
-                                }:
-                                    raise
-
-                    await _run_owned_durable_sqlite(renew_one_cycle)
+                    await _run_owned_durable_sqlite(
+                        self.repository.heartbeat_owned_cycle,
+                        work_id=self.work_id,
+                        run_id=run_id,
+                        lease_owner=owner,
+                        ttl_seconds=self.lease_ttl_seconds,
+                        # PENDING Step startups are intentionally omitted.
+                        # The repository rechecks terminal Step races inside
+                        # the same SQLite write transaction.
+                        step_id=active_step_id,
+                    )
                 except Exception as exc:
                     raise DurableHeartbeatLostError(
                         "durable Work lease heartbeat renewal failed"
