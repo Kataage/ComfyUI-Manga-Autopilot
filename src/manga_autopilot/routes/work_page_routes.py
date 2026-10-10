@@ -23,6 +23,7 @@ from manga_autopilot.repositories.work_lifecycle import (
     WorkNotFoundError,
 )
 from manga_autopilot.services.page_application import PageApplicationService
+from manga_autopilot.routes.work_io import run_owned_work_io
 from manga_autopilot.storage.paths import UnsafeStoragePathError
 from manga_autopilot.storage.repository import (
     RevisionConflictError,
@@ -96,8 +97,11 @@ def _include_archived(request: web.Request) -> bool:
 
 async def list_work_pages(request: web.Request) -> web.Response:
     try:
-        pages = _service(request).list_pages(
-            request.match_info["work_id"], include_archived=_include_archived(request)
+        service = _service(request)
+        include_archived = _include_archived(request)
+        pages = await run_owned_work_io(
+            service.list_pages,
+            request.match_info["work_id"], include_archived=include_archived,
         )
     except Exception as exc:
         return _translate(exc)
@@ -106,9 +110,12 @@ async def list_work_pages(request: web.Request) -> web.Response:
 
 async def get_work_page(request: web.Request) -> web.Response:
     try:
-        state = _service(request).get_page(
+        service = _service(request)
+        include_archived = _include_archived(request)
+        state = await run_owned_work_io(
+            service.get_page,
             request.match_info["work_id"], request.match_info["page_id"],
-            include_archived=_include_archived(request),
+            include_archived=include_archived,
         )
     except Exception as exc:
         return _translate(exc)
@@ -140,7 +147,9 @@ async def update_work_page_layout(request: web.Request) -> web.Response:
             400, "invalid_request", f"unsupported layout fields: {sorted(unexpected)}"
         )
     try:
-        state = _service(request).update_layout(
+        service = _service(request)
+        state = await run_owned_work_io(
+            service.update_layout,
             request.match_info["work_id"], request.match_info["page_id"],
             expected_revision=expected_revision,
             slot_updates=slot_updates,
