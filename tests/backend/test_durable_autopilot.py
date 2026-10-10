@@ -1752,3 +1752,60 @@ def test_issue388_finalizer_start_wait_must_not_starve_single_worker_executor() 
                 await asyncio.wait_for(task, timeout=5)
 
     asyncio.run(scenario())
+
+
+@pytest.mark.asyncio
+async def test_phase_c_independent_audit_durable_step_io_keeps_lease_event_loop_responsive(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Durable RunStep SQLite operations must not starve their own guardian.
+
+    Simulate a slow synchronous SQLite writer on the *real* durable execution
+    path, then schedule a loop callback from a separate watcher thread. The
+    watcher always releases the writer after a bounded period, even when the
+    event loop is blocked. Only a callback serviced while that IO is pending
+    proves that another short-TTL Work lease heartbeat can run.
+    """
+    db = work(tmp_path)
+    repo = DurableRunRepository(db)
+    run_id = start(repo)
+    loop = asyncio.get_running_loop()
+    started = threading.Event()
+    release = threading.Event()
+    pulse = threading.Event()
+    observed: dict[str, bool] = {}
+    original_start = DurableRunRepository.start_step
+
+    def delayed_start(self, *args, **kwargs):
+        started.set()
+        if not release.wait(timeout=15):
+            raise TimeoutError("audit-controlled RunStep SQLite delay not released")
+        return original_start(self, *args, **kwargs)
+
+    def independent_tick() -> None:
+        if not started.wait(timeout=10):
+            observed["loop_tick_during_step_io"] = False
+            release.set()
+            return
+        try:
+            loop.call_soon_threadsafe(pulse.set)
+            observed["loop_tick_during_step_io"] = pulse.wait(timeout=3)
+        finally:
+            release.set()
+
+    monkeypatch.setattr(DurableRunRepository, "start_step", delayed_start)
+    watcher = threading.Thread(target=independent_tick, daemon=True)
+    watcher.start()
+    try:
+        result = await runner(repo, OrchestratorHooks()).execute(
+            run_id, input_payload={}, step_inputs={}, lease_owner="audit_worker",
+        )
+        assert result.machine.state.value == "COMPLETED"
+    finally:
+        release.set()
+        await asyncio.to_thread(watcher.join, 10)
+    assert not watcher.is_alive()
+    assert observed["loop_tick_during_step_io"] is True, (
+        "Durable Autopilot runs synchronous RunStep SQLite IO on its own "
+        "heartbeat event loop, starving independent lease renewal callbacks"
+    )
