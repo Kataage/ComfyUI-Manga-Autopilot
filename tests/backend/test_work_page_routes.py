@@ -779,3 +779,65 @@ async def test_issue405_page_read_keeps_event_loop_heartbeat_responsive(
         "Page HTTP read blocked aiohttp's event loop, preventing an otherwise "
         "ready durable Work lease heartbeat from running during slow I/O"
     )
+
+
+@pytest.mark.asyncio
+async def test_issue405_cancelled_layout_patch_drains_its_owned_sqlite_worker(
+    api, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Repeated HTTP cancellations cannot detach a committing Work mutation."""
+    import asyncio
+    import threading
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    from manga_autopilot.routes import work_page_routes
+    from manga_autopilot.services.page_application import PageApplicationService
+
+    _client, _prefix, root, handle = api
+    started = threading.Event()
+    release = threading.Event()
+    original_update = PageApplicationService.update_layout
+
+    def blocked_update(self, *args, **kwargs):
+        started.set()
+        if not release.wait(timeout=15):
+            raise TimeoutError("controlled Work PATCH worker never resumed")
+        return original_update(self, *args, **kwargs)
+
+    monkeypatch.setattr(PageApplicationService, "update_layout", blocked_update)
+    request = SimpleNamespace(
+        app={"manga_storage_root": str(root)},
+        match_info={"work_id": handle.work_id, "page_id": "page_001"},
+        json=AsyncMock(return_value={
+            "expected_revision": 1,
+            "geometry_json": {"width": 1337, "height": 1600},
+        }),
+    )
+
+    task = asyncio.create_task(work_page_routes.update_work_page_layout(request))
+    try:
+        assert await asyncio.to_thread(started.wait, 10), (
+            "the HTTP layout command never reached its offloaded worker"
+        )
+        task.cancel()
+        await asyncio.sleep(0.04)
+        task.cancel()
+        await asyncio.sleep(0.04)
+        assert not task.done(), (
+            "cancelled HTTP PATCH detached a still-running Work SQLite worker"
+        )
+    finally:
+        release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, timeout=20)
+
+    # Cancellation cannot undo a completed guarded commit. The server must
+    # drain it before exit; the persisted revision is the client-visible truth.
+    state = PageApplicationService(root).get_page(
+        handle.work_id, "page_001"
+    )
+    assert state["layout"]["revision"] == 2
+    assert state["layout"]["geometry_json"] == {
+        "width": 1337, "height": 1600,
+    }
