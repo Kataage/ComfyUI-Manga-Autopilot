@@ -12,6 +12,7 @@ import asyncio
 import inspect
 import json
 import secrets
+import threading
 from collections.abc import Callable, Mapping
 from contextlib import suppress
 from dataclasses import dataclass, field
@@ -297,16 +298,22 @@ class DurableAutopilotOrchestrator:
         run.input = base_inputs
         legacy = Orchestrator(hooks=self.hooks, project_root=self.project_root)
 
-        # Obtaining the single Work lease precedes any durable Run mutation.
-        # An expired owner is never reclaimed automatically.
-        await _run_owned_durable_sqlite(self.repository.acquire_lease, 
-            work_id=self.work_id,
-            lease_owner=owner,
-            lease_kind="AUTOPILOT_MUTATION",
-            ttl_seconds=self.lease_ttl_seconds,
-            run_id=run_id,
-            reclaim_expired_owner=reclaim_expired_owner,
-        )
+        # Cancellation may arrive after the worker has acquired its lease
+        # but before the waiter resumes. Record acquisition in the worker,
+        # so even a cancelled waiter's outer finally releases the exact token.
+        lease_acquired = threading.Event()
+
+        def acquire_owned_lease() -> None:
+            self.repository.acquire_lease(
+                work_id=self.work_id,
+                lease_owner=owner,
+                lease_kind="AUTOPILOT_MUTATION",
+                ttl_seconds=self.lease_ttl_seconds,
+                run_id=run_id,
+                reclaim_expired_owner=reclaim_expired_owner,
+            )
+            lease_acquired.set()
+
         heartbeat_task: asyncio.Task[None] | None = None
         active_step_id: str | None = None
 
@@ -319,13 +326,13 @@ class DurableAutopilotOrchestrator:
             while True:
                 await asyncio.sleep(period)
                 try:
-                    await _run_owned_durable_sqlite(self.repository.heartbeat_lease, 
+                    await _run_owned_durable_sqlite(self.repository.heartbeat_lease,
                         work_id=self.work_id, lease_owner=owner,
                         ttl_seconds=self.lease_ttl_seconds,
                     )
                     await _run_owned_durable_sqlite(self.repository.heartbeat_run, run_id, lease_owner=owner)
                     if active_step_id is not None:
-                        await _run_owned_durable_sqlite(self.repository.heartbeat_step, 
+                        await _run_owned_durable_sqlite(self.repository.heartbeat_step,
                             active_step_id, lease_owner=owner,
                         )
                 except Exception as exc:
@@ -334,10 +341,13 @@ class DurableAutopilotOrchestrator:
                     ) from exc
 
         try:
+            # Obtain the single Work lease before mutating the Run. This call
+            # belongs inside the same cancellation-safe cleanup scope.
+            await _run_owned_durable_sqlite(acquire_owned_lease)
             await assert_completed_stage_provenance()
             durable = await _run_owned_durable_sqlite(self.repository.get_run, run_id)
             if durable["status"] == "RUNNING":
-                await _run_owned_durable_sqlite(self.repository.recover_interrupted_run, 
+                await _run_owned_durable_sqlite(self.repository.recover_interrupted_run,
                     run_id, lease_owner=owner,
                 )
                 durable = await _run_owned_durable_sqlite(self.repository.get_run, run_id)
@@ -348,7 +358,7 @@ class DurableAutopilotOrchestrator:
                     raise DurableRunStateError(
                         "crashed in-flight step needs explicit reconciliation"
                     )
-            await _run_owned_durable_sqlite(self.repository.transition_run, 
+            await _run_owned_durable_sqlite(self.repository.transition_run,
                 run_id, expected_status=str(durable["status"]),
                 new_status="RUNNING", lease_owner=owner,
             )
@@ -381,7 +391,7 @@ class DurableAutopilotOrchestrator:
                 upstream = fingerprint
                 step = current_steps.get(hook_name)
                 if step is None:
-                    step = await _run_owned_durable_sqlite(self.repository.create_step, 
+                    step = await _run_owned_durable_sqlite(self.repository.create_step,
                         run_id=run_id, step_key=hook_name,
                         input_fingerprint=fingerprint,
                         lease_owner=owner,
@@ -401,14 +411,14 @@ class DurableAutopilotOrchestrator:
                             run.store(hook_name, value)
                         run.log_event("step_skipped", {"step": hook_name})
                         continue
-                    await _run_owned_durable_sqlite(self.repository.mark_step_stale, 
+                    await _run_owned_durable_sqlite(self.repository.mark_step_stale,
                         step["id"], new_fingerprint=fingerprint,
                         lease_owner=owner,
                     )
                 elif step["status"] == "PENDING" and (
                     step["input_fingerprint"] != fingerprint
                 ):
-                    await _run_owned_durable_sqlite(self.repository.set_pending_fingerprint, 
+                    await _run_owned_durable_sqlite(self.repository.set_pending_fingerprint,
                         step["id"], input_fingerprint=fingerprint,
                         lease_owner=owner,
                     )
@@ -430,7 +440,7 @@ class DurableAutopilotOrchestrator:
                     )
 
                 # No untracked result is treated as successful completion.
-                await _run_owned_durable_sqlite(self.repository.start_step, 
+                await _run_owned_durable_sqlite(self.repository.start_step,
                     step["id"], input_fingerprint=fingerprint,
                     lease_owner=owner,
                 )
@@ -462,7 +472,7 @@ class DurableAutopilotOrchestrator:
                                 legacy._finalize, run, heartbeat_task,
                             )
                         _check_heartbeat(heartbeat_task)
-                    await _run_owned_durable_sqlite(self.repository.finish_step, 
+                    await _run_owned_durable_sqlite(self.repository.finish_step,
                         step["id"], status="COMPLETED",
                         output={
                             "value": replayable,
@@ -486,12 +496,12 @@ class DurableAutopilotOrchestrator:
                     # already expired or was reclaimed, only the new owner
                     # may reconcile the still-RUNNING attempt.
                     try:
-                        await _run_owned_durable_sqlite(self.repository.finish_step, 
+                        await _run_owned_durable_sqlite(self.repository.finish_step,
                             step["id"], status="INTERRUPTED",
                             error={"reason": "lease_heartbeat_lost"},
                             lease_owner=owner,
                         )
-                        await _run_owned_durable_sqlite(self.repository.transition_run, 
+                        await _run_owned_durable_sqlite(self.repository.transition_run,
                             run_id, expected_status="RUNNING",
                             new_status="INTERRUPTED", lease_owner=owner,
                         )
@@ -499,12 +509,12 @@ class DurableAutopilotOrchestrator:
                         pass
                     raise
                 except asyncio.CancelledError:
-                    await _run_owned_durable_sqlite(self.repository.finish_step, 
+                    await _run_owned_durable_sqlite(self.repository.finish_step,
                         step["id"], status="INTERRUPTED",
                         error={"reason": "task_cancelled"},
                         lease_owner=owner,
                     )
-                    await _run_owned_durable_sqlite(self.repository.transition_run, 
+                    await _run_owned_durable_sqlite(self.repository.transition_run,
                         run_id, expected_status="RUNNING",
                         new_status="INTERRUPTED", lease_owner=owner,
                     )
@@ -521,11 +531,11 @@ class DurableAutopilotOrchestrator:
                         # silently retried with a fresh stochastic attempt.
                         state = "FAILED_TERMINAL"
                     error = {"type": type(exc).__name__, "message": str(exc)}
-                    await _run_owned_durable_sqlite(self.repository.finish_step, 
+                    await _run_owned_durable_sqlite(self.repository.finish_step,
                         step["id"], status=state, error=error,
                         lease_owner=owner,
                     )
-                    await _run_owned_durable_sqlite(self.repository.transition_run, 
+                    await _run_owned_durable_sqlite(self.repository.transition_run,
                         run_id, expected_status="RUNNING",
                         new_status=state, lease_owner=owner,
                     )
@@ -548,7 +558,7 @@ class DurableAutopilotOrchestrator:
                     active_step_id = None
 
             _check_heartbeat(heartbeat_task)
-            await _run_owned_durable_sqlite(self.repository.transition_run, 
+            await _run_owned_durable_sqlite(self.repository.transition_run,
                 run_id, expected_status="RUNNING",
                 new_status="COMPLETED", lease_owner=owner,
             )
@@ -559,7 +569,7 @@ class DurableAutopilotOrchestrator:
             # Lease failure can also be noticed between stages, with no
             # active Step. The Run must not be left as a normal success.
             try:
-                await _run_owned_durable_sqlite(self.repository.transition_run, 
+                await _run_owned_durable_sqlite(self.repository.transition_run,
                     run_id, expected_status="RUNNING",
                     new_status="INTERRUPTED", lease_owner=owner,
                 )
@@ -571,13 +581,18 @@ class DurableAutopilotOrchestrator:
                 heartbeat_task.cancel()
                 with suppress(asyncio.CancelledError, DurableHeartbeatLostError):
                     await heartbeat_task
-            # Old process owners cannot release a newly reclaimed lease.
-            try:
-                await _run_owned_durable_sqlite(self.repository.release_lease, 
-                    work_id=self.work_id, lease_owner=owner,
-                )
-            except WorkLeaseConflictError:
-                pass
+            # Never release another worker's lease on failed acquisition.
+            # Cancellation of the acquire waiter still leaves this flag set
+            # if the owned worker successfully acquired the Work lease.
+            if lease_acquired.is_set():
+                try:
+                    await _run_owned_durable_sqlite(
+                        self.repository.release_lease,
+                        work_id=self.work_id, lease_owner=owner,
+                    )
+                except WorkLeaseConflictError:
+                    # An expired or rotated lease remains for explicit recovery.
+                    pass
 
 
 __all__ = [
