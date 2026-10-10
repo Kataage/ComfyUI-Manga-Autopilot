@@ -1100,6 +1100,7 @@ async def cleanup_runs(request: web.Request) -> web.Response:
         dry_run=plan.dry_run,
         protected_run_ids=plan.protected_run_ids,
         candidates=plan.candidates,
+        policy=plan.policy,
     )
 
     result = execute_run_cleanup_plan(plan)
