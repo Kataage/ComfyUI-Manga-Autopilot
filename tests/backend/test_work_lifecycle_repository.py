@@ -2419,3 +2419,73 @@ def test_issue403_parallel_work_open_with_forced_refresh_has_no_temp_collision(
         "app_version"
     ] == "current"
     assert not list(created.root.glob("manifest.json.*.tmp"))
+
+
+def test_phase_c_audit_recovery_snapshot_survives_checkpoint_between_db_and_wal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A valid live Work must not be quarantined by a mixed-generation copy.
+
+    Simulate an ordinary SQLite WAL checkpoint at the exact inter-file copy
+    boundary; the source has already committed its repaired authoritative
+    revision before the recovery scan starts.
+    """
+    repository = WorkLifecycleRepository(tmp_path)
+    work_id = "work_checkpoint_race"
+    created = repository.create_work(work_id=work_id, title="Valid recovered Work")
+    staging = tmp_path / "works" / f".creating-{work_id}"
+    os.replace(created.root, staging)
+    with repository_write(repository.paths.master_db) as connection:
+        connection.execute(
+            "DELETE FROM work_catalog WHERE work_id = ?", (work_id,),
+        )
+    database = staging / "work.sqlite3"
+    keeper = sqlite3.connect(database)
+    try:
+        keeper.execute("PRAGMA journal_mode=WAL")
+        keeper.execute("PRAGMA wal_autocheckpoint=0")
+        # Force main database pages to represent an older, invalid revision
+        # while the newest committed WAL restores the *valid* authoritative
+        # Work head. This is a deterministic two-generation copy fixture,
+        # not a damaged source Work.
+        keeper.execute(
+            "UPDATE work_metadata SET current_revision = current_revision + 99"
+        )
+        keeper.commit()
+        assert keeper.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()[0] == 0
+        keeper.execute(
+            "UPDATE work_metadata SET current_revision = current_revision - 99"
+        )
+        keeper.commit()
+        assert database.with_name(database.name + "-wal").stat().st_size > 0
+
+        clean = repository.scan_recovery()
+        assert len(clean) == 1
+        assert clean[0].kind == "STALE_STAGING_VALID", clean[0].diagnostics
+
+        real_copy = lifecycle_module.shutil.copy2
+        checkpointed = []
+
+        def interleaved_copy(source, destination, *args, **kwargs):
+            result = real_copy(source, destination, *args, **kwargs)
+            if Path(source) == database and not checkpointed:
+                checkpointed.append(True)
+                # Scanner copied the old main-file pages. SQLite now moves
+                # the already-committed repairs out of WAL before WAL copy.
+                assert keeper.execute(
+                    "PRAGMA wal_checkpoint(TRUNCATE)"
+                ).fetchone()[0] == 0
+            return result
+
+        monkeypatch.setattr(lifecycle_module.shutil, "copy2", interleaved_copy)
+        findings = repository.scan_recovery()
+        assert checkpointed, "test did not hit database/WAL copy boundary"
+        assert len(findings) == 1
+        assert findings[0].kind == "STALE_STAGING_VALID", (
+            "recovery classified a healthy Work as corrupt because its "
+            "copied main DB precedes a WAL checkpoint while the copied WAL "
+            "follows it; a false quarantine recommendation risks valid data"
+        )
+        assert findings[0].recommended_action == "finalize"
+    finally:
+        keeper.close()
