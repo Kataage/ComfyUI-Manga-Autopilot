@@ -340,9 +340,23 @@ class DurableAutopilotOrchestrator:
                         )
                         step_to_renew = active_step_id
                         if step_to_renew is not None:
-                            self.repository.heartbeat_step(
-                                step_to_renew, lease_owner=owner,
-                            )
+                            try:
+                                self.repository.heartbeat_step(
+                                    step_to_renew, lease_owner=owner,
+                                )
+                            except DurableRunStateError:
+                                # Completion may commit concurrently with
+                                # the guardian's lease/Run renewals. A
+                                # now-terminal Step needs no further tick;
+                                # a still-RUNNING or PENDING Step error must
+                                # fail closed, not mask a real lost guardian.
+                                current = self.repository.get_step(step_to_renew)
+                                if current["status"] not in {
+                                    "COMPLETED", "INTERRUPTED",
+                                    "FAILED_RETRYABLE", "FAILED_TERMINAL",
+                                    "NEEDS_ATTENTION",
+                                }:
+                                    raise
 
                     await _run_owned_durable_sqlite(renew_one_cycle)
                 except Exception as exc:
