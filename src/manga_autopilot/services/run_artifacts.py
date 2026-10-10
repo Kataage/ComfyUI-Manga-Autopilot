@@ -13,6 +13,8 @@ import logging
 import shutil
 from pathlib import Path
 
+from manga_autopilot.services.run_cleanup import project_run_directory_lock
+
 log = logging.getLogger(__name__)
 
 # Files to mirror when they exist on project root.
@@ -40,43 +42,43 @@ def mirror_latest_artifacts_to_run(project_root: Path, run_id: str) -> dict[str,
 
     Raises :class:`MirrorError` on I/O failure.
     """
-    project_root = Path(project_root)
-    run_dir = project_root / "runs" / run_id
-    run_dir.mkdir(parents=True, exist_ok=True)
+    project_root = Path(project_root)    with project_run_directory_lock(project_root):
+        run_dir = project_root / "runs" / run_id
+        run_dir.mkdir(parents=True, exist_ok=True)
 
-    mirrored: dict[str, str] = {}
+        mirrored: dict[str, str] = {}
 
-    # ---- JSON files ----
-    for name in _JSON_FILES:
-        src = project_root / name
-        if not src.exists():
-            continue
-        dst = run_dir / name
-        # Never overwrite run.json which may already contain richer metadata.
-        if dst.exists() and name == "run.json":
-            continue
-        try:
-            shutil.copy2(src, dst)
-            mirrored[name] = f"runs/{run_id}/{name}"
-        except OSError as exc:
-            raise MirrorError(f"failed to copy {name}: {exc}") from exc
+        # ---- JSON files ----
+        for name in _JSON_FILES:
+            src = project_root / name
+            if not src.exists():
+                continue
+            dst = run_dir / name
+            # Never overwrite run.json which may already contain richer metadata.
+            if dst.exists() and name == "run.json":
+                continue
+            try:
+                shutil.copy2(src, dst)
+                mirrored[name] = f"runs/{run_id}/{name}"
+            except OSError as exc:
+                raise MirrorError(f"failed to copy {name}: {exc}") from exc
 
-    # ---- Directories ----
-    for dirname in _DIR_NAMES:
-        src_dir = project_root / dirname
-        if not src_dir.exists() or not src_dir.is_dir():
-            continue
-        dst_dir = run_dir / dirname
-        try:
-            if dst_dir.exists():
-                shutil.rmtree(dst_dir)
-            shutil.copytree(src_dir, dst_dir)
-            mirrored[dirname] = f"runs/{run_id}/{dirname}"
-        except OSError as exc:
-            raise MirrorError(f"failed to copy directory {dirname}: {exc}") from exc
+        # ---- Directories ----
+        for dirname in _DIR_NAMES:
+            src_dir = project_root / dirname
+            if not src_dir.exists() or not src_dir.is_dir():
+                continue
+            dst_dir = run_dir / dirname
+            try:
+                if dst_dir.exists():
+                    shutil.rmtree(dst_dir)
+                shutil.copytree(src_dir, dst_dir)
+                mirrored[dirname] = f"runs/{run_id}/{dirname}"
+            except OSError as exc:
+                raise MirrorError(f"failed to copy directory {dirname}: {exc}") from exc
 
-    log.info("mirrored %d artefacts for run %s", len(mirrored), run_id)
-    return mirrored
+        log.info("mirrored %d artefacts for run %s", len(mirrored), run_id)
+        return mirrored
 
 
 def read_run_artifacts_summary(project_root: Path, run_id: str) -> dict[str, str | None]:
