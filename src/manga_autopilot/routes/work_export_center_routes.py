@@ -24,6 +24,7 @@ from manga_autopilot.repositories import (
     WorkIdentityMismatchError,
     WorkNotFoundError,
 )
+from manga_autopilot.routes.work_io import run_owned_work_io
 from manga_autopilot.services.page_export_freshness import page_png_freshness
 from manga_autopilot.services.page_png_budget import (
     MAX_SERVABLE_PNG_BYTES,
@@ -179,30 +180,66 @@ def _ensure_page_png(row: dict[str, Any], artifact_id: str) -> None:
         )
 
 
+def _read_export_list(repository: ArtifactRepository) -> list[dict[str, Any]]:
+    """Keep Work open and all freshness reads in one worker-owned snapshot."""
+    handle = repository._open()
+    with repository_read(handle.database_path) as conn:
+        # Artifact publication and invalidations must share one snapshot.
+        conn.execute("BEGIN")
+        try:
+            rows = [
+                dict(row) for row in conn.execute(
+                    """SELECT * FROM artifacts
+                    WHERE artifact_type = 'page_render'
+                      AND scope_type = 'page'
+                      AND mime_type = 'image/png'
+                      AND status = 'READY'
+                      AND archived_at IS NULL
+                    ORDER BY created_commit_seq DESC, id DESC"""
+                )
+            ]
+            return [_present(row, page_png_freshness(conn, row)) for row in rows]
+        finally:
+            conn.rollback()
+
+
+def _read_export_download(
+    repository: ArtifactRepository, artifact_id: str,
+) -> tuple[Path, dict[str, Any], dict[str, Any]]:
+    """Read current/historical metadata and freshness in one SQLite snapshot."""
+    handle = repository._open()
+    with repository_read(handle.database_path) as conn:
+        conn.execute("BEGIN")
+        try:
+            record = conn.execute(
+                "SELECT * FROM artifacts WHERE id = ?", (artifact_id,)
+            ).fetchone()
+            if record is None:
+                raise ArtifactNotFoundError(f"artifact not found: {artifact_id}")
+            row = dict(record)
+            _ensure_page_png(row, artifact_id)
+            freshness = page_png_freshness(conn, row)
+        finally:
+            conn.rollback()
+    return handle.root, row, freshness
+
+
+def _snapshot_from_work(
+    root: Path, row: dict[str, Any],
+):
+    """Resolve managed paths and verify bytes together in an off-loop worker."""
+    path = assert_managed_path(
+        root.joinpath(*row["relative_path"].split("/")),
+        containment_root=root,
+        field_name="Work Page PNG export",
+    )
+    return _verified_png_snapshot(path, row)
+
+
 async def list_work_exports(request: web.Request) -> web.Response:
     try:
         repository = _repository(request)
-        handle = repository._open()
-        with repository_read(handle.database_path) as conn:
-            # The artifacts and their later invalidations share one snapshot.
-            conn.execute("BEGIN")
-            try:
-                rows = [
-                    dict(row) for row in conn.execute(
-                        """SELECT * FROM artifacts
-                        WHERE artifact_type = 'page_render'
-                          AND scope_type = 'page'
-                          AND mime_type = 'image/png'
-                          AND status = 'READY'
-                          AND archived_at IS NULL
-                        ORDER BY created_commit_seq DESC, id DESC"""
-                    )
-                ]
-                exports = [
-                    _present(row, page_png_freshness(conn, row)) for row in rows
-                ]
-            finally:
-                conn.rollback()
+        exports = await run_owned_work_io(_read_export_list, repository)
         return web.json_response({
             "work_id": request.match_info["work_id"],
             "exports": exports,
@@ -218,20 +255,9 @@ async def get_work_export_png(request: web.Request) -> web.Response:
         require_current = request.query.get("require_current", "0")
         if require_current not in {"0", "1"}:
             raise ValueError("require_current must be 0 or 1")
-        handle = repository._open()
-        with repository_read(handle.database_path) as conn:
-            conn.execute("BEGIN")
-            try:
-                record = conn.execute(
-                    "SELECT * FROM artifacts WHERE id = ?", (artifact_id,)
-                ).fetchone()
-                if record is None:
-                    raise ArtifactNotFoundError(f"artifact not found: {artifact_id}")
-                row = dict(record)
-                _ensure_page_png(row, artifact_id)
-                freshness = page_png_freshness(conn, row)
-            finally:
-                conn.rollback()
+        root, row, freshness = await run_owned_work_io(
+            _read_export_download, repository, artifact_id,
+        )
         # Historical downloads remain available. Consumers explicitly requiring
         # fresh output fail closed, without converting READY into a stale status.
         if require_current == "1" and not freshness["is_current"]:
@@ -253,15 +279,11 @@ async def get_work_export_png(request: web.Request) -> web.Response:
                 status=429, headers={"Retry-After": "2"},
             )
         try:
-            path = assert_managed_path(
-                handle.root.joinpath(*row["relative_path"].split("/")),
-                containment_root=handle.root,
-                field_name="Work Page PNG export",
-            )
             # Validate a pinned original file descriptor and copy in bounded
             # chunks. Stream only from the verified independent temp snapshot.
+            # Path validation stays off the event loop, inside this same worker.
             snapshot = await _owned_download_thread(
-                _verified_png_snapshot, path, row, close_cancelled_result=True,
+                _snapshot_from_work, root, row, close_cancelled_result=True,
             )
             try:
                 response = web.StreamResponse(
