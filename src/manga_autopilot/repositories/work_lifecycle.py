@@ -609,15 +609,47 @@ def _recovery_validation_snapshot(root: Path) -> Iterator[Path]:
 
         # SQLite's online backup reads a coherent committed view, including
         # pending WAL frames, even if another connection checkpoints while it
-        # is copying. The source is opened read-only; both SQLite connections
-        # stay within this scope and the source's critical files are untouched.
+        # is copying. A normal mode=ro SQLite open may create a WAL/-shm
+        # sidecar even for an idle, fully checkpointed source. For a database
+        # with no WAL/journal evidence, immutable read-only mode avoids those
+        # scanner-originated source filesystem changes. Recheck for concurrent
+        # source changes and fall back to the live WAL-aware snapshot if needed.
         snapshot_db = snapshot_root / database_path.name
-        with repository_read(database_path) as source_connection:
-            target_connection = sqlite3.connect(snapshot_db)
+        wal = database_path.with_name(database_path.name + "-wal")
+        journal = database_path.with_name(database_path.name + "-journal")
+        needs_live_read = wal.exists() or journal.exists()
+        if not needs_live_read:
+            before_stat = database_path.stat()
+            source_connection = sqlite3.connect(
+                f"{database_path.as_uri()}?mode=ro&immutable=1",
+                uri=True,
+            )
             try:
-                source_connection.backup(target_connection, pages=64, sleep=0.05)
+                target_connection = sqlite3.connect(snapshot_db)
+                try:
+                    source_connection.backup(
+                        target_connection, pages=64, sleep=0.05,
+                    )
+                finally:
+                    target_connection.close()
             finally:
-                target_connection.close()
+                source_connection.close()
+            after_stat = database_path.stat()
+            needs_live_read = (
+                wal.exists() or journal.exists()
+                or before_stat.st_mtime_ns != after_stat.st_mtime_ns
+                or before_stat.st_size != after_stat.st_size
+                or before_stat.st_ino != after_stat.st_ino
+            )
+        if needs_live_read:
+            with repository_read(database_path) as source_connection:
+                target_connection = sqlite3.connect(snapshot_db)
+                try:
+                    source_connection.backup(
+                        target_connection, pages=64, sleep=0.05,
+                    )
+                finally:
+                    target_connection.close()
 
         yield snapshot_root
 
