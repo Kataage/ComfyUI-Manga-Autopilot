@@ -2012,3 +2012,72 @@ async def test_issue407_pending_step_is_not_heartbeated_until_start_is_durable(
     assert first_run_tick.is_set(), "the lease guardian never renewed the Run"
     assert result.machine.state.value == "COMPLETED"
     assert repo.inspect_lease("work_246") is None
+
+
+def test_issue407_atomic_guardian_cycle_renews_all_receipts_or_none(
+    tmp_path: Path,
+) -> None:
+    """Lease/Run/Step heartbeats are one visible, fenced DB commit."""
+    class Clock:
+        moment = datetime(2026, 10, 9, tzinfo=timezone.utc)
+
+        def __call__(self):
+            return self.moment
+
+    db = work(tmp_path)
+    clock = Clock()
+    repo = DurableRunRepository(db, clock=clock)
+    run_id = start(repo)
+    repo.acquire_lease(
+        work_id="work_246", lease_owner="atomic_heartbeat",
+        lease_kind="AUTOPILOT_MUTATION", ttl_seconds=6, run_id=run_id,
+    )
+    repo.transition_run(
+        run_id, expected_status="PENDING", new_status="RUNNING",
+        lease_owner="atomic_heartbeat",
+    )
+    step = repo.create_step(
+        run_id=run_id, step_key="validate_input",
+        input_fingerprint="atomic:v1", lease_owner="atomic_heartbeat",
+    )
+    repo.start_step(
+        step["id"], input_fingerprint="atomic:v1",
+        lease_owner="atomic_heartbeat",
+    )
+    clock.moment += timedelta(seconds=2)
+    repo.heartbeat_owned_cycle(
+        work_id="work_246", run_id=run_id,
+        lease_owner="atomic_heartbeat", ttl_seconds=6, step_id=step["id"],
+    )
+    with repository_read(db) as conn:
+        lease = dict(conn.execute("SELECT * FROM work_leases").fetchone())
+        run = dict(conn.execute(
+            "SELECT * FROM runs WHERE id = ?", (run_id,),
+        ).fetchone())
+        persisted_step = dict(conn.execute(
+            "SELECT * FROM run_steps WHERE id = ?", (step["id"],),
+        ).fetchone())
+    now = clock.moment.isoformat()
+    assert lease["heartbeat_at"] == run["heartbeat_at"]
+    assert run["heartbeat_at"] == persisted_step["heartbeat_at"] == now
+    assert lease["expires_at"] == (clock.moment + timedelta(seconds=6)).isoformat()
+
+    # A stale worker may not renew even one of these three rows.
+    clock.moment += timedelta(seconds=7)
+    with pytest.raises(WorkLeaseConflictError):
+        repo.heartbeat_owned_cycle(
+            work_id="work_246", run_id=run_id,
+            lease_owner="atomic_heartbeat", ttl_seconds=6,
+            step_id=step["id"],
+        )
+    with repository_read(db) as conn:
+        stored_lease = dict(conn.execute("SELECT * FROM work_leases").fetchone())
+        stored_run = dict(conn.execute(
+            "SELECT * FROM runs WHERE id = ?", (run_id,),
+        ).fetchone())
+        stored_step = dict(conn.execute(
+            "SELECT * FROM run_steps WHERE id = ?", (step["id"],),
+        ).fetchone())
+    assert stored_lease == lease
+    assert stored_run == run
+    assert stored_step == persisted_step
