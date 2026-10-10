@@ -1874,3 +1874,42 @@ async def test_issue407_slow_lease_renewal_does_not_block_guardian_event_loop(
         "Durable lease guardian's synchronous SQLite heartbeat blocks "
         "unrelated event-loop work during its database wait"
     )
+
+
+@pytest.mark.asyncio
+async def test_issue407_cancelled_lease_acquisition_drains_and_releases_owner(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Cancel must not orphan a lease successfully acquired in a worker."""
+    db = work(tmp_path)
+    repo = DurableRunRepository(db)
+    run_id = start(repo)
+    entered = threading.Event()
+    release = threading.Event()
+    original = DurableRunRepository.acquire_lease
+
+    def blocked_acquire(self, *args, **kwargs):
+        entered.set()
+        if not release.wait(timeout=12):
+            raise TimeoutError("controlled Work lease acquire not released")
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(DurableRunRepository, "acquire_lease", blocked_acquire)
+    task = asyncio.create_task(runner(repo, OrchestratorHooks()).execute(
+        run_id, input_payload={}, step_inputs={}, lease_owner="cancel_acquire",
+    ))
+    try:
+        assert await asyncio.to_thread(entered.wait, 10)
+        task.cancel()
+        await asyncio.sleep(0.05)
+        task.cancel()
+        await asyncio.sleep(0.05)
+        assert not task.done(), "cancelled acquire abandoned its SQLite worker"
+    finally:
+        release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, timeout=20)
+    assert repo.inspect_lease("work_246") is None, (
+        "cancelled acquisition created a live lease that no Run owns"
+    )
+    assert repo.get_run(run_id)["status"] == "PENDING"
