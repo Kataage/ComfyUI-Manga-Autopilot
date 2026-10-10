@@ -767,14 +767,14 @@ def test_issue413_archived_entity_recovery_is_exclusive_and_revision_guarded(
     _setup(repositories)
     is_page = scope == "page"
     record = pages.get_page("page_001") if is_page else panels.get_panel("panel_001")
-    update = (
-        lambda expected_revision, **changes: pages.update_page(
-            "page_001", expected_revision=expected_revision, **changes,
-        )
-        if is_page else panels.update_panel(
+    def update(expected_revision, **changes):
+        if is_page:
+            return pages.update_page(
+                "page_001", expected_revision=expected_revision, **changes,
+            )
+        return panels.update_panel(
             "panel_001", expected_revision=expected_revision, **changes,
         )
-    )
     archived = update(
         record["revision"], archived_at="2026-10-11T03:00:00Z",
     )
@@ -820,6 +820,7 @@ def test_issue413_archive_race_fences_later_semantic_update(
     import threading
 
     import manga_autopilot.repositories.page_domain as domain
+    from manga_autopilot.repositories.page_domain import PageDomainArchivedError
 
     pages, _, panels = repositories
     _setup(repositories)
@@ -828,14 +829,14 @@ def test_issue413_archive_race_fences_later_semantic_update(
     target_id = "page_001" if is_page else "panel_001"
     repo = pages if is_page else panels
     record = repo.get_page(target_id) if is_page else repo.get_panel(target_id)
-    update = (
-        lambda expected_revision, **changes: pages.update_page(
+    def update(expected_revision, **changes):
+        if is_page:
+            return pages.update_page(
+                target_id, expected_revision=expected_revision, **changes,
+            )
+        return panels.update_panel(
             target_id, expected_revision=expected_revision, **changes,
         )
-        if is_page else panels.update_panel(
-            target_id, expected_revision=expected_revision, **changes,
-        )
-    )
     at_archive_lock = threading.Event()
     allow_archive = threading.Event()
     attempted_edit = threading.Event()
