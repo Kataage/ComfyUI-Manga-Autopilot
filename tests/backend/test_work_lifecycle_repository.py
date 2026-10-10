@@ -2524,9 +2524,12 @@ def test_issue409_recovery_online_backup_reads_committed_wal_without_source_writ
     try:
         assert keeper.execute("PRAGMA journal_mode=WAL").fetchone()[0] == "wal"
         keeper.execute("PRAGMA wal_autocheckpoint=0")
-        # SQLite commits a logically unchanged but WAL-resident authoritative
-        # Work row; a main-only raw copy cannot be assumed current.
-        keeper.execute("UPDATE work_metadata SET status = status")
+        # Commit a real, head-consistent Work metadata update into WAL.
+        # Updating an identical value may generate NO WAL frame in SQLite.
+        keeper.execute(
+            "UPDATE work_metadata SET updated_at = ?",
+            ("2026-10-10T00:00:00+00:00",),
+        )
         keeper.commit()
         wal = database.with_name(database.name + "-wal")
         assert wal.is_file() and wal.stat().st_size > 0
