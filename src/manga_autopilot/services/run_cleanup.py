@@ -182,7 +182,7 @@ def _read_run_json(run_dir: Path) -> dict | None:
         return None
     try:
         return json.loads(run_json.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError):
+    except (json.JSONDecodeError, OSError, UnicodeError):
         return None
 
 
@@ -227,14 +227,14 @@ def build_run_cleanup_plan(
             policy=policy,
         )
 
-    # Read latest_run_id.txt
-    latest_file = project_root / "latest_run_id.txt"
-    latest_run_id = ""
-    if latest_file.exists():
-        try:
-            latest_run_id = latest_file.read_text(encoding="utf-8").strip()
-        except OSError:
-            pass
+    # Use the same fail-closed latest pointer read as the deletion executor.
+    # An unreadable/corrupt pointer cannot authorize any cleanup candidates.
+    latest_run_id = _current_latest(project_root)
+    if latest_run_id is None:
+        return RunCleanupPlan(
+            project_id="", dry_run=policy.dry_run,
+            protected_run_ids=[], candidates=[], policy=policy,
+        )
 
     # Only a validated persisted start time may determine recency. The
     # second-resolution run ID's random suffix must never rank distinct Runs.
