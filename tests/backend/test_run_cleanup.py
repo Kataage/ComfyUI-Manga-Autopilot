@@ -657,3 +657,92 @@ def test_phase_c_post423_audit_cleanup_execute_preserves_symlinked_runs_root(
     )
     assert (outside_run / "important.txt").read_text() == "must survive"
     assert "run_outside" not in result.deleted_run_ids
+
+
+
+def test_issue425_rejects_linked_runs_parent_added_after_valid_plan(
+    tmp_path: Path,
+) -> None:
+    """A stale plan cannot delete a matching Run in a newly linked foreign tree."""
+    project = tmp_path / "project"
+    project.mkdir()
+    local = _create_fake_run(project, "run_old", "COMPLETED")
+    _create_fake_run(project, "run_latest", "COMPLETED")
+    (project / "latest_run_id.txt").write_text("run_latest")
+    plan = build_run_cleanup_plan(
+        project, RunCleanupPolicy(keep_last=0, dry_run=False),
+    )
+    assert [c.run_id for c in plan.candidates] == ["run_old"]
+
+    original_runs = project / "runs"
+    original_runs.rename(project / "saved_runs")
+    outside = tmp_path / "other_project"
+    outside.mkdir()
+    foreign = _create_fake_run(outside, "run_old", "COMPLETED")
+    (foreign / "must_survive.txt").write_text("foreign")
+    try:
+        original_runs.symlink_to(outside / "runs", target_is_directory=True)
+    except (OSError, NotImplementedError):
+        pytest.skip("directory symlinks require platform privileges")
+
+    result = execute_run_cleanup_plan(plan)
+    assert result.deleted_run_ids == []
+    assert result.skipped_run_ids == ["run_old"]
+    assert (foreign / "must_survive.txt").read_text() == "foreign"
+    assert (project / "saved_runs" / "run_old" / "run.json").exists()
+
+
+def test_issue425_rejects_replaced_real_runs_parent_after_plan(
+    tmp_path: Path,
+) -> None:
+    """A fresh real directory under the same lexical name is not the old plan."""
+    project = tmp_path / "project"
+    project.mkdir()
+    original = _create_fake_run(project, "run_old", "COMPLETED")
+    _create_fake_run(project, "run_latest", "COMPLETED")
+    (project / "latest_run_id.txt").write_text("run_latest")
+    plan = build_run_cleanup_plan(
+        project, RunCleanupPolicy(keep_last=0, dry_run=False),
+    )
+    assert [c.run_id for c in plan.candidates] == ["run_old"]
+
+    (project / "runs").rename(project / "saved_runs")
+    replacement = _create_fake_run(project, "run_old", "COMPLETED")
+    (replacement / "preserve.txt").write_text("new parent")
+    result = execute_run_cleanup_plan(plan)
+    assert result.deleted_run_ids == []
+    assert result.skipped_run_ids == ["run_old"]
+    assert (replacement / "preserve.txt").read_text() == "new parent"
+    assert (project / "saved_runs" / original.name / "run.json").exists()
+
+
+def test_issue425_legitimate_cleanup_uses_project_root_quarantine(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Normal deletion stays inside the Project and frees its quarantine."""
+    project = tmp_path / "project"
+    project.mkdir()
+    old = _create_fake_run(project, "run_old", "COMPLETED")
+    _create_fake_run(project, "run_latest", "COMPLETED")
+    (project / "latest_run_id.txt").write_text("run_latest")
+    plan = build_run_cleanup_plan(
+        project, RunCleanupPolicy(keep_last=0, dry_run=False),
+    )
+    original_rename = Path.rename
+    moved_to = []
+
+    def capture_rename(self: Path, destination: Path):
+        if self == old:
+            moved_to.append(Path(destination))
+        return original_rename(self, destination)
+
+    monkeypatch.setattr(Path, "rename", capture_rename)
+    result = execute_run_cleanup_plan(plan)
+    assert result.errors == []
+    assert result.deleted_run_ids == ["run_old"]
+    assert len(moved_to) == 1
+    assert moved_to[0].parent == project
+    assert moved_to[0].name.startswith(".cleanup-quarantine-")
+    assert not moved_to[0].exists()
+    assert not old.exists()
+    assert (project / "runs" / "run_latest" / "run.json").exists()
