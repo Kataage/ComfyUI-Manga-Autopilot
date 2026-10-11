@@ -609,3 +609,51 @@ def test_issue421_execution_rechecks_new_started_at_under_run_lock(
     assert result.deleted_run_ids == []
     assert result.skipped_run_ids == [older]
     assert target.is_dir()
+
+
+
+def _audit_linked_runs_root(tmp_path: Path) -> tuple[Path, Path]:
+    """Keep the deletion target inside pytest's temporary area, but outside Project."""
+    outside_project = tmp_path / "outside_project"
+    outside_project.mkdir()
+    outside_run = _create_fake_run(outside_project, "run_outside", "COMPLETED")
+    (outside_run / "important.txt").write_text("must survive")
+    project = tmp_path / "project"
+    project.mkdir()
+    try:
+        (project / "runs").symlink_to(
+            outside_project / "runs", target_is_directory=True,
+        )
+    except (OSError, NotImplementedError):
+        pytest.skip("directory symlinks require platform privileges")
+    return project, outside_run
+
+
+def test_phase_c_post423_audit_cleanup_plan_rejects_symlinked_runs_root(
+    tmp_path: Path,
+) -> None:
+    """A Project/runs link must never authorize external directory deletion."""
+    project, outside_run = _audit_linked_runs_root(tmp_path)
+    plan = build_run_cleanup_plan(
+        project, RunCleanupPolicy(keep_last=0, dry_run=False),
+    )
+    assert plan.candidates == [], (
+        "run cleanup must not enumerate external Runs through a linked parent"
+    )
+    assert outside_run.is_dir()
+
+
+def test_phase_c_post423_audit_cleanup_execute_preserves_symlinked_runs_root(
+    tmp_path: Path,
+) -> None:
+    """Even a live plan must never recursively delete an external Run."""
+    project, outside_run = _audit_linked_runs_root(tmp_path)
+    plan = build_run_cleanup_plan(
+        project, RunCleanupPolicy(keep_last=0, dry_run=False),
+    )
+    result = execute_run_cleanup_plan(plan)
+    assert outside_run.is_dir(), (
+        "Run cleanup removed a directory outside the Project through runs/ link"
+    )
+    assert (outside_run / "important.txt").read_text() == "must survive"
+    assert "run_outside" not in result.deleted_run_ids
