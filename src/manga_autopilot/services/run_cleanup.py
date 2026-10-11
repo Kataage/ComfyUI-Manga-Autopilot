@@ -305,6 +305,12 @@ def build_run_cleanup_plan(
         elif status == "CANCELLED" and policy.delete_cancelled:
             eligible = True
             reason = "older than keep_last"
+        elif status == "RUNNING" and policy.delete_running:
+            # Deliberate opt-in only. Never enable this in the default
+            # policy; latest and directory identity remain fenced, and
+            # executor rechecks status/policy under the publisher lock.
+            eligible = True
+            reason = "explicitly authorized RUNNING cleanup"
 
         if eligible:
             identity = _directory_identity(run_path)
