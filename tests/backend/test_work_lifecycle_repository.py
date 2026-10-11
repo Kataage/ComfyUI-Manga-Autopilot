@@ -2871,3 +2871,66 @@ def test_phase_c_post435_audit_recovery_resynchronizes_creation_date_before_cata
             "FROM work_metadata WHERE work_id = ?", (work_id,),
         ).fetchone())
     assert current == authoritative
+
+
+@pytest.mark.parametrize("entrypoint", ["reconcile_orphan_work", "finalize_staging_work"])
+@pytest.mark.parametrize("damage", ["foreign_manifest_identity", "missing_work_database"])
+def test_phase_c_post437_audit_idempotent_recovery_rejects_invalid_cataloged_work(
+    tmp_path: Path, entrypoint: str, damage: str,
+) -> None:
+    """An idempotent recovery must not certify a now-invalid cataloged Work."""
+    repository = WorkLifecycleRepository(tmp_path)
+    work_id = f"work_catalog_integrity_{entrypoint}_{damage}"
+    created = repository.create_work(work_id=work_id, title="Recovery Integrity")
+    with repository_read(repository.paths.master_db) as conn:
+        original = dict(conn.execute(
+            "SELECT * FROM work_catalog WHERE work_id = ?", (work_id,),
+        ).fetchone())
+
+    if damage == "foreign_manifest_identity":
+        manifest = json.loads(created.manifest_path.read_text(encoding="utf-8"))
+        manifest["work_id"] = "work_different_identity"
+        created.manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    else:
+        created.database_path.unlink()
+
+    # The master entry exists, but its portable bytes are now invalid.
+    # Ordinary open_work fails closed; both recovery entry points must not
+    # bypass those identity/critical-file checks and report false success.
+    with pytest.raises(WorkRecoveryError):
+        getattr(repository, entrypoint)(work_id)
+
+    with repository_read(repository.paths.master_db) as conn:
+        current = dict(conn.execute(
+            "SELECT * FROM work_catalog WHERE work_id = ?", (work_id,),
+        ).fetchone())
+    assert current == original
+
+
+@pytest.mark.parametrize("entrypoint", ["reconcile_orphan_work", "finalize_staging_work"])
+def test_issue439_healthy_cataloged_work_recovery_remains_read_only(
+    tmp_path: Path, entrypoint: str,
+) -> None:
+    """A healthy already-cataloged Work remains safely idempotent."""
+    repository = WorkLifecycleRepository(tmp_path)
+    work_id = f"work_healthy_recovery_{entrypoint}"
+    created = repository.create_work(work_id=work_id, title="Healthy Recovery")
+    before_catalog = repository.list_works()
+    before_manifest = created.manifest_path.read_bytes()
+    with repository_read(created.database_path) as conn:
+        before_work = dict(conn.execute(
+            "SELECT created_at, current_revision, current_commit_seq "
+            "FROM work_metadata WHERE work_id = ?", (work_id,),
+        ).fetchone())
+
+    result = getattr(repository, entrypoint)(work_id)
+
+    assert (result,) == before_catalog
+    assert created.manifest_path.read_bytes() == before_manifest
+    assert repository.list_works() == before_catalog
+    with repository_read(created.database_path) as conn:
+        after_work = dict(conn.execute(
+            "SELECT created_at, current_revision, current_commit_seq "
+            "FROM work_metadata WHERE work_id = ?", (work_id,),
+        ).fetchone())
+    assert after_work == before_work
