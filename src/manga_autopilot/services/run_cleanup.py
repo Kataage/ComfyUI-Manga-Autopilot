@@ -263,19 +263,33 @@ def build_run_cleanup_plan(
     # instants; arbitrary suffixes never override differing full timestamps.
     run_entries.sort(key=lambda e: (e[3], e[0]), reverse=True)
 
-    for idx, (run_id, status, run_path, _started) in enumerate(run_entries):
-        # Protect latest run
+    # Retention counts terminal Run history, not currently active or
+    # unknown states. Preserve the existing UTC chronology of ALL entries
+    # so a terminal latest Run still consumes exactly one keep_last slot,
+    # even though the latest pointer independently protects that Run.
+    terminal_seen = 0
+    for run_id, status, run_path, _started in run_entries:
+        terminal = (
+            status == "COMPLETED"
+            or status.startswith("FAILED")
+            or status == "CANCELLED"
+        )
+        if terminal:
+            terminal_seen += 1
+
+        # Protect latest run independently from the terminal retention rule.
         if policy.keep_latest and run_id == latest_run_id:
             protected.append(run_id)
             continue
 
-        # Protect running runs
+        # Protect running runs independently from the terminal retention rule.
         if not policy.delete_running and status == "RUNNING":
             protected.append(run_id)
             continue
 
-        # Protect keep_last most recent runs (after latest)
-        if idx < policy.keep_last:
+        # A newer RUNNING/PENDING/PAUSED/UNKNOWN Run cannot evict the
+        # most recent completed/failed/cancelled Run from this budget.
+        if terminal and terminal_seen <= policy.keep_last:
             protected.append(run_id)
             continue
 
