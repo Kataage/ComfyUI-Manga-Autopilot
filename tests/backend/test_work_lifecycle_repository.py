@@ -2723,3 +2723,53 @@ def test_issue431_postcheck_regular_lock_inode_swap_fails_closed(
     assert swapped
     assert saved.read_bytes() == b"0"
     assert lock_path.read_bytes() == b""
+
+
+
+@pytest.mark.parametrize("forged_created_at", ["2099-12-31T23:59:59+00:00", ""])
+def test_phase_c_post433_audit_open_restores_manifest_created_at_from_work_db(
+    tmp_path: Path, forged_created_at: str,
+) -> None:
+    """The portable manifest cannot override the Work DB's creation instant."""
+    repository = WorkLifecycleRepository(tmp_path, app_version="audit")
+    created = repository.create_work(work_id="work_creation_clock", title="Clock")
+    with repository_read(created.database_path) as conn:
+        authoritative = conn.execute(
+            "SELECT created_at FROM work_metadata WHERE work_id = ?",
+            (created.work_id,),
+        ).fetchone()["created_at"]
+    manifest = json.loads(created.manifest_path.read_text(encoding="utf-8"))
+    assert manifest["created_at"] == authoritative
+    manifest["created_at"] = forged_created_at
+    created.manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    reopened = repository.open_work(created.work_id)
+    refreshed = json.loads(reopened.manifest_path.read_text(encoding="utf-8"))
+    assert reopened.created_at == authoritative
+    assert refreshed["created_at"] == authoritative, (
+        "open_work silently treated a modifiable manifest timestamp as "
+        "authoritative even though work_metadata.created_at is the Work truth"
+    )
+
+
+def test_phase_c_post433_audit_legacy_manifest_normalization_uses_db_creation_date(
+    tmp_path: Path,
+) -> None:
+    """The legacy-to-live manifest upgrade must not perpetuate forged metadata."""
+    repository = WorkLifecycleRepository(tmp_path, app_version="audit")
+    created = repository.create_work(work_id="work_legacy_clock", title="Legacy")
+    with repository_read(created.database_path) as conn:
+        authoritative = conn.execute(
+            "SELECT created_at FROM work_metadata WHERE work_id = ?",
+            (created.work_id,),
+        ).fetchone()["created_at"]
+    legacy = json.loads(created.manifest_path.read_text(encoding="utf-8"))
+    legacy["format_version"] = 1
+    legacy["integrity"] = {"database_sha256": "0" * 64}
+    legacy["created_at"] = "2100-01-01T00:00:00+00:00"
+    created.manifest_path.write_text(json.dumps(legacy), encoding="utf-8")
+
+    reopened = repository.open_work(created.work_id)
+    normalized = json.loads(reopened.manifest_path.read_text(encoding="utf-8"))
+    assert normalized["format_version"] == 2
+    assert normalized["created_at"] == authoritative
