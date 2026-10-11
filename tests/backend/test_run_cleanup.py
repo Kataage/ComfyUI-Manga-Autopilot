@@ -1093,3 +1093,131 @@ async def test_issue429_real_json_false_flags_preserve_existing_behavior(
     assert result["deleted_run_ids"] == ["run_completed_old"]
     assert not old.exists()
     assert keep.is_dir()
+
+
+
+def test_phase_c_post431_audit_explicit_delete_running_selects_nonlatest_run(
+    tmp_path: Path,
+) -> None:
+    """A deliberately enabled RUNNING deletion flag must not be a no-op."""
+    project = tmp_path / "project"
+    project.mkdir()
+    _create_fake_run(project, "run_old_running", "RUNNING")
+    latest = _create_fake_run(project, "run_latest", "COMPLETED")
+    (project / "latest_run_id.txt").write_text("run_latest")
+
+    plan = build_run_cleanup_plan(
+        project,
+        RunCleanupPolicy(
+            keep_last=0, dry_run=False, delete_running=True,
+        ),
+    )
+    assert [c.run_id for c in plan.candidates] == ["run_old_running"]
+    assert latest.is_dir()
+
+
+@pytest.mark.asyncio()
+async def test_phase_c_post431_audit_http_explicit_delete_running_executes(
+    aiohttp_client, tmp_path: Path,
+) -> None:
+    """The accepted JSON delete_running=true must match the plan and result."""
+    app = web.Application()
+    register_all(app, storage_root=str(tmp_path))
+    client = await aiohttp_client(app)
+    created = await client.post(
+        "/manga_autopilot/api/projects", json={"name": "Running Cleanup Audit"},
+    )
+    assert created.status == 201
+    project_id = (await created.json())["id"]
+    project = tmp_path / "projects" / project_id
+    running = _create_fake_run(project, "run_old_running", "RUNNING")
+    latest = _create_fake_run(project, "run_latest", "COMPLETED")
+    (project / "latest_run_id.txt").write_text("run_latest")
+    (running / "dummy_output.png").write_bytes(b"temporary fixture")
+
+    response = await client.post(
+        f"/manga_autopilot/api/projects/{project_id}/runs/cleanup",
+        json={
+            "dry_run": False, "keep_last": 0,
+            "delete_running": True, "delete_completed": False,
+        },
+    )
+    assert response.status == 200
+    payload = await response.json()
+    assert payload["deleted_run_ids"] == ["run_old_running"], (
+        "Accepted delete_running=true was ignored during actual cleanup"
+    )
+    assert not running.exists()
+    assert latest.is_dir()
+
+
+
+def test_issue433_running_cleanup_optin_still_protects_latest_and_defaults(
+    tmp_path: Path,
+) -> None:
+    """Explicit RUNNING opt-in must not bypass default/latest protection."""
+    project = tmp_path / "project"
+    project.mkdir()
+    previous = _create_fake_run(project, "run_previous", "RUNNING")
+    current = _create_fake_run(project, "run_current", "RUNNING")
+    (project / "latest_run_id.txt").write_text("run_current", encoding="utf-8")
+    # Original safe default never plans a running directory.
+    safe = build_run_cleanup_plan(
+        project, RunCleanupPolicy(keep_last=0, dry_run=False),
+    )
+    assert safe.candidates == []
+    assert {"run_previous", "run_current"} <= set(safe.protected_run_ids)
+    # Deliberate opt-in deletes only nonlatest RUNNING history.
+    opted = build_run_cleanup_plan(
+        project,
+        RunCleanupPolicy(keep_last=0, delete_running=True, dry_run=False),
+    )
+    assert [c.run_id for c in opted.candidates] == ["run_previous"]
+    assert "run_current" in opted.protected_run_ids
+    assert previous.is_dir() and current.is_dir()
+
+
+def test_issue433_running_optin_dry_run_never_deletes(
+    tmp_path: Path,
+) -> None:
+    """Dry-run stays safe even when RUNNING deletion is explicitly enabled."""
+    project = tmp_path / "project"
+    project.mkdir()
+    previous = _create_fake_run(project, "run_previous", "RUNNING")
+    _create_fake_run(project, "run_current", "COMPLETED")
+    (project / "latest_run_id.txt").write_text("run_current", encoding="utf-8")
+    plan = build_run_cleanup_plan(
+        project, RunCleanupPolicy(keep_last=0, delete_running=True),
+    )
+    assert [c.run_id for c in plan.candidates] == ["run_previous"]
+    result = execute_run_cleanup_plan(plan)
+    assert result.dry_run is True
+    assert result.deleted_run_ids == []
+    assert previous.is_dir()
+
+
+@pytest.mark.parametrize("new_status", ["COMPLETED", "PAUSED", "CANCELLED"])
+def test_issue433_explicit_running_plan_rechecks_live_status_before_delete(
+    tmp_path: Path, new_status: str,
+) -> None:
+    """A stale RUNNING plan cannot authorize another status after transition."""
+    project = tmp_path / "project"
+    project.mkdir()
+    target = _create_fake_run(project, "run_previous", "RUNNING")
+    _create_fake_run(project, "run_latest", "COMPLETED")
+    (project / "latest_run_id.txt").write_text("run_latest", encoding="utf-8")
+    plan = build_run_cleanup_plan(
+        project,
+        RunCleanupPolicy(
+            keep_last=0, delete_running=True, delete_completed=False,
+            delete_cancelled=False, dry_run=False,
+        ),
+    )
+    assert [c.run_id for c in plan.candidates] == ["run_previous"]
+    metadata = json.loads((target / "run.json").read_text(encoding="utf-8"))
+    metadata["status"] = new_status
+    (target / "run.json").write_text(json.dumps(metadata), encoding="utf-8")
+    result = execute_run_cleanup_plan(plan)
+    assert result.deleted_run_ids == []
+    assert result.skipped_run_ids == ["run_previous"]
+    assert target.is_dir()
