@@ -87,6 +87,10 @@ def _positive(value: int, name: str) -> int:
 
 
 def _normalize(field: str, value: Any) -> Any:
+    # A saved Layout/Slot geometry is consumed as an object by Page PNG export.
+    # Other JSON fields can legitimately be lists (e.g. bubble regions).
+    if field == "geometry_json" and not isinstance(value, dict):
+        raise ValueError("geometry_json must be a JSON object")
     if field in _JSON_FIELDS:
         if not isinstance(value, (dict, list)):
             raise ValueError(f"{field} must be a JSON object or array")
