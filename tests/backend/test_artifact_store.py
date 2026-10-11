@@ -230,3 +230,63 @@ class TestResponseContract:
         result = ArtifactUploadResult(artifact_key="test.png")
         with pytest.raises(AttributeError):
             result.artifact_key = "other.png"  # type: ignore[misc]
+
+# ------------------------------------------------ independent Phase C audit
+# Test-only evidence: the *legacy* LocalArtifactStore is distinct from the
+# v2 Work ArtifactRepository fixed in #417. A valid relative upload key
+# must never write outside the configured local storage root.
+
+def test_phase_c_independent_local_artifact_store_rejects_parent_symlink_escape(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "artifacts"
+    root.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    try:
+        (root / "shortcut").symlink_to(outside, target_is_directory=True)
+    except (OSError, NotImplementedError) as exc:
+        pytest.skip(f"directory symlinks unsupported on this CI runner: {exc}")
+
+    store = LocalArtifactStore(root)
+    with pytest.raises(ValueError):
+        store.upload_bytes(key="shortcut/escape.png", data=b"outside payload")
+    assert not (outside / "escape.png").exists()
+
+
+def test_phase_c_independent_local_artifact_store_rejects_final_symlink_overwrite(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "artifacts"
+    root.mkdir()
+    victim = tmp_path / "victim.png"
+    original = b"keep these bytes outside artifact root"
+    victim.write_bytes(original)
+    try:
+        (root / "output.png").symlink_to(victim)
+    except (OSError, NotImplementedError) as exc:
+        pytest.skip(f"file symlinks unsupported on this CI runner: {exc}")
+
+    store = LocalArtifactStore(root)
+    with pytest.raises(ValueError):
+        store.upload_bytes(key="output.png", data=b"unexpected overwrite")
+    assert victim.read_bytes() == original
+
+
+def test_phase_c_independent_local_artifact_store_rejects_windows_drive_absolute_key(
+    tmp_path: Path,
+) -> None:
+    # On Windows, str(victim) is e.g. C:\\...\\victim.png. It does not
+    # start with '/' or '\\' and has no '..' segments, bypassing the
+    # current simplistic key validator; Path(root) / key escapes root.
+    # On POSIX the same absolute path is already rejected (baseline pass).
+    root = tmp_path / "artifacts"
+    root.mkdir()
+    victim = tmp_path / "drive_absolute_victim.png"
+    original = b"outside must remain unchanged"
+    victim.write_bytes(original)
+
+    store = LocalArtifactStore(root)
+    with pytest.raises(ValueError):
+        store.upload_bytes(key=str(victim), data=b"outside was overwritten")
+    assert victim.read_bytes() == original
