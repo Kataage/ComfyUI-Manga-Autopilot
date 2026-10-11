@@ -666,7 +666,7 @@ def test_issue425_rejects_linked_runs_parent_added_after_valid_plan(
     """A stale plan cannot delete a matching Run in a newly linked foreign tree."""
     project = tmp_path / "project"
     project.mkdir()
-    local = _create_fake_run(project, "run_old", "COMPLETED")
+    _create_fake_run(project, "run_old", "COMPLETED")
     _create_fake_run(project, "run_latest", "COMPLETED")
     (project / "latest_run_id.txt").write_text("run_latest")
     plan = build_run_cleanup_plan(
