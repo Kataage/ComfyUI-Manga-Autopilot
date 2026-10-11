@@ -891,3 +891,85 @@ def test_issue413_archive_race_fences_later_semantic_update(
     assert isinstance(outcomes.get("edit_error"), error_type), outcomes
     after = repo.get_page(target_id) if is_page else repo.get_panel(target_id)
     assert after == outcomes["archive"]
+
+
+@pytest.mark.parametrize("mutation", [
+    "create_layout", "create_slot", "update_layout", "update_slot", "mixed_batch",
+])
+def test_issue441_geometry_must_be_an_object_at_domain_boundary(
+    repositories, mutation,
+):
+    pages, layouts, panels = repositories
+    _setup(repositories)
+    pages.create_page(
+        page_id="page_other", page_number=2, order_key="0002",
+        page_purpose="Extra",
+    )
+    before_layout = layouts.get_layout("layout_001")
+    before_slot = layouts.get_slot("slot_001")
+    before_panel = panels.get_panel("panel_001")
+    with repository_read(pages.database_path) as conn:
+        before_counts = tuple(
+            conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+            for table in ("commits", "entity_revisions", "invalidations")
+        )
+
+    with pytest.raises(ValueError, match="geometry_json must be a JSON object"):
+        if mutation == "create_layout":
+            layouts.create_layout(
+                layout_id="invalid_layout", page_id="page_other", geometry=[],
+            )
+        elif mutation == "create_slot":
+            layouts.create_slot(
+                slot_id="invalid_slot", layout_id="layout_001",
+                slot_key="extra", reading_order=2, geometry=[],
+            )
+        elif mutation == "update_layout":
+            layouts.update_layout(
+                "layout_001", expected_revision=1, geometry_json=[],
+            )
+        elif mutation == "update_slot":
+            layouts.update_slot(
+                "slot_001", expected_revision=1, geometry_json=[],
+            )
+        else:
+            layouts.update_layout(
+                "layout_001", expected_revision=1,
+                geometry_json={"width": 1700},
+                slot_updates=[{
+                    "id": "slot_001", "expected_revision": 1,
+                    "geometry_json": [],
+                }],
+                panel_bindings=[{
+                    "id": "panel_001", "expected_revision": 1,
+                    "layout_slot_id": None,
+                }],
+            )
+
+    assert layouts.get_layout("layout_001") == before_layout
+    assert layouts.get_slot("slot_001") == before_slot
+    assert panels.get_panel("panel_001") == before_panel
+    assert layouts.get_page_layout("page_other") is None
+    assert [slot["id"] for slot in layouts.list_slots("layout_001")] == ["slot_001"]
+    with repository_read(pages.database_path) as conn:
+        assert tuple(
+            conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+            for table in ("commits", "entity_revisions", "invalidations")
+        ) == before_counts
+
+
+def test_issue441_object_geometry_and_list_regions_remain_supported(repositories):
+    pages, layouts, _ = repositories
+    _setup(repositories)
+    before_commits = _commits(pages)
+    slot = layouts.update_slot(
+        "slot_001", expected_revision=1,
+        geometry_json={"x": 11, "y": 22},
+        bubble_regions_json=[{"x": 4, "y": 6}],
+        forbidden_regions_json=[],
+    )
+    assert slot["revision"] == 2
+    assert json.loads(slot["geometry_json"]) == {"x": 11, "y": 22}
+    assert json.loads(slot["bubble_regions_json"]) == [{"x": 4, "y": 6}]
+    assert json.loads(slot["forbidden_regions_json"]) == []
+    assert _commits(pages) == before_commits + 1
