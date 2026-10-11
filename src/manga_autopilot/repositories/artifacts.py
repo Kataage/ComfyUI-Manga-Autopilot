@@ -102,7 +102,7 @@ def _validate_media(path: Path, mime_type: str) -> tuple[int | None, int | None]
                     )
                 width, height = img.size
                 img.verify()
-        except (UnidentifiedImageError, OSError, SyntaxError) as exc:
+        except (UnidentifiedImageError, Image.DecompressionBombError, OSError, SyntaxError) as exc:
             raise ArtifactIntegrityError("invalid image artifact") from exc
         return width, height
     return None, None
