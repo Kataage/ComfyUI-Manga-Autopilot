@@ -1256,3 +1256,45 @@ def test_phase_c_post443_audit_invalid_utf8_run_cleanup_fails_closed(
         assert "run_corrupt" not in candidate_ids
         assert "run_latest" not in candidate_ids
     assert older.is_dir() and latest.is_dir() and corrupt_run.is_dir()
+
+
+@pytest.mark.asyncio()
+@pytest.mark.parametrize("corrupt", ["latest_pointer", "run_json"])
+async def test_issue445_cleanup_api_invalid_utf8_is_safe_and_available(
+    aiohttp_client, tmp_path: Path, corrupt: str,
+) -> None:
+    """An explicit cleanup request handles corrupt text without losing a Run."""
+    app = web.Application()
+    register_all(app, storage_root=str(tmp_path))
+    client = await aiohttp_client(app)
+    created = await client.post(
+        "/manga_autopilot/api/projects", json={"name": "UTF-8 Cleanup"},
+    )
+    assert created.status == 201
+    project_id = (await created.json())["id"]
+    project = tmp_path / "projects" / project_id
+    older = _create_fake_run(project, "run_old", "COMPLETED")
+    latest = _create_fake_run(project, "run_latest", "COMPLETED")
+    damaged = _create_fake_run(project, "run_corrupt", "COMPLETED")
+    latest_file = project / "latest_run_id.txt"
+    latest_file.write_text("run_latest", encoding="utf-8")
+    if corrupt == "latest_pointer":
+        latest_file.write_bytes(b"\xff\xfe")
+    else:
+        (damaged / "run.json").write_bytes(b"\xff\xfe")
+
+    response = await client.post(
+        f"/manga_autopilot/api/projects/{project_id}/runs/cleanup",
+        json={"keep_last": 0, "dry_run": False},
+    )
+    assert response.status == 200, await response.text()
+    data = await response.json()
+    assert data["errors"] == []
+    assert latest.is_dir() and damaged.is_dir()
+    if corrupt == "latest_pointer":
+        assert data["candidates"] == []
+        assert data["deleted_run_ids"] == []
+        assert older.is_dir()
+    else:
+        assert data["deleted_run_ids"] == ["run_old"]
+        assert not older.exists()
