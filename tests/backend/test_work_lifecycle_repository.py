@@ -2824,3 +2824,50 @@ def test_issue435_consistent_manifest_reopen_does_not_rewrite_bytes(
     initial_bytes = created.manifest_path.read_bytes()
     reopened = repository.open_work(created.work_id)
     assert reopened.manifest_path.read_bytes() == initial_bytes
+
+
+@pytest.mark.parametrize("recovery_mode", ["orphan", "staging"])
+def test_phase_c_post435_audit_recovery_resynchronizes_creation_date_before_catalog(
+    tmp_path: Path, recovery_mode: str,
+) -> None:
+    """Recovery registration must not bless forged portable creation metadata."""
+    repository = WorkLifecycleRepository(tmp_path, app_version="audit")
+    work_id = f"work_recovery_date_{recovery_mode}"
+    created = repository.create_work(work_id=work_id, title="Recovery Date")
+    with repository_read(created.database_path) as conn:
+        authoritative = dict(conn.execute(
+            "SELECT created_at, current_revision, current_commit_seq "
+            "FROM work_metadata WHERE work_id = ?", (work_id,),
+        ).fetchone())
+
+    manifest = json.loads(created.manifest_path.read_text(encoding="utf-8"))
+    assert manifest["created_at"] == authoritative["created_at"]
+    manifest["created_at"] = "2099-12-31T23:59:59+00:00"
+    created.manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    # Simulate a completed directory publish followed by a failed Master
+    # catalog registration, without modifying the Work DB or artwork.
+    with repository_write(repository.paths.master_db) as conn:
+        conn.execute("DELETE FROM work_catalog WHERE work_id = ?", (work_id,))
+    if recovery_mode == "staging":
+        staged_root = repository.paths.works / f".creating-{work_id}"
+        os.replace(created.root, staged_root)
+        catalog = repository.finalize_staging_work(work_id)
+    else:
+        catalog = repository.reconcile_orphan_work(work_id)
+
+    final_root = repository.paths.works / work_id
+    final_manifest = json.loads((final_root / "manifest.json").read_text(encoding="utf-8"))
+    assert final_manifest["created_at"] == authoritative["created_at"], (
+        "recovery published a Master catalog hash for a forged mutable "
+        "manifest creation date instead of resynchronizing the Work DB truth"
+    )
+    assert catalog.manifest_hash == lifecycle_module.sha256_file(
+        final_root / "manifest.json"
+    )
+    with repository_read(final_root / "work.sqlite3") as conn:
+        current = dict(conn.execute(
+            "SELECT created_at, current_revision, current_commit_seq "
+            "FROM work_metadata WHERE work_id = ?", (work_id,),
+        ).fetchone())
+    assert current == authoritative
