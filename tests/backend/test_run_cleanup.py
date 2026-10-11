@@ -474,3 +474,66 @@ def test_issue415_keep_last_is_rechecked_against_current_run_order(
     assert oldest.is_dir()
     assert result.deleted_run_ids == []
     assert result.skipped_run_ids == ["run_001"]
+
+def _phase_c_audit_same_second_retention_runs(
+    project: Path,
+) -> tuple[str, str, str]:
+    """Use the real run_YYYYMMDD_HHMMSS_<random> ID contract.
+
+    A later-in-time Run gets a smaller random suffix; sorting opaque Run IDs
+    as if they were timestamps reverses the true order within the same second.
+    """
+    older_id = "run_20261011_100000_ffffffff"
+    newer_id = "run_20261011_100000_00000000"
+    latest_id = "run_20261011_100001_11111111"
+    for run_id, started_at in (
+        (older_id, "2026-10-11T10:00:00.100000+00:00"),
+        (newer_id, "2026-10-11T10:00:00.900000+00:00"),
+        (latest_id, "2026-10-11T10:00:01.100000+00:00"),
+    ):
+        folder = _create_fake_run(project, run_id, "COMPLETED")
+        meta = json.loads((folder / "run.json").read_text(encoding="utf-8"))
+        meta["started_at"] = started_at
+        (folder / "run.json").write_text(json.dumps(meta), encoding="utf-8")
+    (project / "latest_run_id.txt").write_text(latest_id, encoding="utf-8")
+    return older_id, newer_id, latest_id
+
+
+def test_phase_c_independent_audit_keep_last_uses_actual_run_start_not_random_suffix(
+    tmp_path: Path,
+) -> None:
+    """Protect the two most recent Runs even with inverted random suffixes."""
+    project = tmp_path / "project"
+    project.mkdir()
+    older, newer, latest = _phase_c_audit_same_second_retention_runs(project)
+    plan = build_run_cleanup_plan(
+        project, RunCleanupPolicy(keep_last=2, dry_run=False),
+    )
+    assert latest in plan.protected_run_ids
+    assert newer in plan.protected_run_ids
+    assert older not in plan.protected_run_ids
+    assert [item.run_id for item in plan.candidates] == [older]
+
+
+def test_phase_c_independent_audit_cleanup_never_deletes_newer_same_second_run(
+    tmp_path: Path,
+) -> None:
+    """An actual destructive cleanup must retain newer Run bytes and history."""
+    project = tmp_path / "project"
+    project.mkdir()
+    older, newer, latest = _phase_c_audit_same_second_retention_runs(project)
+    newer_dir = project / "runs" / newer
+    older_dir = project / "runs" / older
+    (newer_dir / "precious-newer-output.bin").write_bytes(b"newer output")
+    (older_dir / "retired-older-output.bin").write_bytes(b"retired output")
+
+    plan = build_run_cleanup_plan(
+        project, RunCleanupPolicy(keep_last=2, dry_run=False),
+    )
+    result = execute_run_cleanup_plan(plan)
+    assert result.errors == []
+    assert result.deleted_run_ids == [older]
+    assert older_dir.exists() is False
+    assert newer_dir.is_dir()
+    assert (newer_dir / "precious-newer-output.bin").read_bytes() == b"newer output"
+    assert (project / "runs" / latest).is_dir()
