@@ -565,19 +565,21 @@ def test_phase_c_post441_audit_pillow_image_bomb_rejected_as_artifact_integrity(
     original_counts = _counts(handle.database_path)
     final = handle.root / "assets" / "panels" / "bomb.png"
     if entrypoint == "bytes":
-        register = lambda: _register(
-            repo, data=source, relative_path="assets/panels/bomb.png",
-            artifact_id="artifact_bomb_bytes",
-        )
+        def register():
+            return _register(
+                repo, data=source, relative_path="assets/panels/bomb.png",
+                artifact_id="artifact_bomb_bytes",
+            )
     else:
         original = tmp_path / "input.png"
         original.write_bytes(source)
-        register = lambda: repo.register_local_file(
-            source_path=original, relative_path="assets/panels/bomb.png",
-            artifact_type="panel_candidate", scope_type="panel",
-            scope_id="panel_001", dependency_fingerprint="gen-v1:bomb",
-            mime_type="image/png", artifact_id="artifact_bomb_file",
-        )
+        def register():
+            return repo.register_local_file(
+                source_path=original, relative_path="assets/panels/bomb.png",
+                artifact_type="panel_candidate", scope_type="panel",
+                scope_id="panel_001", dependency_fingerprint="gen-v1:bomb",
+                mime_type="image/png", artifact_id="artifact_bomb_file",
+            )
 
     with pytest.raises(ArtifactIntegrityError, match="invalid image artifact"):
         register()
