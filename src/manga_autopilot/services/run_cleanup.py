@@ -86,6 +86,35 @@ def _current_latest(project_root: Path) -> str | None:
         return None
 
 
+def _trusted_runs_parent(project_root: Path) -> tuple[int, int] | None:
+    """Only a real Project/runs directory may authorize recursive deletion.
+
+    lstat never follows symlinks; on Windows a junction is a reparse point,
+    not a trusted real directory either. This is checked both when planning
+    and while executing under the shared publisher/cleanup lock.
+    """
+    project_root = Path(project_root)
+    runs_dir = project_root / "runs"
+    try:
+        project_info = project_root.lstat()
+        runs_info = runs_dir.lstat()
+        for info in (project_info, runs_info):
+            if not stat.S_ISDIR(info.st_mode) or (
+                getattr(info, "st_file_attributes", 0)
+                & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+            ):
+                return None
+        # A POSIX directory symlink has S_IFLNK (not S_IFDIR).
+        # Reject linked/junction parents even when the target stays in Project.
+        if project_root.is_symlink() or runs_dir.is_symlink():
+            return None
+        if runs_dir.resolve(strict=True) != project_root.resolve(strict=True) / "runs":
+            return None
+        return runs_info.st_dev, runs_info.st_ino
+    except (OSError, RuntimeError):
+        return None
+
+
 # ----------------------------------------------------------- policy model
 @dataclass(frozen=True)
 class RunCleanupPolicy:
@@ -115,6 +144,8 @@ class RunCleanupCandidate:
     reason: str
     directory_device: int | None = None
     directory_inode: int | None = None
+    runs_directory_device: int | None = None
+    runs_directory_inode: int | None = None
 
 
 @dataclass(frozen=True)
@@ -186,7 +217,8 @@ def build_run_cleanup_plan(
     """
     project_root = Path(project_root)
     runs_dir = project_root / "runs"
-    if not runs_dir.is_dir():
+    runs_identity = _trusted_runs_parent(project_root)
+    if runs_identity is None:
         return RunCleanupPlan(
             project_id="",
             dry_run=policy.dry_run,
@@ -271,6 +303,8 @@ def build_run_cleanup_plan(
                 reason=reason,
                 directory_device=identity[0],
                 directory_inode=identity[1],
+                runs_directory_device=runs_identity[0],
+                runs_directory_inode=runs_identity[1],
             ))
         else:
             protected.append(run_id)
@@ -312,6 +346,19 @@ def execute_run_cleanup_plan(plan: RunCleanupPlan) -> RunCleanupResult:
         project_root = path.parent.parent
         try:
             with project_run_directory_lock(project_root):
+                # The Run candidate and its PARENT must still be the
+                # directories that were approved in the original plan.
+                # In particular, reject a linked or swapped Project/runs.
+                parent_identity = _trusted_runs_parent(project_root)
+                planned_parent = (
+                    candidate.runs_directory_device,
+                    candidate.runs_directory_inode,
+                )
+                if parent_identity is None or (
+                    None not in planned_parent and parent_identity != planned_parent
+                ):
+                    skipped.append(candidate.run_id)
+                    continue
                 identity = _directory_identity(path)
                 original = (
                     candidate.directory_device, candidate.directory_inode
@@ -356,7 +403,11 @@ def execute_run_cleanup_plan(plan: RunCleanupPlan) -> RunCleanupResult:
                         skipped.append(candidate.run_id)
                         continue
 
-                parked = path.parent / f".cleanup-quarantine-{secrets.token_hex(16)}"
+                # Detach into the real Project root, NOT under runs/.
+                # A hostile runs/ symlink swap must never redirect rmtree's
+                # quarantine pathname outside this Project. The detached
+                # object's inode and the runs parent are checked again below.
+                parked = project_root / f".cleanup-quarantine-{secrets.token_hex(16)}"
                 if parked.exists() or parked.is_symlink():
                     errors.append(f"{candidate.run_id}: quarantine path occupied")
                     continue
@@ -365,10 +416,12 @@ def execute_run_cleanup_plan(plan: RunCleanupPlan) -> RunCleanupResult:
                 # replace the original path, but cannot redirect our rmtree
                 # to the new Run. Cooperating publishers hold the same lock.
                 parked_identity = _directory_identity(parked)
+                current_parent = _trusted_runs_parent(project_root)
                 parked_data = _read_run_json(parked)
                 new_latest = _current_latest(project_root)
                 safe = (
                     parked_identity == identity
+                    and current_parent == parent_identity
                     and isinstance(parked_data, dict)
                     and parked_data.get("run_id", candidate.run_id) == candidate.run_id
                     and parked_data.get("status") == candidate.status
@@ -389,6 +442,12 @@ def execute_run_cleanup_plan(plan: RunCleanupPlan) -> RunCleanupResult:
                     continue
                 # Deletion only targets the detached private directory, not
                 # the original name that another process could now create.
+                # Keep the final recursive operation on the now-detached
+                # real Project-root pathname, never through Project/runs.
+                if _trusted_runs_parent(project_root) != parent_identity:
+                    skipped.append(candidate.run_id)
+                    errors.append(f"{candidate.run_id}: runs directory changed before deletion")
+                    continue
                 shutil.rmtree(parked)
                 deleted.append(candidate.run_id)
                 log.info("deleted retired run directory: %s", path)
