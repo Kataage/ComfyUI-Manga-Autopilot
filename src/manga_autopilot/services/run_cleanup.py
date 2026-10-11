@@ -432,9 +432,15 @@ def execute_run_cleanup_plan(plan: RunCleanupPlan) -> RunCleanupResult:
                     )
                 )
                 if not safe:
-                    if not path.exists() and parked.exists():
+                    if (
+                        current_parent == parent_identity
+                        and not path.exists() and parked.exists()
+                    ):
                         parked.rename(path)
                     else:
+                        # Never restore through a changed/linked runs parent:
+                        # it may now point outside Project. Retain the exact
+                        # detached bytes in Project quarantine for recovery.
                         errors.append(
                             f"{candidate.run_id}: detached Run could not be restored"
                         )
