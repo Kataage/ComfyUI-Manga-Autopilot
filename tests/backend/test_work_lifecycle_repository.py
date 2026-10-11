@@ -2789,7 +2789,7 @@ def test_issue435_manifest_date_repair_updates_catalog_hash_not_semantic_work_re
             (created.work_id,),
         ).fetchone())
         old_count = conn.execute(
-            "SELECT COUNT(*) FROM work_entity_revisions WHERE entity_type = 'work'"
+            "SELECT COUNT(*) FROM entity_revisions WHERE entity_type = 'work'"
         ).fetchone()[0]
     manifest = json.loads(created.manifest_path.read_text(encoding="utf-8"))
     manifest["created_at"] = "2099-12-31T23:59:59+00:00"
@@ -2803,7 +2803,7 @@ def test_issue435_manifest_date_repair_updates_catalog_hash_not_semantic_work_re
             (created.work_id,),
         ).fetchone())
         count = conn.execute(
-            "SELECT COUNT(*) FROM work_entity_revisions WHERE entity_type = 'work'"
+            "SELECT COUNT(*) FROM entity_revisions WHERE entity_type = 'work'"
         ).fetchone()[0]
     assert current == original
     assert count == old_count
