@@ -203,7 +203,9 @@ class TestFactoryFromEnv:
         monkeypatch.setenv("MANGA_AUTOPILOT_ARTIFACT_LOCAL_ROOT", "/tmp/test-artifacts")
         store = create_artifact_store_from_env()
         assert isinstance(store, LocalArtifactStore)
-        assert store.root == Path("/tmp/test-artifacts")
+        # The constructor canonicalizes its configured root on every OS.
+        # On Windows, "/tmp/..." resolves to a drive-qualified pathname.
+        assert store.root == Path("/tmp/test-artifacts").resolve()
 
 
 # ----------------------------------------------- response contract
@@ -290,3 +292,55 @@ def test_phase_c_independent_local_artifact_store_rejects_windows_drive_absolute
     with pytest.raises(ValueError):
         store.upload_bytes(key=str(victim), data=b"outside was overwritten")
     assert victim.read_bytes() == original
+
+@pytest.mark.parametrize(
+    "unsafe_key",
+    [
+        "C:relative.png",
+        "C:/absolute.png",
+        r"nested\\windows_separator.png",
+        "nested:alternate-stream.png",
+        "nested/./ambiguous.png",
+        "nested//empty-component.png",
+        "nested/trailing-dot.",
+    ],
+)
+def test_issue419_portable_local_keys_never_interpret_platform_escapes(
+    tmp_path: Path, unsafe_key: str,
+) -> None:
+    store = LocalArtifactStore(tmp_path / "root")
+    with pytest.raises(ValueError):
+        store.upload_bytes(key=unsafe_key, data=b"rejected")
+    assert list((tmp_path / "root").rglob("*")) == [] if (tmp_path / "root").exists() else True
+
+
+def test_issue419_local_artifact_regular_key_replacement_stays_atomic(
+    tmp_path: Path,
+) -> None:
+    store = LocalArtifactStore(tmp_path / "root")
+    one = store.upload_bytes(key="nested/panel.png", data=b"first", content_type="image/png")
+    two = store.upload_bytes(key="nested/panel.png", data=b"second", content_type="image/png")
+    assert one.artifact_path == two.artifact_path
+    assert Path(two.artifact_path).read_bytes() == b"second"
+    assert two.artifact_key == "nested/panel.png"
+    assert two.size_bytes == 6
+    assert list(Path(two.artifact_path).parent.glob(".artifact-upload-*")) == []
+
+
+def test_issue419_failed_atomic_publication_keeps_original_file_and_cleans_temp(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from manga_autopilot.services import artifact_store as artifact_store_module
+
+    store = LocalArtifactStore(tmp_path / "root")
+    saved = store.upload_bytes(key="nested/panel.png", data=b"original")
+    destination = Path(saved.artifact_path)
+
+    def fail_replace(*args, **kwargs):
+        raise OSError("simulated publication failure")
+
+    monkeypatch.setattr(artifact_store_module.os, "replace", fail_replace)
+    with pytest.raises(OSError, match="simulated publication failure"):
+        store.upload_bytes(key="nested/panel.png", data=b"uncommitted")
+    assert destination.read_bytes() == b"original"
+    assert list(destination.parent.glob(".artifact-upload-*")) == []
