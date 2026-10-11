@@ -2601,8 +2601,8 @@ def test_phase_c_post429_audit_work_creation_lock_refuses_postcheck_symlink_swap
         try:
             with lifecycle_module._work_creation_lock(works, "work_swap"):
                 pass
-        except OSError:
-            pass  # Fail-closed is acceptable: no external write is allowed.
+        except (OSError, lifecycle_module.WorkManifestError):
+            pass  # A verified fail-closed rejection is safe on Windows and POSIX.
         assert outside.read_bytes() == b"", (
             "Work lifecycle followed a swapped symlink and wrote outside Works"
         )
