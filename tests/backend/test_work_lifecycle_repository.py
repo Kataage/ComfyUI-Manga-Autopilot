@@ -2644,3 +2644,82 @@ def test_phase_c_post429_audit_json_publication_lock_refuses_postcheck_symlink_s
     finally:
         if lock_path.is_symlink():
             lock_path.unlink()
+
+
+
+@pytest.mark.parametrize("lock_kind", ["creation", "publication"])
+def test_issue431_preexisting_lock_symlink_never_modifies_external_target(
+    tmp_path: Path, lock_kind: str,
+) -> None:
+    """Even a preexisting symlink must fail closed without touching its target."""
+    works = tmp_path / "works"
+    works.mkdir()
+    external = tmp_path / "external-lock.txt"
+    external.write_bytes(b"external evidence")
+    if lock_kind == "creation":
+        lock_path = lifecycle_module._work_creation_lock_path(works, "work_existing")
+    else:
+        lock_path = works / "manifest.json.publish.lock"
+    try:
+        lock_path.symlink_to(external)
+    except (OSError, NotImplementedError):
+        pytest.skip("file symlink creation is unavailable")
+    try:
+        with pytest.raises((
+            OSError, UnsafeStoragePathError, lifecycle_module.WorkManifestError,
+        )):
+            if lock_kind == "creation":
+                with lifecycle_module._work_creation_lock(works, "work_existing"):
+                    pass
+            else:
+                lifecycle_module._write_json_atomic(
+                    works / "manifest.json", {"version": 2},
+                )
+        assert external.read_bytes() == b"external evidence"
+    finally:
+        if lock_path.is_symlink():
+            lock_path.unlink()
+
+
+@pytest.mark.parametrize("lock_kind", ["creation", "publication"])
+def test_issue431_postcheck_regular_lock_inode_swap_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, lock_kind: str,
+) -> None:
+    """Don't use a different lock inode than the validated preexisting inode."""
+    works = tmp_path / "works"
+    works.mkdir()
+    if lock_kind == "creation":
+        lock_path = lifecycle_module._work_creation_lock_path(works, "work_inode")
+    else:
+        lock_path = works / "manifest.json.publish.lock"
+    lock_path.write_bytes(b"0")
+    saved = works / "original-lock-evidence"
+    checked = lifecycle_module.assert_managed_regular_file
+    swapped = False
+
+    def swap_regular_after_check(path: Path, **kwargs: object):
+        nonlocal swapped
+        result = checked(path, **kwargs)
+        if Path(path) == lock_path and not swapped:
+            swapped = True
+            lock_path.rename(saved)
+            lock_path.write_bytes(b"")
+        return result
+
+    monkeypatch.setattr(
+        lifecycle_module, "assert_managed_regular_file",
+        swap_regular_after_check,
+    )
+    with pytest.raises((
+        OSError, UnsafeStoragePathError, lifecycle_module.WorkManifestError,
+    )):
+        if lock_kind == "creation":
+            with lifecycle_module._work_creation_lock(works, "work_inode"):
+                pass
+        else:
+            lifecycle_module._write_json_atomic(
+                works / "manifest.json", {"version": 2},
+            )
+    assert swapped
+    assert saved.read_bytes() == b"0"
+    assert lock_path.read_bytes() == b""
