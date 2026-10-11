@@ -1132,7 +1132,10 @@ class WorkLifecycleRepository:
             ) from exc
 
         schema_version = migration.current_version
-        created_at = str(manifest.get("created_at") or _utc_now_iso())
+        # The mutable portable manifest is discovery metadata, never the
+        # source of truth for Work creation time. Reopen/legacy normalization
+        # must repair a forged or blank timestamp from the verified Work DB.
+        created_at = str(metadata["created_at"])
         normalized_manifest = _live_manifest(
             work_id=work_id,
             database_name=inspection.database_path.name,
