@@ -892,3 +892,72 @@ def test_issue427_execution_rechecks_retention_after_new_running_run(
     assert not old.exists()
     assert (keep / "saved.png").read_bytes() == b"valuable"
     assert active.is_dir()
+
+
+
+@pytest.mark.asyncio()
+@pytest.mark.parametrize(
+    ("status", "flag"),
+    [
+        ("COMPLETED", "delete_completed"),
+        ("FAILED_RENDER", "delete_failed"),
+        ("CANCELLED", "delete_cancelled"),
+    ],
+)
+async def test_phase_c_post427_audit_cleanup_rejects_nonboolean_protection_flag(
+    aiohttp_client, tmp_path: Path, status: str, flag: str,
+) -> None:
+    """The literal JSON string 'false' cannot authorize destructive deletion."""
+    app = web.Application()
+    register_all(app, storage_root=str(tmp_path))
+    client = await aiohttp_client(app)
+    created = await client.post(
+        "/manga_autopilot/api/projects", json={"name": "Flag Audit"},
+    )
+    assert created.status == 201
+    project_id = (await created.json())["id"]
+    project = tmp_path / "projects" / project_id
+    protected = _create_fake_run(project, "run_protected", status)
+    _create_fake_run(project, "run_latest", "COMPLETED")
+    (project / "latest_run_id.txt").write_text("run_latest")
+    sentinel = protected / "important_user_output.png"
+    sentinel.write_bytes(b"must survive a 'false' delete flag")
+
+    response = await client.post(
+        f"/manga_autopilot/api/projects/{project_id}/runs/cleanup",
+        json={"dry_run": False, "keep_last": 0, flag: "false"},
+    )
+    assert sentinel.read_bytes() == b"must survive a 'false' delete flag", (
+        "Non-boolean delete flag was coerced to True and erased a Run"
+    )
+    assert response.status == 400, "Dangerous JSON coercions must fail with HTTP 400"
+
+
+@pytest.mark.asyncio()
+async def test_phase_c_post427_audit_cleanup_rejects_negative_keep_last(
+    aiohttp_client, tmp_path: Path,
+) -> None:
+    """A negative terminal retention count must not silently mean delete all."""
+    app = web.Application()
+    register_all(app, storage_root=str(tmp_path))
+    client = await aiohttp_client(app)
+    created = await client.post(
+        "/manga_autopilot/api/projects", json={"name": "Retention Audit"},
+    )
+    assert created.status == 201
+    project_id = (await created.json())["id"]
+    project = tmp_path / "projects" / project_id
+    old = _create_fake_run(project, "run_old", "COMPLETED")
+    _create_fake_run(project, "run_latest", "COMPLETED")
+    (project / "latest_run_id.txt").write_text("run_latest")
+    sentinel = old / "important_user_output.png"
+    sentinel.write_bytes(b"negative retention must not delete")
+
+    response = await client.post(
+        f"/manga_autopilot/api/projects/{project_id}/runs/cleanup",
+        json={"dry_run": False, "keep_last": -1},
+    )
+    assert sentinel.read_bytes() == b"negative retention must not delete", (
+        "Negative keep_last reached destructive cleanup instead of 400"
+    )
+    assert response.status == 400
