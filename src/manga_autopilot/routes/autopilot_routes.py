@@ -1073,10 +1073,14 @@ async def cleanup_runs(request: web.Request) -> web.Response:
     if not paths.project_json.exists():
         raise web.HTTPNotFound(text=f"project {project_id!r} not found")
 
-    try:
-        body = await _payload(request)
-    except web.HTTPBadRequest:
-        body = {}
+    # Omitted request bodies keep the documented safe dry-run defaults.
+    # Invalid JSON, non-object bodies and malformed policy controls never
+    # silently turn into a permissive destructive cleanup request.
+    body = (
+        await _payload(request)
+        if request.body_exists or request.content_length
+        else {}
+    )
 
     from manga_autopilot.services.run_cleanup import (
         RunCleanupPlan,
@@ -1085,14 +1089,41 @@ async def cleanup_runs(request: web.Request) -> web.Response:
         execute_run_cleanup_plan,
     )
 
+    # Python bool("false") and bool("0") are True. A string can NEVER be
+    # accepted as a deletion permission (or as the dry_run safety switch).
+    defaults = {
+        "delete_completed": True,
+        "delete_failed": True,
+        "delete_cancelled": True,
+        "delete_running": False,
+        "dry_run": True,
+    }
+    extra = set(body) - set(defaults) - {"keep_last"}
+    if extra:
+        raise web.HTTPBadRequest(
+            text=f"unsupported Run cleanup fields: {sorted(extra)}"
+        )
+    switches: dict[str, bool] = {}
+    for field, default in defaults.items():
+        value = body.get(field, default)
+        if type(value) is not bool:
+            raise web.HTTPBadRequest(
+                text=f"{field} must be a JSON boolean"
+            )
+        switches[field] = value
+    keep_last = body.get("keep_last", 5)
+    if (
+        type(keep_last) is not int
+        or not 0 <= keep_last <= 1_000_000
+    ):
+        raise web.HTTPBadRequest(
+            text="keep_last must be a nonnegative integer <= 1000000"
+        )
+
     policy = RunCleanupPolicy(
         keep_latest=True,
-        keep_last=int(body.get("keep_last", 5)),
-        delete_completed=bool(body.get("delete_completed", True)),
-        delete_failed=bool(body.get("delete_failed", True)),
-        delete_cancelled=bool(body.get("delete_cancelled", True)),
-        delete_running=bool(body.get("delete_running", False)),
-        dry_run=bool(body.get("dry_run", True)),
+        keep_last=keep_last,
+        **switches,
     )
 
     # Cleanup holds an OS-level cross-process writer lock and may recursively
