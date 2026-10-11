@@ -961,3 +961,135 @@ async def test_phase_c_post427_audit_cleanup_rejects_negative_keep_last(
         "Negative keep_last reached destructive cleanup instead of 400"
     )
     assert response.status == 400
+
+
+
+@pytest.mark.asyncio()
+@pytest.mark.parametrize(
+    "invalid_policy",
+    [
+        {"dry_run": "false"},
+        {"dry_run": 0},
+        {"dry_run": None},
+        {"delete_completed": 0},
+        {"delete_completed": None},
+        {"delete_failed": []},
+        {"delete_cancelled": "false"},
+        {"delete_running": "false"},
+        {"delete_running": 1},
+        {"keep_last": True},
+        {"keep_last": "0"},
+        {"keep_last": 0.0},
+        {"keep_last": -2},
+        {"keep_last": 10**12},
+        {"keep_latest": False},
+    ],
+)
+async def test_issue429_invalid_cleanup_policy_never_deletes(
+    aiohttp_client, tmp_path: Path, invalid_policy: dict,
+) -> None:
+    """An invalid control never reaches the deletion planner or executor."""
+    app = web.Application()
+    register_all(app, storage_root=str(tmp_path))
+    client = await aiohttp_client(app)
+    created = await client.post(
+        "/manga_autopilot/api/projects", json={"name": "Policy Validation"},
+    )
+    assert created.status == 201
+    project_id = (await created.json())["id"]
+    project = tmp_path / "projects" / project_id
+    old = _create_fake_run(project, "run_old", "COMPLETED")
+    _create_fake_run(project, "run_latest", "COMPLETED")
+    (project / "latest_run_id.txt").write_text("run_latest")
+    sentinel = old / "safe_content.txt"
+    sentinel.write_text("never delete for invalid JSON")
+    response = await client.post(
+        f"/manga_autopilot/api/projects/{project_id}/runs/cleanup",
+        json={"dry_run": False, "keep_last": 0, **invalid_policy},
+    )
+    assert response.status == 400
+    assert sentinel.read_text() == "never delete for invalid JSON"
+
+
+@pytest.mark.asyncio()
+@pytest.mark.parametrize(
+    "body_text",
+    ["{malformed", "[]", "null", "true", '"false"'],
+)
+async def test_issue429_malformed_or_nonobject_cleanup_body_rejected(
+    aiohttp_client, tmp_path: Path, body_text: str,
+) -> None:
+    """Malformed/non-object JSON is not silently accepted as policy defaults."""
+    app = web.Application()
+    register_all(app, storage_root=str(tmp_path))
+    client = await aiohttp_client(app)
+    created = await client.post(
+        "/manga_autopilot/api/projects", json={"name": "Malformed Policy"},
+    )
+    assert created.status == 201
+    project_id = (await created.json())["id"]
+    response = await client.post(
+        f"/manga_autopilot/api/projects/{project_id}/runs/cleanup",
+        data=body_text,
+        headers={"Content-Type": "application/json"},
+    )
+    assert response.status == 400
+
+
+@pytest.mark.asyncio()
+async def test_issue429_no_body_preserves_safe_dry_run_defaults(
+    aiohttp_client, tmp_path: Path,
+) -> None:
+    """The documented omitted-body behavior stays an actual nondeleting dry-run."""
+    app = web.Application()
+    register_all(app, storage_root=str(tmp_path))
+    client = await aiohttp_client(app)
+    created = await client.post(
+        "/manga_autopilot/api/projects", json={"name": "Empty Body"},
+    )
+    assert created.status == 201
+    project_id = (await created.json())["id"]
+    project = tmp_path / "projects" / project_id
+    old = _create_fake_run(project, "run_old", "COMPLETED")
+    _create_fake_run(project, "run_latest", "COMPLETED")
+    (project / "latest_run_id.txt").write_text("run_latest")
+    response = await client.post(
+        f"/manga_autopilot/api/projects/{project_id}/runs/cleanup",
+    )
+    assert response.status == 200
+    result = await response.json()
+    assert result["dry_run"] is True
+    assert result["deleted_run_ids"] == []
+    assert old.is_dir()
+
+
+@pytest.mark.asyncio()
+async def test_issue429_real_json_false_flags_preserve_existing_behavior(
+    aiohttp_client, tmp_path: Path,
+) -> None:
+    """A valid boolean false protects a selected status while deleting others."""
+    app = web.Application()
+    register_all(app, storage_root=str(tmp_path))
+    client = await aiohttp_client(app)
+    created = await client.post(
+        "/manga_autopilot/api/projects", json={"name": "Valid Flags"},
+    )
+    assert created.status == 201
+    project_id = (await created.json())["id"]
+    project = tmp_path / "projects" / project_id
+    keep = _create_fake_run(project, "run_failed_keep", "FAILED_RENDER")
+    old = _create_fake_run(project, "run_completed_old", "COMPLETED")
+    _create_fake_run(project, "run_latest", "COMPLETED")
+    (project / "latest_run_id.txt").write_text("run_latest")
+    response = await client.post(
+        f"/manga_autopilot/api/projects/{project_id}/runs/cleanup",
+        json={
+            "dry_run": False, "keep_last": 0,
+            "delete_failed": False, "delete_completed": True,
+        },
+    )
+    assert response.status == 200
+    result = await response.json()
+    assert result["deleted_run_ids"] == ["run_completed_old"]
+    assert not old.exists()
+    assert keep.is_dir()
