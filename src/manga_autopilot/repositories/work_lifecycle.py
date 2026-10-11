@@ -1667,6 +1667,31 @@ class WorkLifecycleRepository:
                 f"orphan Work {work_id!r} has no authoritative work_metadata row"
             )
 
+        # Recovery registration is another path to publishing a live Work.
+        # As in open_work, the verified Work DB (not a mutable manifest) owns
+        # the creation instant. Normalize before hashing the actual bytes
+        # recorded in Master; scan/validation above remain read-only.
+        inspection = inspect_work_directory(
+            final_paths.root,
+            migrations=self.work_migrations,
+            expected_work_id=work_id,
+        )
+        manifest = _read_manifest(final_paths.manifest_json)
+        normalized_manifest = _live_manifest(
+            work_id=work_id,
+            database_name=final_paths.work_db.name,
+            work_schema_version=inspection.database_schema_version,
+            created_at=str(metadata["created_at"]),
+            app_version=self.app_version or manifest.get("app_version"),
+        )
+        if manifest != normalized_manifest:
+            try:
+                _write_json_atomic(final_paths.manifest_json, normalized_manifest)
+            except OSError as exc:
+                raise WorkRecoveryError(
+                    f"Work {work_id!r} manifest refresh failed during recovery: {exc}"
+                ) from exc
+
         manifest_hash = sha256_file(final_paths.manifest_json)
         with repository_write(self.paths.master_db) as connection:
             connection.execute(
