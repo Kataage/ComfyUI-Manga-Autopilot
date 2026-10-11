@@ -897,3 +897,57 @@ async def test_issue405_export_center_db_read_does_not_starve_event_loop(
     assert observed["during_open"] is True, (
         "Export Center SQLite/Work lookup blocks unrelated event-loop callbacks"
     )
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("require_current", "expected_status", "expected_freshness"),
+    [
+        ("1", 409, None),
+        ("0", 200, "STALE"),
+    ],
+)
+async def test_phase_c_independent_audit_export_freshness_changes_before_png_response(
+    fresh_api, monkeypatch: pytest.MonkeyPatch,
+    require_current: str, expected_status: int, expected_freshness: str | None,
+) -> None:
+    """A completed Page edit before HTTP response must not claim CURRENT.
+
+    The route closes its SQLite freshness snapshot *before* making the
+    verified file snapshot. A committed Page edit inside that gap must make
+    require_current reject the now-stale PNG; a permitted historical download
+    must not emit an obsolete CURRENT freshness header.
+    """
+    from manga_autopilot.routes import work_export_center_routes as exports
+
+    client, _root, _work, _pages, layouts, _panels, _artifacts = fresh_api
+    published = await _export_fresh(client)
+    original_snapshot = exports._snapshot_from_work
+    edits = []
+
+    def commit_page_edit_after_initial_freshness(root: Path, row: dict):
+        assert not edits
+        slot = layouts.get_slot("slot_a")
+        layouts.update_slot(
+            "slot_a", expected_revision=slot["revision"],
+            geometry_json={"x": 33, "y": 5, "width": 100, "height": 100},
+        )
+        edits.append(True)
+        return original_snapshot(root, row)
+
+    monkeypatch.setattr(
+        exports, "_snapshot_from_work", commit_page_edit_after_initial_freshness,
+    )
+    response = await client.get(
+        "/manga_autopilot/api/v2/works/work_fresh/exports/"
+        + published["artifact_id"] + "/png?require_current=" + require_current,
+    )
+    assert edits == [True], "a real Page commit must occur before response"
+    assert (await _list_fresh(client))[0]["freshness"] == "STALE"
+    assert response.status == expected_status, (
+        f"download started after saved Page became STALE; got {response.status}"
+    )
+    if expected_status == 409:
+        assert (await response.json())["error"] == "stale_export"
+    else:
+        assert response.headers["X-Work-Export-Freshness"] == expected_freshness
+        assert await response.read()  # Historical PNG is still downloadable.
