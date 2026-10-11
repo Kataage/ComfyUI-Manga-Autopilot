@@ -203,7 +203,9 @@ class TestFactoryFromEnv:
         monkeypatch.setenv("MANGA_AUTOPILOT_ARTIFACT_LOCAL_ROOT", "/tmp/test-artifacts")
         store = create_artifact_store_from_env()
         assert isinstance(store, LocalArtifactStore)
-        assert store.root == Path("/tmp/test-artifacts")
+        # The constructor canonicalizes its configured root on every OS.
+        # On Windows, "/tmp/..." resolves to a drive-qualified pathname.
+        assert store.root == Path("/tmp/test-artifacts").resolve()
 
 
 # ----------------------------------------------- response contract
@@ -230,3 +232,115 @@ class TestResponseContract:
         result = ArtifactUploadResult(artifact_key="test.png")
         with pytest.raises(AttributeError):
             result.artifact_key = "other.png"  # type: ignore[misc]
+
+# ------------------------------------------------ independent Phase C audit
+# Test-only evidence: the *legacy* LocalArtifactStore is distinct from the
+# v2 Work ArtifactRepository fixed in #417. A valid relative upload key
+# must never write outside the configured local storage root.
+
+def test_phase_c_independent_local_artifact_store_rejects_parent_symlink_escape(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "artifacts"
+    root.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    try:
+        (root / "shortcut").symlink_to(outside, target_is_directory=True)
+    except (OSError, NotImplementedError) as exc:
+        pytest.skip(f"directory symlinks unsupported on this CI runner: {exc}")
+
+    store = LocalArtifactStore(root)
+    with pytest.raises(ValueError):
+        store.upload_bytes(key="shortcut/escape.png", data=b"outside payload")
+    assert not (outside / "escape.png").exists()
+
+
+def test_phase_c_independent_local_artifact_store_rejects_final_symlink_overwrite(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "artifacts"
+    root.mkdir()
+    victim = tmp_path / "victim.png"
+    original = b"keep these bytes outside artifact root"
+    victim.write_bytes(original)
+    try:
+        (root / "output.png").symlink_to(victim)
+    except (OSError, NotImplementedError) as exc:
+        pytest.skip(f"file symlinks unsupported on this CI runner: {exc}")
+
+    store = LocalArtifactStore(root)
+    with pytest.raises(ValueError):
+        store.upload_bytes(key="output.png", data=b"unexpected overwrite")
+    assert victim.read_bytes() == original
+
+
+def test_phase_c_independent_local_artifact_store_rejects_windows_drive_absolute_key(
+    tmp_path: Path,
+) -> None:
+    # On Windows, str(victim) is e.g. C:\\...\\victim.png. It does not
+    # start with '/' or '\\' and has no '..' segments, bypassing the
+    # current simplistic key validator; Path(root) / key escapes root.
+    # On POSIX the same absolute path is already rejected (baseline pass).
+    root = tmp_path / "artifacts"
+    root.mkdir()
+    victim = tmp_path / "drive_absolute_victim.png"
+    original = b"outside must remain unchanged"
+    victim.write_bytes(original)
+
+    store = LocalArtifactStore(root)
+    with pytest.raises(ValueError):
+        store.upload_bytes(key=str(victim), data=b"outside was overwritten")
+    assert victim.read_bytes() == original
+
+@pytest.mark.parametrize(
+    "unsafe_key",
+    [
+        "C:relative.png",
+        "C:/absolute.png",
+        r"nested\\windows_separator.png",
+        "nested:alternate-stream.png",
+        "nested/./ambiguous.png",
+        "nested//empty-component.png",
+        "nested/trailing-dot.",
+    ],
+)
+def test_issue419_portable_local_keys_never_interpret_platform_escapes(
+    tmp_path: Path, unsafe_key: str,
+) -> None:
+    store = LocalArtifactStore(tmp_path / "root")
+    with pytest.raises(ValueError):
+        store.upload_bytes(key=unsafe_key, data=b"rejected")
+    assert list((tmp_path / "root").rglob("*")) == [] if (tmp_path / "root").exists() else True
+
+
+def test_issue419_local_artifact_regular_key_replacement_stays_atomic(
+    tmp_path: Path,
+) -> None:
+    store = LocalArtifactStore(tmp_path / "root")
+    one = store.upload_bytes(key="nested/panel.png", data=b"first", content_type="image/png")
+    two = store.upload_bytes(key="nested/panel.png", data=b"second", content_type="image/png")
+    assert one.artifact_path == two.artifact_path
+    assert Path(two.artifact_path).read_bytes() == b"second"
+    assert two.artifact_key == "nested/panel.png"
+    assert two.size_bytes == 6
+    assert list(Path(two.artifact_path).parent.glob(".artifact-upload-*")) == []
+
+
+def test_issue419_failed_atomic_publication_keeps_original_file_and_cleans_temp(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from manga_autopilot.services import artifact_store as artifact_store_module
+
+    store = LocalArtifactStore(tmp_path / "root")
+    saved = store.upload_bytes(key="nested/panel.png", data=b"original")
+    destination = Path(saved.artifact_path)
+
+    def fail_replace(*args, **kwargs):
+        raise OSError("simulated publication failure")
+
+    monkeypatch.setattr(artifact_store_module.os, "replace", fail_replace)
+    with pytest.raises(OSError, match="simulated publication failure"):
+        store.upload_bytes(key="nested/panel.png", data=b"uncommitted")
+    assert destination.read_bytes() == b"original"
+    assert list(destination.parent.glob(".artifact-upload-*")) == []
