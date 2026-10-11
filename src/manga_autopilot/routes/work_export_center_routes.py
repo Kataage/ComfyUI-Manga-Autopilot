@@ -166,6 +166,23 @@ def _present(row: dict[str, Any], freshness: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _stale_export_response(
+    artifact_id: str, freshness: dict[str, Any],
+) -> web.Response:
+    """Reject fresh-only downloads without rewriting immutable Artifact state."""
+    return web.json_response(
+        {
+            "error": "stale_export",
+            "message": (
+                f"Page PNG {artifact_id!r} is {freshness['freshness']}; "
+                "export the current saved Page again."
+            ),
+            **freshness,
+        },
+        status=409,
+    )
+
+
 def _ensure_page_png(row: dict[str, Any], artifact_id: str) -> None:
     if (
         row["artifact_type"] != "page_render"
@@ -261,17 +278,7 @@ async def get_work_export_png(request: web.Request) -> web.Response:
         # Historical downloads remain available. Consumers explicitly requiring
         # fresh output fail closed, without converting READY into a stale status.
         if require_current == "1" and not freshness["is_current"]:
-            return web.json_response(
-                {
-                    "error": "stale_export",
-                    "message": (
-                        f"Page PNG {artifact_id!r} is {freshness['freshness']}; "
-                        "export the current saved Page again."
-                    ),
-                    **freshness,
-                },
-                status=409,
-            )
+            return _stale_export_response(artifact_id, freshness)
         if not _DOWNLOAD_SLOTS.acquire(blocking=False):
             return web.json_response(
                 {"error": "download_busy", "message":
@@ -286,6 +293,31 @@ async def get_work_export_png(request: web.Request) -> web.Response:
                 _snapshot_from_work, root, row, close_cancelled_result=True,
             )
             try:
+                # The initial SQLite read transaction is closed before the
+                # independently verified byte snapshot is copied. A Page edit
+                # can commit in that interval. Reopen a new authoritative Work
+                # read snapshot *after* the copy, before the first HTTP byte.
+                # A later mutation after response start cannot be prevented
+                # without locking Page edits throughout streaming.
+                late_root, late_row, freshness = await run_owned_work_io(
+                    _read_export_download, repository, artifact_id,
+                )
+                # An Artifact registration may never silently change under a
+                # pinned byte snapshot (including for historical downloads).
+                if late_root != root or late_row != row:
+                    return web.json_response(
+                        {
+                            "error": "export_changed",
+                            "message": (
+                                f"Page PNG {artifact_id!r} metadata changed "
+                                "while preparing the download; retry."
+                            ),
+                        },
+                        status=409,
+                    )
+                if require_current == "1" and not freshness["is_current"]:
+                    return _stale_export_response(artifact_id, freshness)
+
                 response = web.StreamResponse(
                     status=200,
                     headers={

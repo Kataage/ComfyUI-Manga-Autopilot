@@ -897,3 +897,113 @@ async def test_issue405_export_center_db_read_does_not_starve_event_loop(
     assert observed["during_open"] is True, (
         "Export Center SQLite/Work lookup blocks unrelated event-loop callbacks"
     )
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("require_current", "expected_status", "expected_freshness"),
+    [
+        ("1", 409, None),
+        ("0", 200, "STALE"),
+    ],
+)
+async def test_phase_c_independent_audit_export_freshness_changes_before_png_response(
+    fresh_api, monkeypatch: pytest.MonkeyPatch,
+    require_current: str, expected_status: int, expected_freshness: str | None,
+) -> None:
+    """A completed Page edit before HTTP response must not claim CURRENT.
+
+    The route closes its SQLite freshness snapshot *before* making the
+    verified file snapshot. A committed Page edit inside that gap must make
+    require_current reject the now-stale PNG; a permitted historical download
+    must not emit an obsolete CURRENT freshness header.
+    """
+    from manga_autopilot.routes import work_export_center_routes as exports
+
+    client, _root, _work, _pages, layouts, _panels, _artifacts = fresh_api
+    published = await _export_fresh(client)
+    original_snapshot = exports._snapshot_from_work
+    edits = []
+
+    def commit_page_edit_after_initial_freshness(root: Path, row: dict):
+        assert not edits
+        slot = layouts.get_slot("slot_a")
+        layouts.update_slot(
+            "slot_a", expected_revision=slot["revision"],
+            geometry_json={"x": 33, "y": 5, "width": 100, "height": 100},
+        )
+        edits.append(True)
+        return original_snapshot(root, row)
+
+    monkeypatch.setattr(
+        exports, "_snapshot_from_work", commit_page_edit_after_initial_freshness,
+    )
+    response = await client.get(
+        "/manga_autopilot/api/v2/works/work_fresh/exports/"
+        + published["artifact_id"] + "/png?require_current=" + require_current,
+    )
+    assert edits == [True], "a real Page commit must occur before response"
+    assert (await _list_fresh(client))[0]["freshness"] == "STALE"
+    assert response.status == expected_status, (
+        f"download started after saved Page became STALE; got {response.status}"
+    )
+    if expected_status == 409:
+        assert (await response.json())["error"] == "stale_export"
+    else:
+        assert response.headers["X-Work-Export-Freshness"] == expected_freshness
+        assert await response.read()  # Historical PNG is still downloadable.
+
+
+@pytest.mark.asyncio
+async def test_issue423_pinned_download_rejects_changed_artifact_row_and_frees_slot(
+    fresh_api, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verified bytes must not be served under a different registered row.
+
+    This out-of-band SQL tamper deliberately violates Artifact immutability,
+    simulating a concurrently replaced registration. The later full-row Work
+    read must reject it, close the verified snapshot and free the spool slot.
+    """
+    from manga_autopilot.routes import work_export_center_routes as exports
+    from manga_autopilot.storage import repository_write
+
+    client, _root, work, _pages, _layouts, _panels, _artifacts = fresh_api
+    published = await _export_fresh(client)
+    url = (
+        "/manga_autopilot/api/v2/works/work_fresh/exports/"
+        + published["artifact_id"] + "/png"
+    )
+    original_snapshot = exports._snapshot_from_work
+    edits = []
+
+    def mutate_registered_row_after_copy(root: Path, row: dict):
+        verified = original_snapshot(root, row)
+        try:
+            changed = "0" * 64
+            if row["dependency_fingerprint"] == changed:
+                changed = "1" * 64
+            with repository_write(work.database_path) as conn:
+                conn.execute(
+                    "UPDATE artifacts SET dependency_fingerprint = ? WHERE id = ?",
+                    (changed, published["artifact_id"]),
+                )
+            edits.append(True)
+            return verified
+        except BaseException:
+            verified.close()
+            raise
+
+    monkeypatch.setattr(
+        exports, "_snapshot_from_work", mutate_registered_row_after_copy,
+    )
+    response = await client.get(url)
+    assert response.status == 409
+    assert (await response.json())["error"] == "export_changed"
+    assert edits == [True]
+
+    # The rejected pre-response snapshot must not leak a spool slot. A new
+    # historical request for the now-UNVERIFIED row is still permitted.
+    monkeypatch.setattr(exports, "_snapshot_from_work", original_snapshot)
+    historical = await client.get(url + "?require_current=0")
+    assert historical.status == 200
+    assert historical.headers["X-Work-Export-Freshness"] == "UNVERIFIED"
+    assert await historical.read()
