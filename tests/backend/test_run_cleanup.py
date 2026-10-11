@@ -1093,3 +1093,59 @@ async def test_issue429_real_json_false_flags_preserve_existing_behavior(
     assert result["deleted_run_ids"] == ["run_completed_old"]
     assert not old.exists()
     assert keep.is_dir()
+
+
+
+def test_phase_c_post431_audit_explicit_delete_running_selects_nonlatest_run(
+    tmp_path: Path,
+) -> None:
+    """A deliberately enabled RUNNING deletion flag must not be a no-op."""
+    project = tmp_path / "project"
+    project.mkdir()
+    _create_fake_run(project, "run_old_running", "RUNNING")
+    latest = _create_fake_run(project, "run_latest", "COMPLETED")
+    (project / "latest_run_id.txt").write_text("run_latest")
+
+    plan = build_run_cleanup_plan(
+        project,
+        RunCleanupPolicy(
+            keep_last=0, dry_run=False, delete_running=True,
+        ),
+    )
+    assert [c.run_id for c in plan.candidates] == ["run_old_running"]
+    assert latest.is_dir()
+
+
+@pytest.mark.asyncio()
+async def test_phase_c_post431_audit_http_explicit_delete_running_executes(
+    aiohttp_client, tmp_path: Path,
+) -> None:
+    """The accepted JSON delete_running=true must match the plan and result."""
+    app = web.Application()
+    register_all(app, storage_root=str(tmp_path))
+    client = await aiohttp_client(app)
+    created = await client.post(
+        "/manga_autopilot/api/projects", json={"name": "Running Cleanup Audit"},
+    )
+    assert created.status == 201
+    project_id = (await created.json())["id"]
+    project = tmp_path / "projects" / project_id
+    running = _create_fake_run(project, "run_old_running", "RUNNING")
+    latest = _create_fake_run(project, "run_latest", "COMPLETED")
+    (project / "latest_run_id.txt").write_text("run_latest")
+    (running / "dummy_output.png").write_bytes(b"temporary fixture")
+
+    response = await client.post(
+        f"/manga_autopilot/api/projects/{project_id}/runs/cleanup",
+        json={
+            "dry_run": False, "keep_last": 0,
+            "delete_running": True, "delete_completed": False,
+        },
+    )
+    assert response.status == 200
+    payload = await response.json()
+    assert payload["deleted_run_ids"] == ["run_old_running"], (
+        "Accepted delete_running=true was ignored during actual cleanup"
+    )
+    assert not running.exists()
+    assert latest.is_dir()
