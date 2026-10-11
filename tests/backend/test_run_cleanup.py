@@ -537,3 +537,75 @@ def test_phase_c_independent_audit_cleanup_never_deletes_newer_same_second_run(
     assert newer_dir.is_dir()
     assert (newer_dir / "precious-newer-output.bin").read_bytes() == b"newer output"
     assert (project / "runs" / latest).is_dir()
+
+@pytest.mark.parametrize(
+    "invalid_start",
+    [None, "", "not-a-time", "2026-10-11T10:00:00", 123],
+)
+def test_issue421_invalid_run_start_is_protected_from_cleanup(
+    tmp_path: Path, invalid_start: object,
+) -> None:
+    """Missing, naive and malformed metadata cannot authorize deletion."""
+    project = tmp_path / "project"
+    project.mkdir()
+    target = _create_fake_run(project, "run_001", "COMPLETED")
+    latest = _create_fake_run(project, "run_002", "COMPLETED")
+    (project / "latest_run_id.txt").write_text("run_002", encoding="utf-8")
+    data = json.loads((target / "run.json").read_text(encoding="utf-8"))
+    if invalid_start is None:
+        data.pop("started_at", None)
+    else:
+        data["started_at"] = invalid_start
+    (target / "run.json").write_text(json.dumps(data), encoding="utf-8")
+
+    plan = build_run_cleanup_plan(
+        project, RunCleanupPolicy(keep_last=0, dry_run=False),
+    )
+    assert "run_001" in plan.protected_run_ids
+    assert all(candidate.run_id != "run_001" for candidate in plan.candidates)
+    result = execute_run_cleanup_plan(plan)
+    assert result.deleted_run_ids == []
+    assert target.is_dir() and latest.is_dir()
+
+
+def test_issue421_compare_started_at_in_utc_not_local_clock(
+    tmp_path: Path,
+) -> None:
+    """An offset-qualified timestamp beats any randomized Run ID suffix."""
+    project = tmp_path / "project"
+    project.mkdir()
+    older, newer, _latest = _phase_c_audit_same_second_retention_runs(project)
+    newer_file = project / "runs" / newer / "run.json"
+    data = json.loads(newer_file.read_text(encoding="utf-8"))
+    # UTC 10:00:00.900 must be later than UTC 10:00:00.100.
+    data["started_at"] = "2026-10-11T19:00:00.900000+09:00"
+    newer_file.write_text(json.dumps(data), encoding="utf-8")
+
+    plan = build_run_cleanup_plan(
+        project, RunCleanupPolicy(keep_last=2, dry_run=False),
+    )
+    assert [candidate.run_id for candidate in plan.candidates] == [older]
+    assert newer in plan.protected_run_ids
+
+
+def test_issue421_execution_rechecks_new_started_at_under_run_lock(
+    tmp_path: Path,
+) -> None:
+    """A timestamp mutation after plan creation may revoke delete consent."""
+    project = tmp_path / "project"
+    project.mkdir()
+    older, _newer, _latest = _phase_c_audit_same_second_retention_runs(project)
+    target = project / "runs" / older
+    plan = build_run_cleanup_plan(
+        project, RunCleanupPolicy(keep_last=2, dry_run=False),
+    )
+    assert [candidate.run_id for candidate in plan.candidates] == [older]
+
+    data = json.loads((target / "run.json").read_text(encoding="utf-8"))
+    data["started_at"] = "2026-10-11T10:00:01.900000+00:00"
+    (target / "run.json").write_text(json.dumps(data), encoding="utf-8")
+    result = execute_run_cleanup_plan(plan)
+    assert result.errors == []
+    assert result.deleted_run_ids == []
+    assert result.skipped_run_ids == [older]
+    assert target.is_dir()
