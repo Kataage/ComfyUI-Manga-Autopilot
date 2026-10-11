@@ -21,6 +21,7 @@ import stat
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 
 log = logging.getLogger(__name__)
@@ -154,6 +155,26 @@ def _read_run_json(run_dir: Path) -> dict | None:
         return None
 
 
+
+def _verified_run_start(value: object) -> datetime | None:
+    """Parse a real, timezone-aware Run start, or fail closed.
+
+    The legacy Run ID contains only seconds followed by eight random hex
+    digits. That suffix is *not* a chronology tie-break for distinct starts.
+    Missing, naive, malformed and non-string metadata can never authorize
+    destructive keep-last cleanup; the affected directory is protected.
+    """
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        if parsed.utcoffset() is None:
+            return None
+        return parsed.astimezone(timezone.utc)
+    except (OverflowError, TypeError, ValueError):
+        return None
+
+
 def build_run_cleanup_plan(
     project_root: Path,
     policy: RunCleanupPolicy,
@@ -183,8 +204,12 @@ def build_run_cleanup_plan(
         except OSError:
             pass
 
-    # Collect all run directories with their metadata
-    run_entries: list[tuple[str, str, Path]] = []  # (run_id, status, path)
+    # Only a validated persisted start time may determine recency. The
+    # second-resolution run ID's random suffix must never rank distinct Runs.
+    # Legacy/invalid timestamps are conservatively protected, not deleted.
+    run_entries: list[tuple[str, str, Path, datetime]] = []
+    protected: list[str] = []
+    candidates: list[RunCleanupCandidate] = []
     for child in sorted(runs_dir.iterdir()):
         if _directory_identity(child) is None:
             continue
@@ -196,15 +221,17 @@ def build_run_cleanup_plan(
         # Never plan a directory with mismatched/invalid persisted identity.
         if run_id != child.name or not isinstance(status, str):
             continue
-        run_entries.append((run_id, status, child))
+        started = _verified_run_start(data.get("started_at"))
+        if started is None:
+            protected.append(run_id)
+            continue
+        run_entries.append((run_id, status, child, started))
 
-    # Sort by run_id descending (most recent first, based on timestamp)
-    run_entries.sort(key=lambda e: e[0], reverse=True)
+    # A stable ID tie-break is used only for genuinely identical persisted
+    # instants; arbitrary suffixes never override differing full timestamps.
+    run_entries.sort(key=lambda e: (e[3], e[0]), reverse=True)
 
-    protected: list[str] = []
-    candidates: list[RunCleanupCandidate] = []
-
-    for idx, (run_id, status, run_path) in enumerate(run_entries):
+    for idx, (run_id, status, run_path, _started) in enumerate(run_entries):
         # Protect latest run
         if policy.keep_latest and run_id == latest_run_id:
             protected.append(run_id)
