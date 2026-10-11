@@ -1645,6 +1645,19 @@ class WorkLifecycleRepository:
                     f"catalog path mismatch for existing Work {work_id!r}: "
                     f"{entry.relative_work_path!r}"
                 )
+            # Idempotency must not certify a cataloged Work whose current
+            # portable directory has since lost its DB or valid identity.
+            # Reuse the strict read-only recovery validation; do not mutate
+            # the existing Master row or Work evidence on failure.
+            valid, diagnostics = self._validate_recovery_directory(
+                final_paths.root,
+                expected_work_id=work_id,
+            )
+            if not valid:
+                raise WorkRecoveryError(
+                    f"cannot accept invalid cataloged Work {work_id!r}: "
+                    + "; ".join(diagnostics)
+                )
             return entry
 
         valid, diagnostics = self._validate_recovery_directory(
