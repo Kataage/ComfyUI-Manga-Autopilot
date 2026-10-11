@@ -2773,3 +2773,54 @@ def test_phase_c_post433_audit_legacy_manifest_normalization_uses_db_creation_da
     normalized = json.loads(reopened.manifest_path.read_text(encoding="utf-8"))
     assert normalized["format_version"] == 2
     assert normalized["created_at"] == authoritative
+
+
+
+def test_issue435_manifest_date_repair_updates_catalog_hash_not_semantic_work_revision(
+    tmp_path: Path,
+) -> None:
+    """A manifest-only repair must not forge a Work commit or revision."""
+    repository = WorkLifecycleRepository(tmp_path, app_version="audit")
+    created = repository.create_work(work_id="work_repair_revision", title="Revision")
+    with repository_read(created.database_path) as conn:
+        original = dict(conn.execute(
+            "SELECT created_at, current_revision, current_commit_seq "
+            "FROM work_metadata WHERE work_id = ?",
+            (created.work_id,),
+        ).fetchone())
+        old_count = conn.execute(
+            "SELECT COUNT(*) FROM work_entity_revisions WHERE entity_type = 'work'"
+        ).fetchone()[0]
+    manifest = json.loads(created.manifest_path.read_text(encoding="utf-8"))
+    manifest["created_at"] = "2099-12-31T23:59:59+00:00"
+    created.manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    reopened = repository.open_work(created.work_id)
+    with repository_read(reopened.database_path) as conn:
+        current = dict(conn.execute(
+            "SELECT created_at, current_revision, current_commit_seq "
+            "FROM work_metadata WHERE work_id = ?",
+            (created.work_id,),
+        ).fetchone())
+        count = conn.execute(
+            "SELECT COUNT(*) FROM work_entity_revisions WHERE entity_type = 'work'"
+        ).fetchone()[0]
+    assert current == original
+    assert count == old_count
+    assert json.loads(reopened.manifest_path.read_text(encoding="utf-8"))[
+        "created_at"
+    ] == original["created_at"]
+    assert reopened.catalog.manifest_hash == lifecycle_module.sha256_file(
+        reopened.manifest_path,
+    )
+
+
+def test_issue435_consistent_manifest_reopen_does_not_rewrite_bytes(
+    tmp_path: Path,
+) -> None:
+    """An already consistent canonical live manifest is a no-op on reopen."""
+    repository = WorkLifecycleRepository(tmp_path, app_version="audit")
+    created = repository.create_work(work_id="work_consistent_date", title="Stable")
+    initial_bytes = created.manifest_path.read_bytes()
+    reopened = repository.open_work(created.work_id)
+    assert reopened.manifest_path.read_bytes() == initial_bytes
