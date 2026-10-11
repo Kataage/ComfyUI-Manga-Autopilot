@@ -1221,3 +1221,38 @@ def test_issue433_explicit_running_plan_rechecks_live_status_before_delete(
     assert result.deleted_run_ids == []
     assert result.skipped_run_ids == ["run_previous"]
     assert target.is_dir()
+
+
+@pytest.mark.parametrize("corrupt", ["latest_pointer", "run_json"])
+def test_phase_c_post443_audit_invalid_utf8_run_cleanup_fails_closed(
+    tmp_path: Path, corrupt: str,
+) -> None:
+    """Invalid UTF-8 in legacy Run metadata must never crash safe cleanup."""
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "runs").mkdir()
+    older = _create_fake_run(project, "run_old", "COMPLETED")
+    latest = _create_fake_run(project, "run_latest", "COMPLETED")
+    corrupt_run = _create_fake_run(project, "run_corrupt", "COMPLETED")
+    latest_file = project / "latest_run_id.txt"
+    latest_file.write_text("run_latest", encoding="utf-8")
+
+    if corrupt == "latest_pointer":
+        # The latest ID is no longer knowable. Preserve every Run rather
+        # than treating a missing/malformed pointer as deletion permission.
+        latest_file.write_bytes(b"\xff\xfe")
+    else:
+        # Corrupt individual history must not block cleanup of unrelated
+        # valid Runs or become a candidate for deletion itself.
+        (corrupt_run / "run.json").write_bytes(b"\xff\xfe")
+
+    policy = RunCleanupPolicy(keep_last=0, dry_run=False)
+    plan = build_run_cleanup_plan(project, policy)
+    candidate_ids = {entry.run_id for entry in plan.candidates}
+    if corrupt == "latest_pointer":
+        assert candidate_ids == set()
+    else:
+        assert "run_old" in candidate_ids
+        assert "run_corrupt" not in candidate_ids
+        assert "run_latest" not in candidate_ids
+    assert older.is_dir() and latest.is_dir() and corrupt_run.is_dir()
