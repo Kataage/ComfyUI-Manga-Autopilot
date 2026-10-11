@@ -803,3 +803,92 @@ def test_phase_c_post425_audit_cleanup_preserves_recent_completed_run_with_activ
         b"retained successful export"
     )
     assert (project / "runs" / "run_active_latest" / "run.json").is_file()
+
+
+
+@pytest.mark.parametrize("nonterminal", ["RUNNING", "PAUSED", "PENDING", "UNKNOWN"])
+def test_issue427_nonterminal_run_does_not_consume_terminal_keep_last(
+    tmp_path: Path, nonterminal: str,
+) -> None:
+    """Only finished Run outcomes count against the keep_last limit."""
+    project = tmp_path / "proj"
+    project.mkdir()
+    old = _create_fake_run(project, "run_old", "COMPLETED")
+    keep = _create_fake_run(project, "run_keep", "FAILED_EXPORT")
+    active = _create_fake_run(project, "run_newer", nonterminal)
+    for path, stamp in (
+        (old, "2026-10-11T09:00:00+00:00"),
+        (keep, "2026-10-11T10:00:00+00:00"),
+        (active, "2026-10-11T11:00:00+00:00"),
+    ):
+        data = json.loads((path / "run.json").read_text(encoding="utf-8"))
+        data["started_at"] = stamp
+        (path / "run.json").write_text(json.dumps(data), encoding="utf-8")
+    (project / "latest_run_id.txt").write_text("run_newer")
+    plan = build_run_cleanup_plan(
+        project, RunCleanupPolicy(keep_last=1, dry_run=False),
+    )
+    assert "run_keep" in plan.protected_run_ids
+    assert "run_newer" in plan.protected_run_ids
+    assert [c.run_id for c in plan.candidates] == ["run_old"]
+
+
+def test_issue427_mixed_terminal_statuses_retained_by_real_chronology(
+    tmp_path: Path,
+) -> None:
+    """A running/paused pair cannot displace newest FAILED/CANCELLED history."""
+    project = tmp_path / "proj"
+    project.mkdir()
+    statuses = [
+        ("run_cancelled", "CANCELLED"),
+        ("run_failed", "FAILED_EXPORT"),
+        ("run_completed", "COMPLETED"),
+        ("run_paused", "PAUSED"),
+        ("run_running", "RUNNING"),
+    ]
+    for i, (run_id, status) in enumerate(statuses):
+        path = _create_fake_run(project, run_id, status)
+        record = json.loads((path / "run.json").read_text(encoding="utf-8"))
+        record["started_at"] = f"2026-10-11T{10+i:02d}:00:00+00:00"
+        (path / "run.json").write_text(json.dumps(record), encoding="utf-8")
+    (project / "latest_run_id.txt").write_text("run_running")
+    plan = build_run_cleanup_plan(
+        project, RunCleanupPolicy(keep_last=2, dry_run=False),
+    )
+    assert [c.run_id for c in plan.candidates] == ["run_cancelled"]
+    assert set(plan.protected_run_ids) == {
+        "run_running", "run_paused", "run_completed", "run_failed",
+    }
+
+
+def test_issue427_execution_rechecks_retention_after_new_running_run(
+    tmp_path: Path,
+) -> None:
+    """A newer active Run does not revoke protection for recent completed bytes."""
+    project = tmp_path / "proj"
+    project.mkdir()
+    old = _create_fake_run(project, "run_old", "COMPLETED")
+    keep = _create_fake_run(project, "run_keep", "COMPLETED")
+    for path, start in (
+        (old, "2026-10-11T10:00:00+00:00"),
+        (keep, "2026-10-11T11:00:00+00:00"),
+    ):
+        record = json.loads((path / "run.json").read_text(encoding="utf-8"))
+        record["started_at"] = start
+        (path / "run.json").write_text(json.dumps(record), encoding="utf-8")
+    (project / "latest_run_id.txt").write_text("run_keep")
+    (keep / "saved.png").write_bytes(b"valuable")
+    policy = RunCleanupPolicy(keep_last=1, dry_run=False)
+    plan = build_run_cleanup_plan(project, policy)
+    assert [c.run_id for c in plan.candidates] == ["run_old"]
+
+    active = _create_fake_run(project, "run_new_active", "RUNNING")
+    metadata = json.loads((active / "run.json").read_text(encoding="utf-8"))
+    metadata["started_at"] = "2026-10-11T12:00:00+00:00"
+    (active / "run.json").write_text(json.dumps(metadata), encoding="utf-8")
+    (project / "latest_run_id.txt").write_text("run_new_active")
+    result = execute_run_cleanup_plan(plan)
+    assert result.deleted_run_ids == ["run_old"]
+    assert not old.exists()
+    assert (keep / "saved.png").read_bytes() == b"valuable"
+    assert active.is_dir()
