@@ -2905,3 +2905,32 @@ def test_phase_c_post437_audit_idempotent_recovery_rejects_invalid_cataloged_wor
             "SELECT * FROM work_catalog WHERE work_id = ?", (work_id,),
         ).fetchone())
     assert current == original
+
+
+@pytest.mark.parametrize("entrypoint", ["reconcile_orphan_work", "finalize_staging_work"])
+def test_issue439_healthy_cataloged_work_recovery_remains_read_only(
+    tmp_path: Path, entrypoint: str,
+) -> None:
+    """A healthy already-cataloged Work remains safely idempotent."""
+    repository = WorkLifecycleRepository(tmp_path)
+    work_id = f"work_healthy_recovery_{entrypoint}"
+    created = repository.create_work(work_id=work_id, title="Healthy Recovery")
+    before_catalog = repository.list_works()
+    before_manifest = created.manifest_path.read_bytes()
+    with repository_read(created.database_path) as conn:
+        before_work = dict(conn.execute(
+            "SELECT created_at, current_revision, current_commit_seq "
+            "FROM work_metadata WHERE work_id = ?", (work_id,),
+        ).fetchone())
+
+    result = getattr(repository, entrypoint)(work_id)
+
+    assert (result,) == before_catalog
+    assert created.manifest_path.read_bytes() == before_manifest
+    assert repository.list_works() == before_catalog
+    with repository_read(created.database_path) as conn:
+        after_work = dict(conn.execute(
+            "SELECT created_at, current_revision, current_commit_seq "
+            "FROM work_metadata WHERE work_id = ?", (work_id,),
+        ).fetchone())
+    assert after_work == before_work
