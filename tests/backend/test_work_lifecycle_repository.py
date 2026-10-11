@@ -2571,3 +2571,76 @@ def test_issue409_recovery_rejects_symlinked_sqlite_sidecars(
     assert finding.recommended_action is None
     assert "symlink" in " ".join(finding.diagnostics)
     assert outside.read_bytes() == b"preserve external evidence"
+
+
+
+def test_phase_c_post429_audit_work_creation_lock_refuses_postcheck_symlink_swap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A link inserted *after* path validation cannot redirect lock-file writes."""
+    works = tmp_path / "works"
+    works.mkdir()
+    target = lifecycle_module._work_creation_lock_path(works, "work_swap")
+    outside = tmp_path / "outside_creation_lock.txt"
+    outside.write_bytes(b"")
+    checked = lifecycle_module.assert_managed_regular_file
+
+    def replace_after_check(path: Path, **kwargs: object):
+        result = checked(path, **kwargs)
+        if Path(path) == target:
+            try:
+                target.symlink_to(outside)
+            except (OSError, NotImplementedError):
+                pytest.skip("file symlinks require platform privileges")
+        return result
+
+    monkeypatch.setattr(
+        lifecycle_module, "assert_managed_regular_file", replace_after_check,
+    )
+    try:
+        try:
+            with lifecycle_module._work_creation_lock(works, "work_swap"):
+                pass
+        except OSError:
+            pass  # Fail-closed is acceptable: no external write is allowed.
+        assert outside.read_bytes() == b"", (
+            "Work lifecycle followed a swapped symlink and wrote outside Works"
+        )
+    finally:
+        if target.is_symlink():
+            target.unlink()
+
+
+def test_phase_c_post429_audit_json_publication_lock_refuses_postcheck_symlink_swap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Manifest publication cannot append to a swapped external lock target."""
+    manifest = tmp_path / "manifest.json"
+    lock_path = manifest.with_name(manifest.name + ".publish.lock")
+    outside = tmp_path / "outside_publication_lock.txt"
+    outside.write_bytes(b"")
+    checked = lifecycle_module.assert_managed_regular_file
+
+    def replace_after_check(path: Path, **kwargs: object):
+        result = checked(path, **kwargs)
+        if Path(path) == lock_path:
+            try:
+                lock_path.symlink_to(outside)
+            except (OSError, NotImplementedError):
+                pytest.skip("file symlinks require platform privileges")
+        return result
+
+    monkeypatch.setattr(
+        lifecycle_module, "assert_managed_regular_file", replace_after_check,
+    )
+    try:
+        try:
+            lifecycle_module._write_json_atomic(manifest, {"version": 2})
+        except (OSError, lifecycle_module.WorkManifestError):
+            pass  # Rejecting the unsafe publish is acceptable.
+        assert outside.read_bytes() == b"", (
+            "JSON publication followed a swapped lock symlink and wrote outside Works"
+        )
+    finally:
+        if lock_path.is_symlink():
+            lock_path.unlink()
