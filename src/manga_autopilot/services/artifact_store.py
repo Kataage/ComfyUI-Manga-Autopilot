@@ -335,7 +335,7 @@ def _validate_local_artifact_key(key: str) -> tuple[str, ...]:
     if (
         windows_path.drive
         or windows_path.root
-        or "\\\\" in key
+        or "\\" in key
         or ":" in key
         or any(
             not part or part in {".", ".."} or part.endswith((" ", "."))
