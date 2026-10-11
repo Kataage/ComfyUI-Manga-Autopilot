@@ -11,10 +11,13 @@ from __future__ import annotations
 
 import os
 import re
+import tempfile
 from collections.abc import Mapping
 from dataclasses import dataclass, field
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from typing import Any, Protocol, runtime_checkable
+
+from manga_autopilot.storage.paths import assert_managed_path
 
 # --------------------------------------------------------- upload result
 
@@ -122,11 +125,43 @@ class LocalArtifactStore:
         ValueError
             If the key contains path traversal or is empty.
         """
-        _validate_artifact_key(key)
-
-        dest = self._root / key
+        # Portable local keys must remain relative paths on POSIX AND
+        # Windows. S3 object keys use the separate generic validator below.
+        parts = _validate_local_artifact_key(key)
+        dest = assert_managed_path(
+            self._root.joinpath(*parts),
+            containment_root=self._root,
+            field_name="local Artifact destination",
+        )
+        # The pre-mkdir check rejects an existing linked directory before
+        # following it, even when a new nested subdirectory is requested.
         dest.parent.mkdir(parents=True, exist_ok=True)
-        dest.write_bytes(data)
+        dest = assert_managed_path(
+            dest, containment_root=self._root,
+            field_name="local Artifact destination",
+        )
+        # Never truncate an existing destination directly: a final symlink
+        # inserted between checks and publication would otherwise overwrite
+        # its target. os.replace replaces the directory entry, not a symlink's
+        # referent, while preserving normal updates of regular Artifact keys.
+        fd, staged_name = tempfile.mkstemp(
+            prefix=".artifact-upload-", suffix=".tmp", dir=dest.parent,
+        )
+        staged = Path(staged_name)
+        try:
+            with os.fdopen(fd, "wb") as stream:
+                stream.write(data)
+                stream.flush()
+                os.fsync(stream.fileno())
+            # Revalidate managed parent/final entry after staging and
+            # immediately before publishing the complete result.
+            assert_managed_path(
+                dest, containment_root=self._root,
+                field_name="local Artifact destination",
+            )
+            os.replace(staged, dest)
+        finally:
+            staged.unlink(missing_ok=True)
 
         url: str | None = None
         if self._public_base_url:
@@ -286,6 +321,32 @@ def build_panel_artifact_key(
         f"projects/{project_id}/runs/{run_id}/pages/{page_id}"
         f"/panels/{panel_id}/{candidate_id}.png"
     )
+
+
+def _validate_local_artifact_key(key: str) -> tuple[str, ...]:
+    """Reject ambiguous or rooted keys under both POSIX and Windows rules.
+
+    This policy applies ONLY to on-disk storage. Remote S3 object keys remain
+    governed by their existing key contract without filesystem interpretation.
+    """
+    _validate_artifact_key(key)
+    windows_path = PureWindowsPath(key)
+    parts = key.split("/")
+    if (
+        windows_path.drive
+        or windows_path.root
+        or "\\\\" in key
+        or ":" in key
+        or any(
+            not part or part in {".", ".."} or part.endswith((" ", "."))
+            or PureWindowsPath(part).is_reserved()
+            for part in parts
+        )
+    ):
+        raise ValueError(
+            f"local artifact key must be a safe portable relative path: {key!r}"
+        )
+    return tuple(parts)
 
 
 def _validate_artifact_key(key: str) -> None:
