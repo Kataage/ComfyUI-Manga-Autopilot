@@ -841,3 +841,36 @@ async def test_issue405_cancelled_layout_patch_drains_its_owned_sqlite_worker(
     assert state["layout"]["geometry_json"] == {
         "width": 1337, "height": 1600,
     }
+
+
+@pytest.mark.parametrize("target", ["layout", "slot"])
+async def test_phase_c_post439_audit_rejects_array_geometry_without_persisting(
+    api, target: str,
+) -> None:
+    """Geometry must be an object, not a saved array the exporter cannot render."""
+    client, prefix, _, handle = api
+    original_response, original_state = await _state(client, prefix)
+    assert original_response.status == 200
+    with repository_read(handle.database_path) as conn:
+        previous_commits = conn.execute("SELECT COUNT(*) FROM commits").fetchone()[0]
+
+    request = {"expected_revision": 1}
+    if target == "layout":
+        request["geometry_json"] = []
+    else:
+        request["slot_updates"] = [{
+            "id": "slot_001", "expected_revision": 1, "geometry_json": [],
+        }]
+
+    response = await client.patch(prefix + "/page_001/layout", json=request)
+    assert response.status == 400, (
+        f"accepted {target} geometry as an array; exported PNG requires an object: "
+        f"{await response.text()}"
+    )
+    problem = await response.json()
+    assert problem["error"] == "invalid_request"
+    reloaded_response, reloaded_state = await _state(client, prefix)
+    assert reloaded_response.status == 200
+    assert reloaded_state == original_state
+    with repository_read(handle.database_path) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM commits").fetchone()[0] == previous_commits
