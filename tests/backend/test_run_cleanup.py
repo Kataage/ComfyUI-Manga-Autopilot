@@ -746,3 +746,60 @@ def test_issue425_legitimate_cleanup_uses_project_root_quarantine(
     assert not moved_to[0].exists()
     assert not old.exists()
     assert (project / "runs" / "run_latest" / "run.json").exists()
+
+
+
+def _phase_c_post425_active_run_retention_case(
+    tmp_path: Path,
+) -> tuple[Path, Path, Path]:
+    """A newer still-RUNNING Run must not consume the terminal retention budget."""
+    project = tmp_path / "retention_project"
+    project.mkdir()
+    old = _create_fake_run(project, "run_completed_old", "COMPLETED")
+    keep = _create_fake_run(project, "run_completed_keep", "COMPLETED")
+    active = _create_fake_run(project, "run_active_latest", "RUNNING")
+    for directory, started in (
+        (old, "2026-10-11T10:00:00+00:00"),
+        (keep, "2026-10-11T11:00:00+00:00"),
+        (active, "2026-10-11T12:00:00+00:00"),
+    ):
+        metadata = json.loads((directory / "run.json").read_text(encoding="utf-8"))
+        metadata["started_at"] = started
+        (directory / "run.json").write_text(json.dumps(metadata), encoding="utf-8")
+    (project / "latest_run_id.txt").write_text("run_active_latest")
+    (keep / "precious_completed.png").write_bytes(b"retained successful export")
+    return project, old, keep
+
+
+def test_phase_c_post425_audit_running_run_does_not_consume_keep_last(
+    tmp_path: Path,
+) -> None:
+    """Retention counts the most recent terminal Run, not an active Run."""
+    project, old, keep = _phase_c_post425_active_run_retention_case(tmp_path)
+    plan = build_run_cleanup_plan(
+        project, RunCleanupPolicy(keep_last=1, dry_run=False),
+    )
+    assert "run_active_latest" in plan.protected_run_ids
+    assert "run_completed_keep" in plan.protected_run_ids
+    assert [candidate.run_id for candidate in plan.candidates] == [
+        "run_completed_old"
+    ]
+    assert old.is_dir() and keep.is_dir()
+
+
+def test_phase_c_post425_audit_cleanup_preserves_recent_completed_run_with_active_latest(
+    tmp_path: Path,
+) -> None:
+    """Destructive cleanup must preserve recent completed pages while Run runs."""
+    project, old, keep = _phase_c_post425_active_run_retention_case(tmp_path)
+    plan = build_run_cleanup_plan(
+        project, RunCleanupPolicy(keep_last=1, dry_run=False),
+    )
+    result = execute_run_cleanup_plan(plan)
+    assert result.deleted_run_ids == ["run_completed_old"]
+    assert not old.exists()
+    assert keep.is_dir(), "newest completed Run was deleted despite keep_last=1"
+    assert (keep / "precious_completed.png").read_bytes() == (
+        b"retained successful export"
+    )
+    assert (project / "runs" / "run_active_latest" / "run.json").is_file()
