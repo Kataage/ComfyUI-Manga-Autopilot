@@ -7,6 +7,7 @@ import json
 import os
 import shutil
 import sqlite3
+import stat
 from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -170,6 +171,57 @@ def _work_creation_lock_path(works_root: Path, work_id: str) -> Path:
     return works_root / f"{_WORK_CREATION_LOCK_PREFIX}{work_id}.lock"
 
 
+def _lock_file_identity(path: Path) -> tuple[int, int] | None:
+    """Read a real lock inode without following the final path component."""
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return None
+    if not stat.S_ISREG(info.st_mode) or (
+        getattr(info, "st_file_attributes", 0)
+        & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+    ):
+        raise WorkManifestError(f"unsafe Work lock file type or reparse point: {path}")
+    return info.st_dev, info.st_ino
+
+
+@contextmanager
+def _open_verified_lock_file(
+    path: Path, *, containment_root: Path, field_name: str,
+) -> Iterator[tuple[Any, tuple[int, int]]]:
+    """Pin one safe regular lock descriptor across the check/open race.
+
+    POSIX O_NOFOLLOW rejects post-check symlink insertion at open. Windows
+    has no portable O_NOFOLLOW: validate the opened descriptor against a
+    non-following lstat BEFORE writing even the initial lock marker. Checking
+    the preflight identity also rejects an existing lock inode replacement.
+    """
+    original = _lock_file_identity(path)
+    assert_managed_regular_file(
+        path, containment_root=containment_root,
+        field_name=field_name, allow_missing=True,
+    )
+    flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_BINARY", 0)
+    flags |= getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, flags, 0o600)
+    with os.fdopen(descriptor, "r+b") as handle:
+        opened = os.fstat(handle.fileno())
+        identity = (opened.st_dev, opened.st_ino)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or _lock_file_identity(path) != identity
+            or (original is not None and original != identity)
+        ):
+            raise WorkManifestError(f"Work lock file was replaced during open: {path}")
+        yield handle, identity
+
+
+def _require_live_lock_identity(path: Path, identity: tuple[int, int]) -> None:
+    """Do not enter a critical section after its persistent name was replaced."""
+    if _lock_file_identity(path) != identity:
+        raise WorkManifestError(f"Work lock file was replaced while locking: {path}")
+
+
 def _try_lock_handle(handle: Any) -> bool:
     """Acquire one cross-process advisory lock without blocking."""
     handle.seek(0)
@@ -220,13 +272,9 @@ def _work_creation_lock(works_root: Path, work_id: str) -> Iterator[None]:
     process that creates/locks a replacement inode.
     """
     lock_path = _work_creation_lock_path(works_root, work_id)
-    assert_managed_regular_file(
-        lock_path,
-        containment_root=works_root,
-        field_name="Work creation lock",
-        allow_missing=True,
-    )
-    with lock_path.open("a+b") as handle:
+    with _open_verified_lock_file(
+        lock_path, containment_root=works_root, field_name="Work creation lock",
+    ) as (handle, identity):
         handle.seek(0, os.SEEK_END)
         if handle.tell() == 0:
             handle.write(b"0")
@@ -236,6 +284,7 @@ def _work_creation_lock(works_root: Path, work_id: str) -> Iterator[None]:
                 f"Work creation is active for {work_id!r}"
             )
         try:
+            _require_live_lock_identity(lock_path, identity)
             yield
         finally:
             _unlock_handle(handle)
@@ -311,13 +360,9 @@ def _json_publication_lock(path: Path) -> Iterator[None]:
     one. Slow serialization and file fsync happen before taking this lock.
     """
     lock_path = path.with_name(path.name + ".publish.lock")
-    assert_managed_regular_file(
-        lock_path,
-        containment_root=path.parent,
-        field_name="JSON publication lock",
-        allow_missing=True,
-    )
-    with lock_path.open("a+b") as handle:
+    with _open_verified_lock_file(
+        lock_path, containment_root=path.parent, field_name="JSON publication lock",
+    ) as (handle, identity):
         handle.seek(0, os.SEEK_END)
         if handle.tell() == 0:
             handle.write(b"0")
@@ -332,6 +377,7 @@ def _json_publication_lock(path: Path) -> Iterator[None]:
 
             fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
         try:
+            _require_live_lock_identity(lock_path, identity)
             yield
         finally:
             handle.seek(0)
