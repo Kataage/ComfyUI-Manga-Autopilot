@@ -2441,3 +2441,59 @@ def test_issue449_ambiguous_running_steps_reject_atomic_heartbeat(
     assert repo.inspect_lease("work_test") == lease_before
     assert repo.get_run(run_id) == run_before
     assert repo.list_steps(run_id) == steps_before
+
+
+
+def test_issue449_stale_terminal_step_hint_renews_new_active_step(
+    tmp_path: Path,
+) -> None:
+    """A queued old Step ID must not mask a newer committed RUNNING Step."""
+    db = tmp_path / "work.sqlite3"
+    _work(db)
+    clock = Clock()
+    owner = DurableRunRepository(db, clock=clock)
+    observer = DurableRunRepository(db, clock=clock)
+    run_id = _run(owner)
+    owner.acquire_lease(
+        work_id="work_test", lease_owner="heartbeat_owner",
+        lease_kind="AUTOPILOT_MUTATION", ttl_seconds=8, run_id=run_id,
+    )
+    owner.transition_run(
+        run_id, expected_status="PENDING", new_status="RUNNING",
+        lease_owner="heartbeat_owner",
+    )
+    old_step = owner.create_step(
+        run_id=run_id, step_key="plan_story",
+        input_fingerprint="v1", lease_owner="heartbeat_owner",
+    )
+    owner.start_step(
+        old_step["id"], input_fingerprint="v1", lease_owner="heartbeat_owner",
+    )
+    queued_step_id = old_step["id"]
+    owner.finish_step(
+        old_step["id"], status="COMPLETED",
+        output={"value": True}, lease_owner="heartbeat_owner",
+    )
+    previous_step = observer.get_step(old_step["id"])
+    new_step = owner.create_step(
+        run_id=run_id, step_key="generate_panels",
+        input_fingerprint="v1", lease_owner="heartbeat_owner",
+    )
+    owner.start_step(
+        new_step["id"], input_fingerprint="v1", lease_owner="heartbeat_owner",
+    )
+    initial = observer.get_step(new_step["id"])
+    clock.advance(2)
+
+    owner.heartbeat_owned_cycle(
+        work_id="work_test", run_id=run_id,
+        lease_owner="heartbeat_owner", ttl_seconds=8,
+        step_id=queued_step_id,
+    )
+    updated = observer.get_step(new_step["id"])
+    lease = observer.inspect_lease("work_test")
+    assert lease is not None
+    assert updated["heartbeat_at"] > initial["heartbeat_at"]
+    assert updated["heartbeat_at"] == lease["heartbeat_at"]
+    assert observer.get_run(run_id)["heartbeat_at"] == lease["heartbeat_at"]
+    assert observer.get_step(old_step["id"]) == previous_step
