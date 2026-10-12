@@ -460,6 +460,36 @@ def _load_strict_json(raw: str) -> Any:
     )
 
 
+def _validate_quarantine_receipt_binding(
+    payload: Any, *, destination: Path,
+) -> tuple[str, str]:
+    """Bind a versioned receipt to its Work and actual evidence directory."""
+    if not isinstance(payload, dict):
+        raise ValueError("quarantine receipt root must be an object")
+    raw_work_id = payload.get("work_id")
+    if not isinstance(raw_work_id, str):
+        raise ValueError("quarantine receipt work_id must be a string")
+    work_id = validate_work_id(raw_work_id)
+    version = payload.get("protocol_version")
+    if type(version) is not int or version != _QUARANTINE_PROTOCOL_VERSION:
+        raise ValueError("unsupported quarantine receipt protocol_version")
+    expected_source = f"{WORK_STAGING_PREFIX}{work_id}"
+    if payload.get("source") != expected_source:
+        raise ValueError("quarantine receipt source does not match Work ID")
+    expected_suffix = f"-{WORK_STAGING_PREFIX[1:]}{work_id}"
+    if (
+        not destination.name.endswith(expected_suffix)
+        or destination.name == expected_suffix
+    ):
+        raise ValueError("quarantine evidence destination does not match Work ID")
+    if payload.get("destination") != destination.name:
+        raise ValueError("quarantine receipt destination does not match filename")
+    state = payload.get("state", "complete")
+    if not isinstance(state, str) or state not in {"prepared", "complete"}:
+        raise ValueError(f"unsupported quarantine receipt state: {state!r}")
+    return work_id, state
+
+
 def _read_manifest(path: Path) -> dict[str, Any]:
     if path.is_symlink():
         raise WorkManifestError(f"Work manifest must not be a symlink: {path}")
@@ -1303,25 +1333,9 @@ class WorkLifecycleRepository:
                     field_name="quarantine receipt",
                 )
                 payload = _load_strict_json(receipt.read_text(encoding="utf-8"))
-                if not isinstance(payload, dict):
-                    raise ValueError("quarantine receipt root must be an object")
-                raw_work_id = payload.get("work_id")
-                if not isinstance(raw_work_id, str):
-                    raise ValueError("quarantine receipt work_id must be a string")
-                work_id = validate_work_id(raw_work_id)
-                state = payload.get("state", "complete")
-                if state not in {"prepared", "complete"}:
-                    raise ValueError(
-                        f"unsupported quarantine receipt state: {state!r}"
-                    )
-                declared_destination = payload.get("destination")
-                if (
-                    declared_destination is not None
-                    and declared_destination != destination.name
-                ):
-                    raise ValueError(
-                        "quarantine receipt destination does not match filename"
-                    )
+                work_id, state = _validate_quarantine_receipt_binding(
+                    payload, destination=destination,
+                )
                 assert_managed_path(
                     destination,
                     containment_root=quarantine_root,
@@ -1869,12 +1883,15 @@ class WorkLifecycleRepository:
                                 # A changed/malformed receipt is not safe to
                                 # promote, even after a previous good scan.
                                 continue
-                            if (
-                                isinstance(payload, dict)
-                                and payload.get("work_id") == work_id
-                                and payload.get("destination") == destination.name
-                                and payload.get("state") == "prepared"
-                            ):
+                            try:
+                                bound_work_id, state = (
+                                    _validate_quarantine_receipt_binding(
+                                        payload, destination=destination,
+                                    )
+                                )
+                            except ValueError:
+                                continue
+                            if bound_work_id == work_id and state == "prepared":
                                 prepared_candidates.append(
                                     (destination, receipt, payload)
                                 )
