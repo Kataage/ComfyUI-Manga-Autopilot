@@ -3244,3 +3244,80 @@ def test_issue455_legitimate_prepared_receipt_retry_still_completes(
     assert repository.quarantine_staging_work(work_id) == destination
     assert repository.inspect_quarantine()[0].kind == "QUARANTINE_COMPLETE"
     assert (destination / "partial.txt").read_bytes() == b"keep me"
+
+
+@pytest.mark.parametrize("entrypoint", ["inspect_quarantine", "scan_recovery"])
+@pytest.mark.parametrize("tamper", [
+    pytest.param("foreign_work_id", id="foreign_work_id"),
+    pytest.param("foreign_source", id="foreign_source"),
+    pytest.param("unsupported_protocol", id="unsupported_protocol"),
+])
+def test_phase_c_post455_audit_receipt_identity_binding_fails_closed(
+    tmp_path: Path, entrypoint: str, tamper: str,
+) -> None:
+    """An unambiguous but wrongly bound receipt must not certify evidence."""
+    repository = WorkLifecycleRepository(tmp_path)
+    work_id = "work_receipt_binding"
+    staging = tmp_path / "works" / f".creating-{work_id}"
+    staging.mkdir()
+    (staging / "partial.txt").write_bytes(b"evidence belongs to original Work")
+    destination = repository.quarantine_staging_work(
+        work_id, reason="independent receipt binding audit",
+    )
+    receipt = destination.with_name(destination.name + ".recovery.json")
+    payload = json.loads(receipt.read_text(encoding="utf-8"))
+    assert payload["work_id"] == work_id
+    assert payload["source"] == staging.name
+    assert payload["destination"] == destination.name
+    assert payload["protocol_version"] == 1
+    assert repository.inspect_quarantine()[0].kind == "QUARANTINE_COMPLETE"
+    assert repository.scan_recovery() == ()
+    if tamper == "foreign_work_id":
+        payload["work_id"] = "work_foreign_receipt"
+    elif tamper == "foreign_source":
+        payload["source"] = ".creating-work_foreign_receipt"
+    else:
+        payload["protocol_version"] = 999
+    modified = (json.dumps(payload, sort_keys=True, indent=2) + "\n").encode("utf-8")
+    receipt.write_bytes(modified)
+    before_catalog = repository.list_works()
+    before_evidence = (destination / "partial.txt").read_bytes()
+
+    findings = getattr(repository, entrypoint)()
+    assert len(findings) == 1
+    assert findings[0].kind == "QUARANTINE_INVALID"
+    assert findings[0].valid is False
+    assert findings[0].recommended_action is None
+    assert receipt.read_bytes() == modified
+    assert (destination / "partial.txt").read_bytes() == before_evidence
+    assert repository.list_works() == before_catalog
+    assert not staging.exists()
+
+
+def test_phase_c_post455_audit_foreign_work_cannot_claim_other_quarantine(
+    tmp_path: Path,
+) -> None:
+    """Retry cannot report Work A's evidence as completed for Work B."""
+    repository = WorkLifecycleRepository(tmp_path)
+    work_id = "work_owner_receipt"
+    foreign_work_id = "work_claimant_receipt"
+    staging = tmp_path / "works" / f".creating-{work_id}"
+    staging.mkdir()
+    (staging / "partial.txt").write_bytes(b"owner's irreplaceable evidence")
+    destination = repository.quarantine_staging_work(work_id)
+    receipt = destination.with_name(destination.name + ".recovery.json")
+    payload = json.loads(receipt.read_text(encoding="utf-8"))
+    payload["work_id"] = foreign_work_id
+    tampered = (json.dumps(payload, sort_keys=True, indent=2) + "\n").encode("utf-8")
+    receipt.write_bytes(tampered)
+    catalog_before = repository.list_works()
+    evidence_before = (destination / "partial.txt").read_bytes()
+    foreign_staging = tmp_path / "works" / f".creating-{foreign_work_id}"
+    assert not foreign_staging.exists()
+
+    with pytest.raises(WorkRecoveryError):
+        repository.quarantine_staging_work(foreign_work_id)
+    assert receipt.read_bytes() == tampered
+    assert (destination / "partial.txt").read_bytes() == evidence_before
+    assert repository.list_works() == catalog_before
+    assert not foreign_staging.exists()
