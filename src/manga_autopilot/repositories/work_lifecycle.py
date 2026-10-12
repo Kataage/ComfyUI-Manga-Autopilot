@@ -436,6 +436,11 @@ def _write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
                 # A secondary cleanup error must not mask the original failure.
                 pass
 
+def _reject_nonstandard_json_constant(value: str) -> None:
+    # Python's default JSON decoder accepts NaN and Infinity, which are not JSON.
+    raise ValueError(f"nonstandard JSON numeric constant: {value}")
+
+
 def _read_manifest(path: Path) -> dict[str, Any]:
     if path.is_symlink():
         raise WorkManifestError(f"Work manifest must not be a symlink: {path}")
@@ -446,8 +451,10 @@ def _read_manifest(path: Path) -> dict[str, Any]:
     except UnicodeDecodeError as exc:
         raise WorkManifestError(f"Work manifest is invalid UTF-8: {path}") from exc
     try:
-        payload = json.loads(raw)
-    except json.JSONDecodeError as exc:
+        payload = json.loads(
+            raw, parse_constant=_reject_nonstandard_json_constant,
+        )
+    except ValueError as exc:
         raise WorkManifestError(f"Work manifest is invalid JSON: {path}") from exc
     if not isinstance(payload, dict):
         raise WorkManifestError("Work manifest root must be a JSON object")
