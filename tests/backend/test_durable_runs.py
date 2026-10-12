@@ -2345,3 +2345,99 @@ def test_issue397_post_recovery_next_run_cannot_inherit_old_chain(
     )
     assert next_lease["recovery_run_owner"] is None
     repo.release_lease(work_id="work_test", lease_owner="new")
+
+
+
+def test_issue449_queued_lease_heartbeat_catches_newly_running_step(
+    tmp_path: Path,
+) -> None:
+    """A queued heartbeat must not renew the lease without the active Step."""
+    db = tmp_path / "work.sqlite3"
+    _work(db)
+    clock = Clock()
+    owner = DurableRunRepository(db, clock=clock)
+    observer = DurableRunRepository(db, clock=clock)
+    run_id = _run(owner)
+    owner.acquire_lease(
+        work_id="work_test", lease_owner="heartbeat_owner",
+        lease_kind="AUTOPILOT_MUTATION", ttl_seconds=8, run_id=run_id,
+    )
+    owner.transition_run(
+        run_id, expected_status="PENDING", new_status="RUNNING",
+        lease_owner="heartbeat_owner",
+    )
+
+    # Simulate the async guardian submitting a worker with its prior
+    # step_id=None while the Run has no started Step yet.
+    queued_step_id = None
+    step = owner.create_step(
+        run_id=run_id, step_key="generate_panels",
+        input_fingerprint="v1", lease_owner="heartbeat_owner",
+    )
+    owner.start_step(
+        step["id"], input_fingerprint="v1", lease_owner="heartbeat_owner",
+    )
+    initial_lease = observer.inspect_lease("work_test")
+    initial_step = observer.get_step(step["id"])
+    initial_attempts = observer.list_step_attempts(step["id"])
+    assert initial_lease is not None
+    assert initial_step["status"] == "RUNNING"
+    clock.advance(2)
+
+    # SQLite executes the queued heartbeat only AFTER start_step commits.
+    owner.heartbeat_owned_cycle(
+        work_id="work_test", run_id=run_id,
+        lease_owner="heartbeat_owner", ttl_seconds=8,
+        step_id=queued_step_id,
+    )
+    lease = observer.inspect_lease("work_test")
+    updated_step = observer.get_step(step["id"])
+    assert lease is not None
+    assert lease["expires_at"] > initial_lease["expires_at"]
+    assert updated_step["heartbeat_at"] > initial_step["heartbeat_at"]
+    assert updated_step["heartbeat_at"] == lease["heartbeat_at"]
+    assert observer.get_run(run_id)["heartbeat_at"] == lease["heartbeat_at"]
+    assert updated_step["status"] == "RUNNING"
+    assert observer.list_step_attempts(step["id"]) == initial_attempts
+
+
+def test_issue449_ambiguous_running_steps_reject_atomic_heartbeat(
+    tmp_path: Path,
+) -> None:
+    """Never renew only the Work lease if the active Step is ambiguous."""
+    db = tmp_path / "work.sqlite3"
+    _work(db)
+    clock = Clock()
+    repo = DurableRunRepository(db, clock=clock)
+    run_id = _run(repo)
+    repo.acquire_lease(
+        work_id="work_test", lease_owner="heartbeat_owner",
+        lease_kind="AUTOPILOT_MUTATION", ttl_seconds=8, run_id=run_id,
+    )
+    repo.transition_run(
+        run_id, expected_status="PENDING", new_status="RUNNING",
+        lease_owner="heartbeat_owner",
+    )
+    for key in ("generate_panels", "render_pages"):
+        step = repo.create_step(
+            run_id=run_id, step_key=key, input_fingerprint="v1",
+            lease_owner="heartbeat_owner",
+        )
+        repo.start_step(
+            step["id"], input_fingerprint="v1",
+            lease_owner="heartbeat_owner",
+        )
+    lease_before = repo.inspect_lease("work_test")
+    run_before = repo.get_run(run_id)
+    steps_before = repo.list_steps(run_id)
+    clock.advance(2)
+
+    with pytest.raises(DurableRunStateError, match="multiple RUNNING"):
+        repo.heartbeat_owned_cycle(
+            work_id="work_test", run_id=run_id,
+            lease_owner="heartbeat_owner", ttl_seconds=8, step_id=None,
+        )
+
+    assert repo.inspect_lease("work_test") == lease_before
+    assert repo.get_run(run_id) == run_before
+    assert repo.list_steps(run_id) == steps_before
