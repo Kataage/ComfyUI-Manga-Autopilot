@@ -3376,7 +3376,7 @@ def test_post457_invalid_prepared_receipt_does_not_allow_new_quarantine(
     def fail_move(source: Path, destination: Path) -> None:
         raise OSError("controlled failure after prepared receipt")
 
-    monkeypatch.setattr(lifecycle, "_durable_move_directory", fail_move)
+    monkeypatch.setattr(lifecycle_module, "_durable_move_directory", fail_move)
     with pytest.raises(OSError, match="controlled failure"):
         repository.quarantine_staging_work(work_id)
 
@@ -3411,7 +3411,7 @@ def test_post457_invalid_prepared_receipt_does_not_allow_new_quarantine(
     names_before = sorted(item.name for item in quarantine_root.iterdir())
     catalog_before = repository.list_works()
     staging_before = evidence.read_bytes()
-    monkeypatch.setattr(lifecycle, "_durable_move_directory", original_move)
+    monkeypatch.setattr(lifecycle_module, "_durable_move_directory", original_move)
 
     # Expected fail-closed behavior: an unresolved invalid prepared receipt
     # must prevent moving this Work's staging evidence to a second directory.
@@ -3440,7 +3440,7 @@ def test_post457_valid_prepared_receipt_recovers_same_destination(
     def fail_move(source: Path, destination: Path) -> None:
         raise OSError("controlled failure after prepared receipt")
 
-    monkeypatch.setattr(lifecycle, "_durable_move_directory", fail_move)
+    monkeypatch.setattr(lifecycle_module, "_durable_move_directory", fail_move)
     with pytest.raises(OSError, match="controlled failure"):
         repository.quarantine_staging_work(work_id)
 
@@ -3451,7 +3451,7 @@ def test_post457_valid_prepared_receipt_recovers_same_destination(
     expected_destination = receipt.with_name(
         receipt.name[: -len(".recovery.json")]
     )
-    monkeypatch.setattr(lifecycle, "_durable_move_directory", original_move)
+    monkeypatch.setattr(lifecycle_module, "_durable_move_directory", original_move)
     assert repository.quarantine_staging_work(work_id) == expected_destination
     assert not staging.exists()
     assert (expected_destination / "evidence.bin").read_bytes() == (
