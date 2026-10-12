@@ -1864,7 +1864,20 @@ class WorkLifecycleRepository:
                 ] = []
                 completed: list[Path] = []
                 orphaned: list[Path] = []
+                invalid_evidence_suffix = f"-{WORK_STAGING_PREFIX[1:]}{work_id}"
                 for finding in self.inspect_quarantine():
+                    if finding.kind == "QUARANTINE_INVALID":
+                        # Invalid receipts have no trusted Work ID. Use the
+                        # evidence directory name, not the receipt payload, to
+                        # detect conflicts with this Work before any move.
+                        name = finding.path.name
+                        if name.endswith(_QUARANTINE_RECEIPT_SUFFIX):
+                            name = name[: -len(_QUARANTINE_RECEIPT_SUFFIX)]
+                        if name.endswith(invalid_evidence_suffix):
+                            raise WorkRecoveryError(
+                                f"invalid quarantine evidence for {work_id!r}: "
+                                f"{finding.path}; manual inspection required"
+                            )
                     if finding.work_id != work_id:
                         continue
                     if finding.kind == "QUARANTINE_COMPLETE":
@@ -1879,22 +1892,32 @@ class WorkLifecycleRepository:
                                 payload = _load_strict_json(
                                     receipt.read_text(encoding="utf-8")
                                 )
-                            except (OSError, ValueError, UnicodeDecodeError):
-                                # A changed/malformed receipt is not safe to
-                                # promote, even after a previous good scan.
-                                continue
+                            except (OSError, ValueError, UnicodeDecodeError) as exc:
+                                # A receipt changed since inspection must not
+                                # allow a second quarantine to be created.
+                                raise WorkRecoveryError(
+                                    "prepared quarantine receipt changed during "
+                                    f"retry: {receipt}"
+                                ) from exc
                             try:
                                 bound_work_id, state = (
                                     _validate_quarantine_receipt_binding(
                                         payload, destination=destination,
                                     )
                                 )
-                            except ValueError:
-                                continue
-                            if bound_work_id == work_id and state == "prepared":
-                                prepared_candidates.append(
-                                    (destination, receipt, payload)
+                            except ValueError as exc:
+                                raise WorkRecoveryError(
+                                    "prepared quarantine receipt is invalid during "
+                                    f"retry: {receipt}"
+                                ) from exc
+                            if bound_work_id != work_id or state != "prepared":
+                                raise WorkRecoveryError(
+                                    "prepared quarantine receipt changed during "
+                                    f"retry: {receipt}"
                                 )
+                            prepared_candidates.append(
+                                (destination, receipt, payload)
+                            )
                         elif finding.path.is_dir():
                             orphaned.append(finding.path)
 
