@@ -441,6 +441,17 @@ def _reject_nonstandard_json_constant(value: str) -> None:
     raise ValueError(f"nonstandard JSON numeric constant: {value}")
 
 
+def _reject_duplicate_json_members(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    # json.loads otherwise silently keeps the last duplicate member value.
+    # object_pairs_hook runs for every JSON object, including nested objects.
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"duplicate JSON object member: {key!r}")
+        result[key] = value
+    return result
+
+
 def _read_manifest(path: Path) -> dict[str, Any]:
     if path.is_symlink():
         raise WorkManifestError(f"Work manifest must not be a symlink: {path}")
@@ -453,6 +464,7 @@ def _read_manifest(path: Path) -> dict[str, Any]:
     try:
         payload = json.loads(
             raw, parse_constant=_reject_nonstandard_json_constant,
+            object_pairs_hook=_reject_duplicate_json_members,
         )
     except ValueError as exc:
         raise WorkManifestError(f"Work manifest is invalid JSON: {path}") from exc
