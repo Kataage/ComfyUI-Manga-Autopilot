@@ -3042,3 +3042,61 @@ def test_issue451_valid_manifest_app_version_remains_openable(
         assert inspected.work_id == work.work_id
     else:
         assert repository.open_work(work.work_id).work_id == work.work_id
+
+
+@pytest.mark.parametrize("entrypoint", ["portable_inspection", "catalog_open"])
+@pytest.mark.parametrize("duplicate_field", ["work_id", "integrity.mode"])
+def test_phase_c_post451_audit_duplicate_manifest_members_fail_closed(
+    tmp_path: Path, entrypoint: str, duplicate_field: str,
+) -> None:
+    """Contradictory duplicate JSON members must not certify a portable Work."""
+    repository = WorkLifecycleRepository(tmp_path)
+    affected = repository.create_work(
+        work_id="audit_duplicate_manifest", title="Affected Work",
+    )
+    healthy = repository.create_work(
+        work_id="audit_duplicate_healthy", title="Healthy Work",
+    )
+    original = affected.manifest_path.read_text(encoding="utf-8")
+    if duplicate_field == "work_id":
+        key = f'"work_id": "{affected.work_id}"'
+        replacement = f'"work_id": "foreign_work", {key}'
+    else:
+        key = '"mode": "live_mutable"'
+        replacement = '"mode": "immutable_package", ' + key
+    assert original.count(key) == 1
+    changed = original.replace(key, replacement, 1)
+    assert changed != original
+    # Last-wins parsing hides the contradictory earlier member.
+    assert json.loads(changed) == json.loads(original)
+    tampered = changed.encode("utf-8")
+    affected.manifest_path.write_bytes(tampered)
+    original_db = affected.database_path.read_bytes()
+    catalog_before = repository.list_works()
+    with repository_read(affected.database_path) as connection:
+        history_before = (
+            connection.execute("SELECT COUNT(*) FROM commits").fetchone()[0],
+            connection.execute(
+                "SELECT COUNT(*) FROM entity_revisions"
+            ).fetchone()[0],
+        )
+
+    with pytest.raises(lifecycle_module.WorkManifestError, match="manifest"):
+        if entrypoint == "portable_inspection":
+            inspect_work_directory(
+                affected.root, expected_work_id=affected.work_id,
+            )
+        else:
+            repository.open_work(affected.work_id)
+
+    assert affected.manifest_path.read_bytes() == tampered
+    assert affected.database_path.read_bytes() == original_db
+    assert repository.list_works() == catalog_before
+    with repository_read(affected.database_path) as connection:
+        assert (
+            connection.execute("SELECT COUNT(*) FROM commits").fetchone()[0],
+            connection.execute(
+                "SELECT COUNT(*) FROM entity_revisions"
+            ).fetchone()[0],
+        ) == history_before
+    assert repository.open_work(healthy.work_id).work_id == healthy.work_id
