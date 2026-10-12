@@ -3122,3 +3122,54 @@ def test_issue453_single_json_keys_still_open_normally(
         assert inspected.work_id == work.work_id
     else:
         assert repository.open_work(work.work_id).work_id == work.work_id
+
+
+@pytest.mark.parametrize("entrypoint", ["inspect_quarantine", "scan_recovery"])
+@pytest.mark.parametrize("duplicated", [
+    pytest.param("state", id="contradictory_state"),
+    pytest.param("work_id", id="foreign_work_id"),
+    pytest.param("destination", id="foreign_destination"),
+])
+def test_phase_c_post453_audit_quarantine_receipt_duplicate_members_fail_closed(
+    tmp_path: Path, entrypoint: str, duplicated: str,
+) -> None:
+    """Recovery must not certify contradictory durable quarantine receipts."""
+    repository = WorkLifecycleRepository(tmp_path)
+    staging = tmp_path / "works" / ".creating-work_receipt_audit"
+    staging.mkdir()
+    evidence = staging / "partial.txt"
+    evidence.write_bytes(b"preserve crash evidence")
+    dest = repository.quarantine_staging_work(
+        "work_receipt_audit", reason="independent-audit",
+    )
+    receipt = dest.with_name(dest.name + ".recovery.json")
+    original = receipt.read_text(encoding="utf-8")
+    assert repository.inspect_quarantine()[0].kind == "QUARANTINE_COMPLETE"
+    assert repository.scan_recovery() == ()
+    if duplicated == "state":
+        expected = '"state": "complete"'
+        replaced = '"state": "prepared", ' + expected
+    elif duplicated == "work_id":
+        expected = '"work_id": "work_receipt_audit"'
+        replaced = '"work_id": "foreign_work", ' + expected
+    else:
+        expected = f'"destination": "{dest.name}"'
+        replaced = '"destination": "foreign_destination", ' + expected
+    assert original.count(expected) == 1
+    changed = original.replace(expected, replaced, 1)
+    # Default decoding discards the contradictory earlier member.
+    assert json.loads(changed) == json.loads(original)
+    receipt.write_text(changed, encoding="utf-8")
+    before = receipt.read_bytes()
+    evidence_before = (dest / "partial.txt").read_bytes()
+    catalog_before = repository.list_works()
+
+    findings = getattr(repository, entrypoint)()
+    assert len(findings) == 1
+    assert findings[0].kind == "QUARANTINE_INVALID"
+    assert findings[0].valid is False
+    assert findings[0].recommended_action is None
+    assert receipt.read_bytes() == before
+    assert (dest / "partial.txt").read_bytes() == evidence_before
+    assert repository.list_works() == catalog_before
+    assert not staging.exists()
