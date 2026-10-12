@@ -2965,3 +2965,80 @@ def test_issue447_invalid_utf8_manifest_has_typed_error_without_mutation(
     assert created.database_path.read_bytes() == original_db_bytes
     assert repository.list_works() == original_catalog
     assert repository.open_work(other.work_id).work_id == other.work_id
+
+
+
+@pytest.mark.parametrize("entrypoint", ["portable_inspection", "catalog_open"])
+@pytest.mark.parametrize("invalid_version", [
+    pytest.param(float("nan"), id="nonstandard_nan"),
+    pytest.param(float("inf"), id="nonstandard_infinity"),
+    pytest.param(float("-inf"), id="nonstandard_negative_infinity"),
+    pytest.param(["wrong-type"], id="json_list"),
+    pytest.param({"version": "wrong-type"}, id="json_object"),
+    pytest.param(1, id="json_integer"),
+    pytest.param(True, id="json_boolean"),
+])
+def test_issue451_malformed_manifest_app_version_fails_without_mutation(
+    tmp_path: Path, entrypoint: str, invalid_version: object,
+) -> None:
+    """Untrusted portable manifest metadata must fail closed and stay intact."""
+    repository = WorkLifecycleRepository(tmp_path)
+    bad = repository.create_work(
+        work_id="issue451_bad_work", title="Bad Work",
+    )
+    good = repository.create_work(
+        work_id="issue451_good_work", title="Good Work",
+    )
+    manifest = json.loads(bad.manifest_path.read_text(encoding="utf-8"))
+    manifest["app_version"] = invalid_version
+    tampered = (json.dumps(manifest, allow_nan=True) + "\n").encode("utf-8")
+    bad.manifest_path.write_bytes(tampered)
+    original_db = bad.database_path.read_bytes()
+    original_catalog = repository.list_works()
+    with repository_read(bad.database_path) as conn:
+        original_history = (
+            conn.execute("SELECT COUNT(*) FROM commits").fetchone()[0],
+            conn.execute("SELECT COUNT(*) FROM entity_revisions").fetchone()[0],
+        )
+
+    with pytest.raises(lifecycle_module.WorkManifestError, match="manifest"):
+        if entrypoint == "portable_inspection":
+            inspect_work_directory(bad.root, expected_work_id=bad.work_id)
+        else:
+            repository.open_work(bad.work_id)
+
+    assert bad.manifest_path.read_bytes() == tampered
+    assert bad.database_path.read_bytes() == original_db
+    assert repository.list_works() == original_catalog
+    with repository_read(bad.database_path) as conn:
+        assert (
+            conn.execute("SELECT COUNT(*) FROM commits").fetchone()[0],
+            conn.execute("SELECT COUNT(*) FROM entity_revisions").fetchone()[0],
+        ) == original_history
+    assert repository.open_work(good.work_id).work_id == good.work_id
+
+
+@pytest.mark.parametrize("entrypoint", ["portable_inspection", "catalog_open"])
+@pytest.mark.parametrize("allowed_version", [
+    pytest.param(None, id="null"),
+    pytest.param("2.6.0", id="string"),
+])
+def test_issue451_valid_manifest_app_version_remains_openable(
+    tmp_path: Path, entrypoint: str, allowed_version: str | None,
+) -> None:
+    repository = WorkLifecycleRepository(tmp_path)
+    work = repository.create_work(
+        work_id="issue451_valid_work", title="Valid Work",
+    )
+    manifest = json.loads(work.manifest_path.read_text(encoding="utf-8"))
+    manifest["app_version"] = allowed_version
+    work.manifest_path.write_text(
+        json.dumps(manifest) + "\n", encoding="utf-8",
+    )
+    if entrypoint == "portable_inspection":
+        inspected = inspect_work_directory(
+            work.root, expected_work_id=work.work_id,
+        )
+        assert inspected.work_id == work.work_id
+    else:
+        assert repository.open_work(work.work_id).work_id == work.work_id
