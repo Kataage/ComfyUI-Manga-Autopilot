@@ -3244,3 +3244,107 @@ def test_issue455_legitimate_prepared_receipt_retry_still_completes(
     assert repository.quarantine_staging_work(work_id) == destination
     assert repository.inspect_quarantine()[0].kind == "QUARANTINE_COMPLETE"
     assert (destination / "partial.txt").read_bytes() == b"keep me"
+
+
+@pytest.mark.parametrize("entrypoint", ["inspect_quarantine", "scan_recovery"])
+@pytest.mark.parametrize("invalid_field", [
+    pytest.param("work_id", id="foreign_work_id"),
+    pytest.param("source", id="foreign_source"),
+    pytest.param("protocol_version", id="unknown_protocol"),
+])
+def test_issue457_quarantine_receipt_is_bound_to_work_and_protocol(
+    tmp_path: Path, entrypoint: str, invalid_field: str,
+) -> None:
+    """A valid JSON receipt cannot certify a foreign Work's evidence."""
+    repository = WorkLifecycleRepository(tmp_path)
+    work_id = "issue457_original_work"
+    staging = tmp_path / "works" / f".creating-{work_id}"
+    staging.mkdir()
+    (staging / "evidence.txt").write_bytes(b"preserve irreplaceable bytes")
+    destination = repository.quarantine_staging_work(
+        work_id, reason="receipt identity regression",
+    )
+    receipt = destination.with_name(destination.name + ".recovery.json")
+    payload = json.loads(receipt.read_text(encoding="utf-8"))
+    assert payload["work_id"] == work_id
+    assert payload["source"] == staging.name
+    assert payload["destination"] == destination.name
+    assert payload["protocol_version"] == 1
+    if invalid_field == "work_id":
+        payload["work_id"] = "issue457_foreign_work"
+    elif invalid_field == "source":
+        payload["source"] = ".creating-issue457_foreign_work"
+    else:
+        payload["protocol_version"] = 999
+    corrupted = (json.dumps(payload, sort_keys=True, indent=2) + "\n").encode("utf-8")
+    receipt.write_bytes(corrupted)
+    before_catalog = repository.list_works()
+    evidence = (destination / "evidence.txt").read_bytes()
+
+    findings = getattr(repository, entrypoint)()
+    assert len(findings) == 1
+    assert findings[0].kind == "QUARANTINE_INVALID"
+    assert findings[0].valid is False
+    assert findings[0].recommended_action is None
+    assert receipt.read_bytes() == corrupted
+    assert (destination / "evidence.txt").read_bytes() == evidence
+    assert repository.list_works() == before_catalog
+    assert not staging.exists()
+
+
+def test_issue457_foreign_work_must_not_reuse_other_work_quarantine(
+    tmp_path: Path,
+) -> None:
+    repository = WorkLifecycleRepository(tmp_path)
+    owner = "issue457_evidence_owner"
+    claimant = "issue457_wrong_claimant"
+    staging = tmp_path / "works" / f".creating-{owner}"
+    staging.mkdir()
+    (staging / "evidence.txt").write_bytes(b"only owner's evidence")
+    destination = repository.quarantine_staging_work(owner)
+    receipt = destination.with_name(destination.name + ".recovery.json")
+    payload = json.loads(receipt.read_text(encoding="utf-8"))
+    payload["work_id"] = claimant
+    corrupted = (json.dumps(payload, sort_keys=True, indent=2) + "\n").encode("utf-8")
+    receipt.write_bytes(corrupted)
+    before_catalog = repository.list_works()
+
+    with pytest.raises(WorkRecoveryError):
+        repository.quarantine_staging_work(claimant)
+    assert receipt.read_bytes() == corrupted
+    assert (destination / "evidence.txt").read_bytes() == b"only owner's evidence"
+    assert repository.list_works() == before_catalog
+    assert not (tmp_path / "works" / f".creating-{claimant}").exists()
+
+
+@pytest.mark.parametrize("receipt_state", ["complete", "prepared"])
+def test_issue457_legitimate_quarantine_receipt_still_openable(
+    tmp_path: Path, receipt_state: str,
+) -> None:
+    repository = WorkLifecycleRepository(tmp_path)
+    work_id = "issue457_valid_receipt"
+    staging = tmp_path / "works" / f".creating-{work_id}"
+    staging.mkdir()
+    (staging / "evidence.txt").write_bytes(b"keep valid evidence")
+    destination = repository.quarantine_staging_work(work_id)
+    receipt = destination.with_name(destination.name + ".recovery.json")
+    if receipt_state == "prepared":
+        raw = receipt.read_text(encoding="utf-8")
+        assert raw.count('"state": "complete"') == 1
+        receipt.write_text(
+            raw.replace('"state": "complete"', '"state": "prepared"', 1),
+            encoding="utf-8",
+        )
+    findings = repository.inspect_quarantine()
+    assert len(findings) == 1
+    assert findings[0].kind == (
+        "QUARANTINE_COMPLETE" if receipt_state == "complete"
+        else "QUARANTINE_INCOMPLETE"
+    )
+    assert findings[0].work_id == work_id
+    assert (destination / "evidence.txt").read_bytes() == b"keep valid evidence"
+    if receipt_state == "prepared":
+        assert repository.quarantine_staging_work(work_id) == destination
+        assert repository.inspect_quarantine()[0].kind == "QUARANTINE_COMPLETE"
+    else:
+        assert repository.scan_recovery() == ()
