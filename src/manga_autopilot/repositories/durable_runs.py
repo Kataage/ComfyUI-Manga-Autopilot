@@ -805,18 +805,29 @@ class DurableRunRepository:
                 )
             self._assert_owner(conn, run_id, lease_owner)
 
-            renew_step = False
+            # Find the active Step under the same BEGIN IMMEDIATE lock as
+            # the Work/Run heartbeat. The caller's Step hint was captured
+            # before this transaction and may be absent or already terminal.
+            running_steps = conn.execute(
+                "SELECT id FROM run_steps WHERE run_id = ? "
+                "AND status = 'RUNNING' LIMIT 2", (run_id,),
+            ).fetchall()
+            if len(running_steps) > 1:
+                raise DurableRunStateError("multiple RUNNING RunSteps in one Run")
             if step_id is not None:
-                step = self._get(conn, "run_steps", step_id)
-                if step["run_id"] != run_id:
+                hinted = self._get(conn, "run_steps", step_id)
+                if hinted["run_id"] != run_id:
                     raise WorkLeaseConflictError("RunStep belongs to another Run")
-                self._assert_run_step_history_mutable(conn, run_id)
-                if step["status"] == "RUNNING":
-                    renew_step = True
-                elif step["status"] not in _STEP_TERMINAL:
-                    # A PENDING or STALE Step must not be mistaken for a live
-                    # attempt; only a committed terminal Step can be skipped.
+                if hinted["status"] != "RUNNING" and (
+                    hinted["status"] not in _STEP_TERMINAL
+                ):
+                    # A PENDING or STALE hint is not an active attempt.
                     raise DurableRunStateError("step is not RUNNING")
+            active_step_id = (
+                str(running_steps[0]["id"]) if running_steps else None
+            )
+            if active_step_id is not None:
+                self._assert_run_step_history_mutable(conn, run_id)
 
             timestamp = now.isoformat()
             conn.execute(
@@ -834,11 +845,11 @@ class DurableRunRepository:
             )
             if run_cursor.rowcount != 1:
                 raise DurableRunStateError("Run heartbeat owner/state mismatch")
-            if renew_step:
+            if active_step_id is not None:
                 step_cursor = conn.execute(
                     """UPDATE run_steps SET heartbeat_at = ?
                        WHERE id = ? AND run_id = ? AND status = 'RUNNING'""",
-                    (timestamp, step_id, run_id),
+                    (timestamp, active_step_id, run_id),
                 )
                 if step_cursor.rowcount != 1:
                     raise DurableRunStateError("step is not RUNNING")
