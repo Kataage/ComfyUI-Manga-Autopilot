@@ -2934,3 +2934,33 @@ def test_issue439_healthy_cataloged_work_recovery_remains_read_only(
             "FROM work_metadata WHERE work_id = ?", (work_id,),
         ).fetchone())
     assert after_work == before_work
+
+@pytest.mark.parametrize("entrypoint", ["portable_inspection", "catalog_open"])
+def test_issue447_invalid_utf8_manifest_has_typed_error_without_mutation(
+    tmp_path: Path, entrypoint: str,
+) -> None:
+    """Undecodable manifest bytes must be a controlled Work manifest failure."""
+    repository = WorkLifecycleRepository(tmp_path)
+    created = repository.create_work(
+        work_id="work_corrupt_manifest", title="Unchanged Work",
+    )
+    other = repository.create_work(
+        work_id="work_healthy_manifest", title="Healthy Work",
+    )
+    corrupt = b"\xff\xfe\x00"
+    created.manifest_path.write_bytes(corrupt)
+    original_db_bytes = created.database_path.read_bytes()
+    original_catalog = repository.list_works()
+
+    with pytest.raises(lifecycle_module.WorkManifestError, match="manifest"):
+        if entrypoint == "portable_inspection":
+            inspect_work_directory(
+                created.root, expected_work_id=created.work_id,
+            )
+        else:
+            repository.open_work(created.work_id)
+
+    assert created.manifest_path.read_bytes() == corrupt
+    assert created.database_path.read_bytes() == original_db_bytes
+    assert repository.list_works() == original_catalog
+    assert repository.open_work(other.work_id).work_id == other.work_id
