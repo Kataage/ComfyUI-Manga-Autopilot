@@ -3122,3 +3122,125 @@ def test_issue453_single_json_keys_still_open_normally(
         assert inspected.work_id == work.work_id
     else:
         assert repository.open_work(work.work_id).work_id == work.work_id
+
+
+@pytest.mark.parametrize("entrypoint", ["inspect_quarantine", "scan_recovery"])
+@pytest.mark.parametrize("malformation", [
+    pytest.param("state", id="contradictory_state"),
+    pytest.param("work_id", id="foreign_work_id"),
+    pytest.param("destination", id="foreign_destination"),
+    pytest.param("nested", id="nested_duplicate"),
+    pytest.param("nan", id="nonstandard_numeric_constant"),
+])
+def test_issue455_invalid_quarantine_receipt_fails_closed_without_mutation(
+    tmp_path: Path, entrypoint: str, malformation: str,
+) -> None:
+    repository = WorkLifecycleRepository(tmp_path)
+    work_id = "work_issue455_receipt"
+    staging = tmp_path / "works" / f".creating-{work_id}"
+    staging.mkdir()
+    (staging / "partial.txt").write_bytes(b"irreplaceable recovery evidence")
+    destination = repository.quarantine_staging_work(
+        work_id, reason="crashed write",
+    )
+    receipt = destination.with_name(destination.name + ".recovery.json")
+    source = receipt.read_text(encoding="utf-8")
+    if malformation == "state":
+        key = '"state": "complete"'
+        replacement = '"state": "prepared", ' + key
+    elif malformation == "work_id":
+        key = f'"work_id": "{work_id}"'
+        replacement = '"work_id": "foreign_work", ' + key
+    elif malformation == "destination":
+        key = f'"destination": "{destination.name}"'
+        replacement = '"destination": "wrong_destination", ' + key
+    elif malformation == "nested":
+        key = '"state": "complete"'
+        replacement = '"unknown": [{"same": 1, "same": 2}], ' + key
+    else:
+        key = '"state": "complete"'
+        replacement = '"unknown": NaN, ' + key
+    assert source.count(key) == 1
+    changed = source.replace(key, replacement, 1)
+    assert changed != source
+    receipt.write_text(changed, encoding="utf-8")
+    before_receipt = receipt.read_bytes()
+    before_evidence = (destination / "partial.txt").read_bytes()
+    before_catalog = repository.list_works()
+
+    findings = getattr(repository, entrypoint)()
+    assert len(findings) == 1
+    assert findings[0].kind == "QUARANTINE_INVALID"
+    assert findings[0].valid is False
+    assert findings[0].recommended_action is None
+    assert receipt.read_bytes() == before_receipt
+    assert (destination / "partial.txt").read_bytes() == before_evidence
+    assert repository.list_works() == before_catalog
+    assert not staging.exists()
+
+
+def test_issue455_recheck_prepared_receipt_if_changed_between_reads(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A parsed-once receipt cannot be corrupted before retry promotion."""
+    repository = WorkLifecycleRepository(tmp_path)
+    work_id = "work_issue455_retry"
+    staging = tmp_path / "works" / f".creating-{work_id}"
+    staging.mkdir()
+    (staging / "partial.txt").write_bytes(b"must remain unchanged")
+    destination = repository.quarantine_staging_work(work_id)
+    receipt = destination.with_name(destination.name + ".recovery.json")
+    prepared = receipt.read_text(encoding="utf-8").replace(
+        '"state": "complete"', '"state": "prepared"', 1,
+    )
+    receipt.write_text(prepared, encoding="utf-8")
+    initial = repository.inspect_quarantine()
+    assert len(initial) == 1
+    assert initial[0].kind == "QUARANTINE_INCOMPLETE"
+    original_inspect = repository.inspect_quarantine
+    corrupted: list[bytes] = []
+
+    def mutate_after_inspection():
+        findings = original_inspect()
+        source = receipt.read_text(encoding="utf-8")
+        changed = source.replace(
+            '"state": "prepared"',
+            '"state": "unexpected", "state": "prepared"',
+            1,
+        )
+        assert changed != source
+        receipt.write_text(changed, encoding="utf-8")
+        corrupted.append(receipt.read_bytes())
+        return findings
+
+    monkeypatch.setattr(repository, "inspect_quarantine", mutate_after_inspection)
+    before_catalog = repository.list_works()
+    with pytest.raises(WorkRecoveryError):
+        repository.quarantine_staging_work(work_id)
+    assert len(corrupted) == 1
+    assert receipt.read_bytes() == corrupted[0]
+    assert (destination / "partial.txt").read_bytes() == b"must remain unchanged"
+    assert repository.list_works() == before_catalog
+    assert not staging.exists()
+
+
+def test_issue455_legitimate_prepared_receipt_retry_still_completes(
+    tmp_path: Path,
+) -> None:
+    repository = WorkLifecycleRepository(tmp_path)
+    work_id = "work_issue455_valid_retry"
+    staging = tmp_path / "works" / f".creating-{work_id}"
+    staging.mkdir()
+    (staging / "partial.txt").write_bytes(b"keep me")
+    destination = repository.quarantine_staging_work(work_id)
+    receipt = destination.with_name(destination.name + ".recovery.json")
+    original = receipt.read_text(encoding="utf-8")
+    assert original.count('"state": "complete"') == 1
+    receipt.write_text(
+        original.replace('"state": "complete"', '"state": "prepared"', 1),
+        encoding="utf-8",
+    )
+    assert repository.inspect_quarantine()[0].kind == "QUARANTINE_INCOMPLETE"
+    assert repository.quarantine_staging_work(work_id) == destination
+    assert repository.inspect_quarantine()[0].kind == "QUARANTINE_COMPLETE"
+    assert (destination / "partial.txt").read_bytes() == b"keep me"

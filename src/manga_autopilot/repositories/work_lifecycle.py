@@ -452,6 +452,14 @@ def _reject_duplicate_json_members(pairs: list[tuple[str, Any]]) -> dict[str, An
     return result
 
 
+def _load_strict_json(raw: str) -> Any:
+    """Decode portable or recovery JSON without ambiguous duplicate members."""
+    return json.loads(
+        raw, parse_constant=_reject_nonstandard_json_constant,
+        object_pairs_hook=_reject_duplicate_json_members,
+    )
+
+
 def _read_manifest(path: Path) -> dict[str, Any]:
     if path.is_symlink():
         raise WorkManifestError(f"Work manifest must not be a symlink: {path}")
@@ -462,10 +470,7 @@ def _read_manifest(path: Path) -> dict[str, Any]:
     except UnicodeDecodeError as exc:
         raise WorkManifestError(f"Work manifest is invalid UTF-8: {path}") from exc
     try:
-        payload = json.loads(
-            raw, parse_constant=_reject_nonstandard_json_constant,
-            object_pairs_hook=_reject_duplicate_json_members,
-        )
+        payload = _load_strict_json(raw)
     except ValueError as exc:
         raise WorkManifestError(f"Work manifest is invalid JSON: {path}") from exc
     if not isinstance(payload, dict):
@@ -1297,7 +1302,7 @@ class WorkLifecycleRepository:
                     containment_root=quarantine_root,
                     field_name="quarantine receipt",
                 )
-                payload = json.loads(receipt.read_text(encoding="utf-8"))
+                payload = _load_strict_json(receipt.read_text(encoding="utf-8"))
                 if not isinstance(payload, dict):
                     raise ValueError("quarantine receipt root must be an object")
                 raw_work_id = payload.get("work_id")
@@ -1857,12 +1862,19 @@ class WorkLifecycleRepository:
                                 receipt.name[: -len(_QUARANTINE_RECEIPT_SUFFIX)]
                             )
                             try:
-                                payload = json.loads(
+                                payload = _load_strict_json(
                                     receipt.read_text(encoding="utf-8")
                                 )
-                            except (OSError, json.JSONDecodeError):
+                            except (OSError, ValueError, UnicodeDecodeError):
+                                # A changed/malformed receipt is not safe to
+                                # promote, even after a previous good scan.
                                 continue
-                            if isinstance(payload, dict):
+                            if (
+                                isinstance(payload, dict)
+                                and payload.get("work_id") == work_id
+                                and payload.get("destination") == destination.name
+                                and payload.get("state") == "prepared"
+                            ):
                                 prepared_candidates.append(
                                     (destination, receipt, payload)
                                 )
