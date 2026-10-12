@@ -146,6 +146,12 @@ def validate_manifest_common(
             "Work manifest work_schema_version must be a positive integer"
         )
 
+    app_version = manifest.get("app_version")
+    if app_version is not None and not isinstance(app_version, str):
+        raise WorkManifestContractError(
+            "Work manifest app_version must be a string or null"
+        )
+
     return format_version
 
 
