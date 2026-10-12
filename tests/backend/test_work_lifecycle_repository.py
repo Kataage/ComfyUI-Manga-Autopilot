@@ -2965,3 +2965,43 @@ def test_issue447_invalid_utf8_manifest_has_typed_error_without_mutation(
     assert created.database_path.read_bytes() == original_db_bytes
     assert repository.list_works() == original_catalog
     assert repository.open_work(other.work_id).work_id == other.work_id
+
+
+
+@pytest.mark.parametrize("entrypoint", ["portable_inspection", "catalog_open"])
+@pytest.mark.parametrize("invalid_app_version", [
+    pytest.param(float("nan"), id="nonstandard_json_nan"),
+    pytest.param(["not-a-version"], id="json_array_instead_of_optional_string"),
+])
+def test_phase_c_post449_audit_noncanonical_app_version_is_rejected(
+    tmp_path: Path, entrypoint: str, invalid_app_version: object,
+) -> None:
+    """Malformed portable metadata must not be blessed or republished."""
+    repository = WorkLifecycleRepository(tmp_path)
+    affected = repository.create_work(
+        work_id="work_bad_manifest_app_version", title="Affected Work",
+    )
+    healthy = repository.create_work(
+        work_id="work_healthy_manifest_app_version", title="Healthy Work",
+    )
+    manifest = json.loads(affected.manifest_path.read_text(encoding="utf-8"))
+    manifest["app_version"] = invalid_app_version
+    # Deliberately write NaN as the non-JSON token that Python's permissive
+    # decoder accepts by default. This is untrusted portable file input.
+    tampered = (json.dumps(manifest, allow_nan=True) + "\n").encode("utf-8")
+    affected.manifest_path.write_bytes(tampered)
+    previous_db = affected.database_path.read_bytes()
+    previous_catalog = repository.list_works()
+
+    with pytest.raises(lifecycle_module.WorkManifestError):
+        if entrypoint == "portable_inspection":
+            inspect_work_directory(
+                affected.root, expected_work_id=affected.work_id,
+            )
+        else:
+            repository.open_work(affected.work_id)
+
+    assert affected.manifest_path.read_bytes() == tampered
+    assert affected.database_path.read_bytes() == previous_db
+    assert repository.list_works() == previous_catalog
+    assert repository.open_work(healthy.work_id).work_id == healthy.work_id
