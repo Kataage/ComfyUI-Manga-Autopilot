@@ -3042,3 +3042,83 @@ def test_issue451_valid_manifest_app_version_remains_openable(
         assert inspected.work_id == work.work_id
     else:
         assert repository.open_work(work.work_id).work_id == work.work_id
+
+
+@pytest.mark.parametrize("entrypoint", ["portable_inspection", "catalog_open"])
+@pytest.mark.parametrize("duplicate_scope", [
+    pytest.param("root_identity", id="root_work_id_conflict"),
+    pytest.param("integrity_mode", id="nested_integrity_mode_conflict"),
+    pytest.param("same_value", id="identical_app_version_duplicate"),
+    pytest.param("array_object", id="array_embedded_object_duplicate"),
+])
+def test_issue453_duplicate_json_manifest_members_rejected_without_mutation(
+    tmp_path: Path, entrypoint: str, duplicate_scope: str,
+) -> None:
+    """Reject repeated object keys at all depths before any Work write."""
+    repository = WorkLifecycleRepository(tmp_path)
+    damaged = repository.create_work(
+        work_id="issue453_affected", title="Affected Work",
+    )
+    healthy = repository.create_work(
+        work_id="issue453_healthy", title="Healthy Work",
+    )
+    source = damaged.manifest_path.read_text(encoding="utf-8")
+    if duplicate_scope == "root_identity":
+        old = f'"work_id": "{damaged.work_id}"'
+        extra = f'"work_id": "foreign_work", {old}'
+    elif duplicate_scope == "integrity_mode":
+        old = '"mode": "live_mutable"'
+        extra = '"mode": "immutable_package", ' + old
+    elif duplicate_scope == "same_value":
+        old = '"app_version": null'
+        extra = '"app_version": null, ' + old
+    else:
+        old = '"app_version": null'
+        extra = '"unknown_extension": [{"key": 1, "key": 2}], ' + old
+    assert source.count(old) == 1
+    tampered = source.replace(old, extra, 1).encode("utf-8")
+    assert tampered != source.encode("utf-8")
+    # The default JSON loader silently collapses duplicates. This is why
+    # a post-parse canonical-field validator cannot detect the defect.
+    default_loaded = json.loads(tampered)
+    assert isinstance(default_loaded, dict)
+    damaged.manifest_path.write_bytes(tampered)
+    db_before = damaged.database_path.read_bytes()
+    catalog_before = repository.list_works()
+    with repository_read(damaged.database_path) as conn:
+        history_before = (
+            conn.execute("SELECT COUNT(*) FROM commits").fetchone()[0],
+            conn.execute("SELECT COUNT(*) FROM entity_revisions").fetchone()[0],
+        )
+    with pytest.raises(lifecycle_module.WorkManifestError, match="manifest"):
+        if entrypoint == "portable_inspection":
+            inspect_work_directory(
+                damaged.root, expected_work_id=damaged.work_id,
+            )
+        else:
+            repository.open_work(damaged.work_id)
+
+    assert damaged.manifest_path.read_bytes() == tampered
+    assert damaged.database_path.read_bytes() == db_before
+    assert repository.list_works() == catalog_before
+    with repository_read(damaged.database_path) as conn:
+        assert (
+            conn.execute("SELECT COUNT(*) FROM commits").fetchone()[0],
+            conn.execute("SELECT COUNT(*) FROM entity_revisions").fetchone()[0],
+        ) == history_before
+    assert repository.open_work(healthy.work_id).work_id == healthy.work_id
+
+
+@pytest.mark.parametrize("entrypoint", ["portable_inspection", "catalog_open"])
+def test_issue453_single_json_keys_still_open_normally(
+    tmp_path: Path, entrypoint: str,
+) -> None:
+    repository = WorkLifecycleRepository(tmp_path)
+    work = repository.create_work(work_id="issue453_normal", title="Normal Work")
+    before = json.loads(work.manifest_path.read_text(encoding="utf-8"))
+    assert before["integrity"]["mode"] == "live_mutable"
+    if entrypoint == "portable_inspection":
+        inspected = inspect_work_directory(work.root, expected_work_id=work.work_id)
+        assert inspected.work_id == work.work_id
+    else:
+        assert repository.open_work(work.work_id).work_id == work.work_id
