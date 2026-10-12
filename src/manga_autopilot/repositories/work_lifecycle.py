@@ -443,6 +443,8 @@ def _read_manifest(path: Path) -> dict[str, Any]:
         raw = path.read_text(encoding="utf-8")
     except FileNotFoundError as exc:
         raise WorkManifestError(f"Work manifest is missing: {path}") from exc
+    except UnicodeDecodeError as exc:
+        raise WorkManifestError(f"Work manifest is invalid UTF-8: {path}") from exc
     try:
         payload = json.loads(raw)
     except json.JSONDecodeError as exc:
