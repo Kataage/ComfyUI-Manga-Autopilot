@@ -3459,3 +3459,88 @@ def test_post457_valid_prepared_receipt_recovers_same_destination(
     )
     assert repository.inspect_quarantine()[0].kind == "QUARANTINE_COMPLETE"
     assert repository.scan_recovery() == ()
+
+
+# Phase C post-#459 independent audit: versioned quarantine completion proof.
+@pytest.mark.parametrize("entrypoint", ["inspect_quarantine", "scan_recovery"])
+@pytest.mark.parametrize(
+    "malformation",
+    [
+        "missing_state",
+        "missing_completed_at",
+        "null_completed_at",
+        "missing_quarantined_at",
+        "null_quarantined_at",
+    ],
+)
+def test_phase_c_post459_audit_versioned_receipt_requires_completion_proof(
+    tmp_path: Path,
+    entrypoint: str,
+    malformation: str,
+) -> None:
+    """Missing protocol transition evidence must not certify quarantine.
+
+    Completed versioned receipts are written with an explicit state and
+    completion/quarantine timestamps. Missing these required transition
+    markers must never be implicitly interpreted as "complete".
+    """
+    repository = WorkLifecycleRepository(tmp_path)
+    work_id = "post459_completed_proof"
+    staging = tmp_path / "works" / f".creating-{work_id}"
+    staging.mkdir()
+    (staging / "evidence.bin").write_bytes(b"irreplaceable completed quarantine")
+    destination = repository.quarantine_staging_work(work_id)
+    receipt = destination.with_name(destination.name + ".recovery.json")
+    payload = json.loads(receipt.read_text(encoding="utf-8"))
+    assert payload["protocol_version"] == 1
+    assert payload["state"] == "complete"
+    assert payload["completed_at"]
+    assert payload["quarantined_at"]
+
+    if malformation == "missing_state":
+        del payload["state"]
+    elif malformation == "missing_completed_at":
+        del payload["completed_at"]
+    elif malformation == "null_completed_at":
+        payload["completed_at"] = None
+    elif malformation == "missing_quarantined_at":
+        del payload["quarantined_at"]
+    else:
+        payload["quarantined_at"] = None
+
+    damaged = (json.dumps(payload, indent=2, sort_keys=True) + "\n").encode("utf-8")
+    receipt.write_bytes(damaged)
+    catalog_before = repository.list_works()
+    evidence_before = (destination / "evidence.bin").read_bytes()
+
+    findings = getattr(repository, entrypoint)()
+    # A corrupt complete receipt must be reported as invalid, never as
+    # completed and silently filtered out by the recovery scan.
+    assert len(findings) == 1
+    assert findings[0].kind == "QUARANTINE_INVALID"
+    assert findings[0].valid is False
+    assert findings[0].recommended_action is None
+    assert receipt.read_bytes() == damaged
+    assert (destination / "evidence.bin").read_bytes() == evidence_before
+    assert repository.list_works() == catalog_before
+    assert not staging.exists()
+
+
+def test_phase_c_post459_audit_legitimate_completion_still_recognized(
+    tmp_path: Path,
+) -> None:
+    """Positive control: a genuine complete receipt is not a false alarm."""
+    repository = WorkLifecycleRepository(tmp_path)
+    work_id = "post459_valid_completed_receipt"
+    staging = tmp_path / "works" / f".creating-{work_id}"
+    staging.mkdir()
+    (staging / "evidence.bin").write_bytes(b"genuine completed evidence")
+    destination = repository.quarantine_staging_work(work_id)
+    inspected = repository.inspect_quarantine()
+    assert len(inspected) == 1
+    assert inspected[0].kind == "QUARANTINE_COMPLETE"
+    assert inspected[0].work_id == work_id
+    assert repository.scan_recovery() == ()
+    assert (destination / "evidence.bin").read_bytes() == (
+        b"genuine completed evidence"
+    )
