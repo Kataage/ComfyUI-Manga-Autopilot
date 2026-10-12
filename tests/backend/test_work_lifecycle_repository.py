@@ -2952,7 +2952,7 @@ def test_issue447_invalid_utf8_manifest_has_typed_error_without_mutation(
     original_db_bytes = created.database_path.read_bytes()
     original_catalog = repository.list_works()
 
-    with pytest.raises(lifecycle_module.WorkManifestError, match="manifest"):
+    with pytest.raises(lifecycle_module.WorkManifestError, match="manifest") as raised:
         if entrypoint == "portable_inspection":
             inspect_work_directory(
                 created.root, expected_work_id=created.work_id,
@@ -2960,6 +2960,7 @@ def test_issue447_invalid_utf8_manifest_has_typed_error_without_mutation(
         else:
             repository.open_work(created.work_id)
 
+    assert isinstance(raised.value.__cause__, UnicodeDecodeError)
     assert created.manifest_path.read_bytes() == corrupt
     assert created.database_path.read_bytes() == original_db_bytes
     assert repository.list_works() == original_catalog
